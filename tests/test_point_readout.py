@@ -520,3 +520,47 @@ def test_server_field_inspection_and_download_checksum(data_fixture, tmp_path):
     verify(artifact, hashlib.md5(b"complete fixture").hexdigest())
     with pytest.raises(ValueError, match="MD5 mismatch"):
         verify(artifact, hashlib.md5(b"incomplete fixture").hexdigest())
+
+
+def test_download_restarts_partial_transfer_without_discarding_bytes(tmp_path, monkeypatch):
+    import subprocess
+    from scripts import download_pdebench_field as downloader
+    partial = tmp_path / "source.hdf5.part"
+    partial.write_bytes(b"existing")
+    calls, sleeps = [], []
+
+    def transfer(command, check):
+        assert check and command[command.index("--continue-at") + 1] == "-"
+        assert command[command.index("--output") + 1] == str(partial)
+        calls.append(partial.read_bytes())
+        with partial.open("ab") as handle:
+            handle.write(b"more")
+        if len(calls) == 1:
+            raise subprocess.CalledProcessError(18, command)
+
+    monkeypatch.setattr(downloader.subprocess, "run", transfer)
+    monkeypatch.setattr(downloader.time, "sleep", sleeps.append)
+    downloader.download_partial(partial, resume_retries=1)
+    assert calls == [b"existing", b"existingmore"]
+    assert partial.read_bytes() == b"existingmoremore"
+    assert sleeps == [10]
+
+
+@pytest.mark.parametrize("exit_code,attempts", [(18, 3), (22, 1), (23, 1)])
+def test_download_retries_are_bounded_and_preserve_failed_file(tmp_path, monkeypatch, exit_code, attempts):
+    import subprocess
+    from scripts import download_pdebench_field as downloader
+    partial = tmp_path / "source.hdf5.part"
+    partial.write_bytes(b"keep")
+    calls = []
+
+    def fail(command, check):
+        calls.append(command)
+        raise subprocess.CalledProcessError(exit_code, command)
+
+    monkeypatch.setattr(downloader.subprocess, "run", fail)
+    monkeypatch.setattr(downloader.time, "sleep", lambda seconds: None)
+    with pytest.raises(subprocess.CalledProcessError):
+        downloader.download_partial(partial, resume_retries=2)
+    assert len(calls) == attempts
+    assert partial.read_bytes() == b"keep"

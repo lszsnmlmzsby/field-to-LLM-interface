@@ -137,7 +137,7 @@ mkdir -p "$FIELD_TO_LLM_ROOT/raw" "$FIELD_TO_LLM_ROOT/logs" "$FIELD_TO_LLM_ROOT/
 
 ```bash
 hf download Qwen/Qwen2.5-14B-Instruct --local-dir "$FIELD_TO_LLM_MODEL_DIR"
-python scripts/download_pdebench_field.py --output-dir "$FIELD_TO_LLM_ROOT/raw"
+python scripts/download_pdebench_field.py --output-dir "$FIELD_TO_LLM_ROOT/raw" &&
 python scripts/check_field_qa_environment.py --require-cuda \
   --hdf5-path "$PDEBENCH_HDF5" \
   --output "$FIELD_TO_LLM_ROOT/environment/server.json"
@@ -147,6 +147,10 @@ python -m pytest tests/test_point_readout.py -q
 ```
 
 下载器采用官方清单固定 URL/MD5，curl 断点续传，校验通过后才将 `.part` 改为正式 HDF5。
+该文件约 51.2GiB。若出现 `curl: (18) Transferred a partial file`，新版脚本默认间隔 10 秒自动续传最多 5 次，
+可通过 `--resume-retries` 修改次数。旧版脚本或自动重试耗尽时，保留 `.part`，重新执行同一下载命令即可尝试续传。
+没有出现 `verified=...` 前不要构建 QA；随后出现正式 HDF5 的 `FileNotFoundError` 是下载未完成的连带错误。
+模型若已下载成功无需再次下载；HF 的版本更新、未登录和 skill 提示也不要求为此修改环境。
 重复执行会校验已有文件。MD5 不符时保留中间文件；确认损坏后移走，再下载。
 不需要整套 2D CFD。文件名 `Rand` 指 CFD 初始条件，这里使用数值求解的 PDEBench 场，不引入 IID/相关随机场实验。
 已有数据可直接设置 `PDEBENCH_HDF5`。只有部分变量时，构建和环境检查都加 `--fields Vx Vy` 等实际字段名。
