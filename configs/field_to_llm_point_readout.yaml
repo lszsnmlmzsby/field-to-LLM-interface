@@ -1,4 +1,4 @@
-# Real fields only. Open generation of ordered approximate standardized values.
+# Real fields only. v2: numerical reading, regional statistics and coordinates.
 # This is a separate task protocol; existing multiple-choice runs are unchanged.
 model:
   name_or_path: Qwen/Qwen2.5-14B-Instruct
@@ -15,10 +15,11 @@ data:
 generation:
   seed: 20260915
   split_seed: 20260905
-  tasks: [single_point, multi_point, line_profile, region_values]
+  tasks: [single_point, multi_point, line_profile, region_values, region_mean, region_std, region_min, region_max, region_argmin, region_argmax, nearest_value_location]
   multi_counts: [2, 3, 4]
   line_counts: [3, 4, 5]
   region_shapes: [[2, 2]]
+  statistic_region_shapes: [[2, 2], [4, 4]]
   template_variants: [0, 1]
   answer_decimals: 1
   absolute_tolerance: 0.2
@@ -59,6 +60,7 @@ cross_attention:
   dropout: 0.0
   gate_init: 0.0
 training:
+  epochs: 2
   batch_size: 1
   gradient_accumulation_steps: 4
   lr: 5.0e-5
@@ -81,7 +83,7 @@ runtime:
 profiles:
   smoke:
     data:
-      qa_dir: ${FIELD_TO_LLM_ROOT}/data/point_readout/smoke
+      qa_dir: ${FIELD_TO_LLM_ROOT}/data/field_qa_v2/smoke
       train_shapes: [8x8, 8x16]
       heldout_shapes: []
     generation:
@@ -93,19 +95,19 @@ profiles:
       save_every_updates: 25
   pilot:
     data:
-      qa_dir: ${FIELD_TO_LLM_ROOT}/data/point_readout/pilot
+      qa_dir: ${FIELD_TO_LLM_ROOT}/data/field_qa_v2/pilot
     generation:
       train_states: 512
       eval_states_per_shape: 8
     training:
-      max_updates: 1000
+      max_updates: null  # Derive two epochs from the actual selected tasks/batches.
   full:
     data:
-      qa_dir: ${FIELD_TO_LLM_ROOT}/data/point_readout/full
+      qa_dir: ${FIELD_TO_LLM_ROOT}/data/field_qa_v2/full
     generation:
       train_states: 2048
       eval_states_per_shape: 32
     training:
-      max_updates: 4096
+      max_updates: null
       eval_every_updates: 1024
       save_every_updates: 256

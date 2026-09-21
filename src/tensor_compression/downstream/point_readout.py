@@ -1,7 +1,7 @@
 """Open numerical readout protocol: data truth, public prompts and strict scoring.
 
-Coordinates in questions are one-based. Model answers are ordered JSON arrays
-of approximate standardized values, generated over the full vocabulary.
+Coordinates in questions are one-based. Model answers are JSON arrays of
+approximate standardized values or coordinates, generated over the full vocabulary.
 """
 from __future__ import annotations
 
@@ -15,9 +15,12 @@ from collections.abc import Mapping, Sequence
 import torch
 
 
-FORMAT = "standardized_point_readout_v1"
-PROMPT_VERSION = "ordered_values_one_based_v1"
-TASKS = ("single_point", "multi_point", "line_profile", "region_values")
+FORMAT = "standardized_field_qa_v2"
+PROMPT_VERSION = "values_or_coordinates_one_based_v2"
+READ_TASKS = ("single_point", "multi_point", "line_profile", "region_values")
+STAT_TASKS = ("region_mean", "region_std", "region_min", "region_max")
+LOCATION_TASKS = ("region_argmin", "region_argmax", "nearest_value_location")
+TASKS = READ_TASKS + STAT_TASKS + LOCATION_TASKS
 DEFAULT_TOLERANCE = 0.2
 
 
@@ -60,7 +63,7 @@ def query_points(task: str, spec: Mapping, shape: Sequence[int]) -> list[list[in
         if step not in ([0, 1], [1, 0]) or type(count) is not int or count < 2:
             raise ValueError("Line requires a positive horizontal/vertical unit step and count >= 2")
         points = [[start[0] + i * step[0], start[1] + i * step[1]] for i in range(count)]
-    elif task == "region_values":
+    elif task == "region_values" or task in STAT_TASKS + LOCATION_TASKS:
         start, size = spec["start"], spec["size"]
         if len(size) != 2 or any(type(n) is not int or n < 2 for n in size):
             raise ValueError("Region dimensions must be integers >= 2")
@@ -93,6 +96,23 @@ def render_question(task: str, spec: Mapping, shape: Sequence[int], variant: int
                 f"one cell at a time, for {spec['count']} cells including the starting cell.")
     r, c = spec["start"]
     h, w = spec["size"]
+    region = f"the {h} by {w} region whose top-left cell is row {r}, column {c}"
+    if task in STAT_TASKS:
+        statistic = {"region_mean": "arithmetic mean", "region_std": "population standard deviation (divide variance by N)",
+                     "region_min": "minimum", "region_max": "maximum"}[task]
+        stem = ("Compute", "Report", "What is")[variant]
+        return f"{stem} the approximate {statistic} of the standardized values in {region}? Return [value]."
+    if task in LOCATION_TASKS:
+        if task == "nearest_value_location":
+            target = spec["target"]
+            if type(target) not in (int, float) or not math.isfinite(target):
+                raise ValueError("Nearest-value query needs a finite displayed target")
+            description = f"a cell whose standardized value is closest in absolute difference to {target}"
+        else:
+            description = "a cell attaining the " + ("minimum" if task == "region_argmin" else "maximum") + " standardized value"
+        stem = ("Find", "Locate", "Give the location of")[variant]
+        return (f"{stem} {description} within {region}. Return [row, column] using the full input grid's "
+                "one-based coordinates. If tied, return any one of the tied cells.")
     stems = ("Read the approximate standardized values", "Report the approximate z values",
              "Extract the standardized field values")
     return (f"{stems[variant]} in the {h} by {w} region whose top-left cell is row {r}, "
@@ -103,14 +123,16 @@ def build_prompt(record: Mapping) -> str:
     """Explicit inference allowlist: only public grid shape and question text."""
     h, w = record["grid_shape"]
     return (f"The supplied field memory represents a {h} by {w} standardized numerical grid.\n"
-            "Coordinates use one-based row and column indices. Read approximate values directly "
-            "from the field. Return only one JSON array of numbers in the requested order, "
-            "including for a single value. Do not output coordinates or explanations.\n\n"
+            "Coordinates use one-based row and column indices of the full input grid. "
+            "Use the field to answer the question. Return only one JSON array: ordered approximate "
+            "values for numerical queries (including a single value), or [row, column] integers "
+            "when a location is requested. Do not add explanations.\n\n"
             f"Question: {record['question']}\nAnswer:")
 
 
 def sample_spec(task: str, shape: Sequence[int], rng: random.Random, *,
-                multi_counts=(2, 3, 4), line_counts=(3, 4, 5), region_shapes=((2, 2),)) -> dict:
+                multi_counts=(2, 3, 4), line_counts=(3, 4, 5), region_shapes=((2, 2),),
+                statistic_region_shapes=((2, 2), (4, 4)), z=None) -> dict:
     h, w = shape
     if task == "single_point":
         return {"points": [[rng.randrange(h) + 1, rng.randrange(w) + 1]]}
@@ -127,14 +149,40 @@ def sample_spec(task: str, shape: Sequence[int], rng: random.Random, *,
         return {"start": [rng.randrange(h - (count - 1) * step[0]) + 1,
                           rng.randrange(w - (count - 1) * step[1]) + 1],
                 "step": step, "count": count}
-    if task == "region_values":
-        sizes = [(rh, rw) for rh, rw in region_shapes if rh <= h and rw <= w]
+    if task == "region_values" or task in STAT_TASKS + LOCATION_TASKS:
+        shapes = region_shapes if task == "region_values" else statistic_region_shapes
+        sizes = [(rh, rw) for rh, rw in shapes if rh <= h and rw <= w]
         if not sizes:
             raise ValueError("No configured region fits this field")
         rh, rw = rng.choice(sizes)
-        return {"start": [rng.randrange(h - rh + 1) + 1, rng.randrange(w - rw + 1) + 1],
-                "size": [rh, rw]}
+        spec = {"start": [rng.randrange(h - rh + 1) + 1, rng.randrange(w - rw + 1) + 1], "size": [rh, rw]}
+        if task == "nearest_value_location":
+            if z is None:
+                raise ValueError("Nearest-value sampling requires the real field")
+            row, col = rng.choice(query_points(task, spec, shape))
+            # Round BEFORE computing the nearest cell: the visible target defines truth.
+            spec["target"] = round(float(z[row - 1, col - 1]), 1) or 0.0
+        return spec
     raise ValueError(f"Unsupported task: {task}")
+
+
+def oracle_answer(z: torch.Tensor, task: str, spec: Mapping) -> tuple[list, list]:
+    points = query_points(task, spec, z.shape)
+    values = torch.tensor([float(z[r - 1, c - 1]) for r, c in points], dtype=torch.float64)
+    if task in READ_TASKS:
+        return values.tolist(), []
+    if task in STAT_TASKS:
+        value = {"region_mean": lambda: values.mean(), "region_std": lambda: values.std(unbiased=False),
+                 "region_min": lambda: values.min(), "region_max": lambda: values.max()}[task]()
+        return [float(value)], []
+    if task == "nearest_value_location":
+        distance = (values - float(spec["target"])).abs()
+        mask = distance == distance.min()
+    else:
+        extreme = values.min() if task == "region_argmin" else values.max()
+        mask = values == extreme
+    coordinates = [p for p, selected in zip(points, mask.tolist()) if selected]
+    return list(coordinates[0]), coordinates
 
 
 def make_record(state_ref: str, z: torch.Tensor, task: str, spec: Mapping, *,
@@ -144,16 +192,17 @@ def make_record(state_ref: str, z: torch.Tensor, task: str, spec: Mapping, *,
     if 0.5 * 10 ** -decimals >= tolerance:
         raise ValueError("Answer rounding must be strictly finer than the scoring tolerance")
     shape = list(z.shape)
-    points = query_points(task, spec, shape)
-    values = [float(z[r - 1, c - 1]) for r, c in points]
-    answer = [round(value, decimals) or 0.0 for value in values]
+    values, coordinates = oracle_answer(z, task, spec)
+    answer = values if coordinates else [round(value, decimals) or 0.0 for value in values]
     identity = {"state_ref": state_ref, "task": task, "spec": spec, "variant": variant}
     return {"qa_id": json_hash(identity)[:24], "state_ref": state_ref, "task_type": task,
             "grid_shape": shape, "template_variant": variant,
             "question": render_question(task, spec, shape, variant),
             "answer": json.dumps(answer, allow_nan=False),
             "oracle": {"query_spec": dict(spec), "values": values,
-                       "value_space": "stored_fp16_z", "absolute_tolerance": tolerance}}
+                       "value_space": "stored_fp16_z", "absolute_tolerance": tolerance,
+                       "answer_kind": "coordinate" if coordinates else "values",
+                       "valid_coordinates": coordinates}}
 
 
 def validate_record(record: Mapping, z: torch.Tensor | None = None) -> None:
@@ -165,13 +214,26 @@ def validate_record(record: Mapping, z: torch.Tensor | None = None) -> None:
                                                record["grid_shape"], record["template_variant"]):
         raise ValueError("Question and audit query specification disagree")
     values = oracle["values"]
-    if len(values) != len(points) or any(type(x) not in (int, float) or not math.isfinite(x) for x in values):
+    expected_count = len(points) if record["task_type"] in READ_TASKS else 2 if record["task_type"] in LOCATION_TASKS else 1
+    if len(values) != expected_count or any(type(x) not in (int, float) or not math.isfinite(x) for x in values):
         raise ValueError("Invalid oracle values")
+    coordinates = oracle["valid_coordinates"]
+    coordinate_task = record["task_type"] in LOCATION_TASKS
+    if oracle["answer_kind"] != ("coordinate" if coordinate_task else "values"):
+        raise ValueError("Answer kind disagrees with task")
+    if coordinate_task:
+        if not coordinates or any(p not in points or any(type(v) is not int for v in p) for p in coordinates):
+            raise ValueError("Invalid accepted coordinates")
+        if values != coordinates[0] or len(set(map(tuple, coordinates))) != len(coordinates):
+            raise ValueError("Invalid canonical coordinate/tie set")
+    elif coordinates:
+        raise ValueError("Numerical answers cannot have coordinate alternatives")
     tol = oracle["absolute_tolerance"]
     if type(tol) not in (int, float) or not math.isfinite(tol) or tol <= 0:
         raise ValueError("Invalid oracle tolerance")
     if z is not None:
-        if list(z.shape) != record["grid_shape"] or values != [float(z[r - 1, c - 1]) for r, c in points]:
+        replay_values, replay_coordinates = oracle_answer(z, record["task_type"], oracle["query_spec"])
+        if list(z.shape) != record["grid_shape"] or values != replay_values or coordinates != replay_coordinates:
             raise ValueError("Oracle does not replay from the source field")
     if not score_answer(record, record["answer"])["all_correct"]:
         raise ValueError("Reference answer fails its own scoring contract")
@@ -205,13 +267,25 @@ def score_answer(record: Mapping, prediction: str, *, terminated: bool = True) -
         error = "generation_truncated"
     elif error is None and observed_count != len(expected):
         error = "wrong_value_count"
+    coordinate_task = record["oracle"]["answer_kind"] == "coordinate"
+    if error is None and coordinate_task:
+        h, w = record["grid_shape"]
+        if not all(v.is_integer() for v in values) or not (1 <= values[0] <= h and 1 <= values[1] <= w):
+            error = "invalid_coordinate"
     valid = error is None
     errors = [abs(a - b) for a, b in zip(values, expected)] if valid else []
-    hits = sum(err <= tolerance for err in errors)
+    # A coordinate is one indivisible answer, never two approximately correct numbers.
+    if coordinate_task:
+        hits = int(valid and values in record["oracle"]["valid_coordinates"])
+        units = 1
+        errors = []
+    else:
+        hits, units = sum(err <= tolerance for err in errors), len(expected)
     return {"valid": valid, "error": error, "expected_count": len(expected),
+            "answer_kind": record["oracle"]["answer_kind"], "scoring_units": units,
             "observed_count": observed_count, "missing_count": max(0, len(expected) - observed_count),
             "extra_count": max(0, observed_count - len(expected)), "correct_values": hits,
-            "point_accuracy": hits / len(expected), "all_correct": valid and hits == len(expected),
+            "point_accuracy": hits / units, "all_correct": valid and hits == units,
             "absolute_errors": errors, "parsed_values": values}
 
 
@@ -221,18 +295,21 @@ def summarize_scores(rows: Sequence[Mapping]) -> dict:
 
     def aggregate(group):
         n = len(group)
-        expected = sum(r["score"]["expected_count"] for r in group)
-        return {"questions": n, "values": expected,
+        expected = sum(r["score"]["scoring_units"] for r in group)
+        return {"questions": n, "values": expected, "scoring_units": expected,
+                "unit_accuracy": sum(r["score"]["correct_values"] for r in group) / expected,
+                "answer_accuracy": sum(r["score"]["all_correct"] for r in group) / n,
                 "valid_rate": sum(r["score"]["valid"] for r in group) / n,
                 "point_accuracy": sum(r["score"]["correct_values"] for r in group) / expected,
                 "all_correct_rate": sum(r["score"]["all_correct"] for r in group) / n,
                 "errors": dict(Counter(r["score"]["error"] for r in group if r["score"]["error"]))}
 
     result = aggregate(rows)
-    for key in ("task_type", "shape", "field"):
+    for key in ("task_type", "shape", "field", "answer_kind"):
         groups = defaultdict(list)
         for row in rows:
-            groups[str(row[key])].append(row)
+            groups[str(row["score"][key] if key == "answer_kind" else row[key])].append(row)
         result[f"by_{key}"] = {name: aggregate(group) for name, group in sorted(groups.items())}
     result["macro_task_point_accuracy"] = sum(v["point_accuracy"] for v in result["by_task_type"].values()) / len(result["by_task_type"])
+    result["macro_task_answer_accuracy"] = sum(v["answer_accuracy"] for v in result["by_task_type"].values()) / len(result["by_task_type"])
     return result

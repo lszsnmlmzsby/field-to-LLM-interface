@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import signal
 import sys
 import time
 from collections import defaultdict
@@ -26,7 +27,7 @@ from tensor_compression.downstream.point_readout_data import (
     PointReadoutDataset, load_config, resolve_path, write_json,
 )
 
-CHECKPOINT_TYPE = "qwen_standardized_point_readout_v1"
+CHECKPOINT_TYPE = "qwen_standardized_field_qa_v2"
 
 
 def model_args(config, model_dir=None, *, checkpointing=True):
@@ -198,10 +199,12 @@ def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_pat
 
 def validate_config(config):
     t, e = config["training"], config["evaluation"]
-    for key in ("batch_size", "gradient_accumulation_steps", "max_updates", "max_prompt_tokens",
+    for key in ("batch_size", "gradient_accumulation_steps", "epochs", "max_prompt_tokens",
                 "max_target_tokens", "log_interval", "save_every_updates", "eval_every_updates"):
         if type(t[key]) is not int or t[key] <= 0:
             raise ValueError(f"training.{key} must be a positive integer")
+    if t.get("max_updates") is not None and (type(t["max_updates"]) is not int or t["max_updates"] <= 0):
+        raise ValueError("max_updates must be null (derive from epochs) or a positive integer")
     if e["max_new_tokens"] < t["max_target_tokens"]:
         raise ValueError("Generation budget must cover training answers including EOS")
     for key in ("lr", "gate_lr", "grad_clip_norm"):
@@ -267,6 +270,13 @@ def validate_resume(checkpoint, identity):
         raise ValueError("Checkpoint dataset/model/tokenizer/recipe differs; resume cannot change an experiment")
 
 
+def planned_updates(records, training, seed):
+    if training.get("max_updates") is not None:
+        return training["max_updates"]
+    count = len(shape_batches(records, training["batch_size"], seed, 0))
+    return math.ceil(count * training["epochs"] / training["gradient_accumulation_steps"])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(ROOT / "configs/field_to_llm_point_readout.yaml"))
@@ -280,11 +290,14 @@ def main():
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument("--split", choices=("val", "test"), default="val")
     parser.add_argument("--audit-only", action="store_true", help="Replay data without loading Qwen")
+    parser.add_argument("--stop-after-updates", type=int, help="Save and stop after N additional updates; preserves the full resume schedule")
     cli = parser.parse_args()
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("This workstation entry point is single-device; use python, not multi-rank torchrun")
     if cli.evaluate_only and not cli.resume:
         parser.error("--evaluate-only requires --resume")
+    if cli.stop_after_updates is not None and cli.stop_after_updates <= 0:
+        parser.error("--stop-after-updates must be positive")
     if cli.split == "test" and not (cli.evaluate_only or cli.audit_only):
         parser.error("The test split is accessible only through explicit evaluation/audit")
     config = load_config(cli.config, cli.profile)
@@ -296,6 +309,12 @@ def main():
         raise FileExistsError("Use a new empty output directory (except when resuming training)")
     output.mkdir(parents=True, exist_ok=True)
     datasets = {}
+    stop_requested = False
+    def request_stop(signum, frame):
+        nonlocal stop_requested
+        stop_requested = True
+        print("Stop requested; saving at the next completed optimizer update.", flush=True)
+    previous_handlers = {}
     try:
         splits = [cli.split] if cli.evaluate_only else ["train", "val"]
         if cli.audit_only:
@@ -349,15 +368,17 @@ def main():
             return
         optimizer, _ = core.build_optimizer(sidecar, args)
         training = config["training"]
-        maximum = int(training["max_updates"])
+        maximum = planned_updates(datasets["train"].records, training, args.seed)
         scheduler, _ = core.build_sidecar_scheduler(optimizer, "cosine", maximum,
                                                    float(training.get("warmup_ratio", .03)),
                                                    float(training.get("min_lr_ratio", .2)))
         step, epoch, cursor, best = 0, 0, 0, -1.0
+        validation_pending = False
         if checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
             scheduler.load_state_dict(checkpoint["scheduler"])
             step, epoch, cursor, best = (checkpoint[k] for k in ("step", "epoch", "cursor", "best"))
+            validation_pending = checkpoint.get("validation_pending", False)
             random.setstate(checkpoint["python_rng"])
             torch.set_rng_state(checkpoint["torch_rng"])
             if device.type == "cuda" and checkpoint["cuda_rng"] is not None:
@@ -366,19 +387,44 @@ def main():
             raise ValueError("Checkpoint step exceeds configured training budget")
         train_data = datasets["train"]
         batches = shape_batches(train_data.records, training["batch_size"], args.seed, epoch)
+        invocation_start_step = step
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, request_stop)
 
         def save(path):
             core.atomic_torch_save(path, {"checkpoint_type": CHECKPOINT_TYPE, "identity": identity,
                 "sidecar": {k: v.detach().cpu().clone() for k, v in sidecar.state_dict().items()},
                 "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                 "step": step, "epoch": epoch, "cursor": cursor, "best": best,
+                "validation_pending": validation_pending,
                 "python_rng": random.getstate(), "torch_rng": torch.get_rng_state(),
                 "cuda_rng": torch.cuda.get_rng_state(device) if device.type == "cuda" else None})
+
+        def validate_and_save():
+            nonlocal best, validation_pending
+            metrics = evaluate(llm, sidecar, tokenizer, datasets["val"], device, dtype, config,
+                               output / f"val_predictions_{step}.jsonl")
+            core.append_jsonl(output / "validation.jsonl", {"step": step, **metrics})
+            score = metrics["seen_shapes"]["macro_task_answer_accuracy"]
+            validation_pending = False
+            if score > best:
+                best = score
+                save(output / "best.pt")
+            print(f"validation step={step} macro_task_answer_accuracy={score:.4f}", flush=True)
+            save(output / "last.pt")
 
         print(f"startup=point_readout tasks={dataset.metadata['tasks']} updates={maximum} "
               f"batch={training['batch_size']} accumulation={training['gradient_accumulation_steps']}", flush=True)
         start = time.perf_counter()
-        while step < maximum:
+        write_json(output / "training_plan.json", {"planned_updates": maximum, "train_questions": len(train_data),
+            "tasks": dataset.metadata["tasks"], "batch_size": training["batch_size"],
+            "gradient_accumulation_steps": training["gradient_accumulation_steps"],
+            "selection_metric": "seen_shapes.macro_task_answer_accuracy"})
+        # A stop or decoder failure immediately before validation must not skip it,
+        # including a checkpoint already at the final optimizer update.
+        if validation_pending:
+            validate_and_save()
+        while step < maximum and not stop_requested:
             micro_batches = []
             for _ in range(training["gradient_accumulation_steps"]):
                 if cursor >= len(batches):
@@ -412,18 +458,26 @@ def main():
                          "elapsed_seconds": time.perf_counter() - start}
                 core.append_jsonl(output / "train.jsonl", entry)
                 print(json.dumps(entry), flush=True)
-            if step % training["eval_every_updates"] == 0 or step == maximum:
-                metrics = evaluate(llm, sidecar, tokenizer, datasets["val"], device, dtype, config,
-                                   output / f"val_predictions_{step}.jsonl")
-                core.append_jsonl(output / "validation.jsonl", {"step": step, **metrics})
-                score = metrics["seen_shapes"]["macro_task_point_accuracy"]
-                if score > best:
-                    best = score
-                    save(output / "best.pt")
-                print(f"validation step={step} macro_task_point_accuracy={score:.4f}", flush=True)
-            if step % training["save_every_updates"] == 0 or step == maximum:
+            should_stop = stop_requested or (cli.stop_after_updates is not None and step - invocation_start_step >= cli.stop_after_updates)
+            validation_pending = step % training["eval_every_updates"] == 0 or step == maximum
+            # Save before potentially long validation, so termination loses no completed update.
+            if step % training["save_every_updates"] == 0 or step % training["eval_every_updates"] == 0 or step == maximum or should_stop:
                 save(output / "last.pt")
+            if should_stop and step < maximum:
+                break
+            if validation_pending:
+                validate_and_save()
+            if stop_requested:
+                break
+        # Also covers a signal arriving between the last periodic-save check and
+        # the loop condition, and resuming a finished checkpoint into a new directory.
+        save(output / "last.pt")
+        write_json(output / "run_summary.json", {"status": "completed" if step == maximum else "stopped",
+            "step": step, "planned_updates": maximum, "best_score": best if best >= 0 else None,
+            "elapsed_this_invocation_seconds": time.perf_counter() - start, "last_checkpoint": str(output / "last.pt")})
     finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
         for d in datasets.values():
             d.close()
 

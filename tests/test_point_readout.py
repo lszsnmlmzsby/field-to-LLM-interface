@@ -16,7 +16,7 @@ for path in (ROOT, ROOT / "src"):
     sys.path.insert(0, str(path))
 
 from tensor_compression.downstream.point_readout import (
-    TASKS, build_prompt, make_record, normalize_field, parse_answer, query_points,
+    TASKS, LOCATION_TASKS, build_prompt, make_record, normalize_field, oracle_answer, parse_answer, query_points,
     sample_spec, score_answer, summarize_scores, validate_record,
 )
 from tensor_compression.downstream.point_readout_data import (
@@ -32,13 +32,61 @@ def z():
 
 @pytest.mark.parametrize("task", TASKS)
 def test_truth_replay_and_reference_scoring(z, task):
-    spec = sample_spec(task, z.shape, random.Random(2))
+    spec = sample_spec(task, z.shape, random.Random(2), z=z)
     row = make_record("state", z, task, spec)
     validate_record(row, z)
     assert score_answer(row, row["answer"])["all_correct"]
     row["oracle"]["values"][0] += 1
-    with pytest.raises(ValueError, match="replay"):
+    with pytest.raises(ValueError, match="replay|canonical"):
         validate_record(row, z)
+
+
+def test_region_statistics_use_subregion_of_whole_grid():
+    field = torch.tensor([[90., 90., 90.], [90., 1., 3.], [90., 5., 7.]])
+    spec = {"start": [2, 2], "size": [2, 2]}
+    expected = {"region_mean": 4., "region_std": 5. ** .5, "region_min": 1., "region_max": 7.}
+    for task, value in expected.items():
+        values, coordinates = oracle_answer(field, task, spec)
+        assert values == pytest.approx([value])
+        assert coordinates == []
+        row = make_record("state", field, task, spec)
+        validate_record(row, field)
+
+
+@pytest.mark.parametrize("task", LOCATION_TASKS)
+def test_coordinate_ties_are_complete_pairs_not_fuzzy_values(task):
+    field = torch.tensor([[9., 9., 9.], [9., 1., 4.], [9., 4., 1.]])
+    spec = {"start": [2, 2], "size": [2, 2], "target": 1.}
+    row = make_record("state", field, task, spec)
+    correct = [[2, 3], [3, 2]] if task == "region_argmax" else [[2, 2], [3, 3]]
+    assert row["oracle"]["valid_coordinates"] == correct
+    for pair in correct:
+        score = score_answer(row, json.dumps(pair))
+        assert score["all_correct"] and score["scoring_units"] == 1
+        assert score["absolute_errors"] == []
+    wrong = [correct[0][0], correct[1][1]]
+    assert score_answer(row, json.dumps(wrong))["correct_values"] == 0
+    for pair in ([2.1, 2], [0, 2], [4, 2]):
+        assert score_answer(row, json.dumps(pair))["error"] == "invalid_coordinate"
+    assert score_answer(row, "[2, 2, 3, 3]")["error"] == "wrong_value_count"
+
+
+def test_nearest_value_uses_visible_rounded_target():
+    field = torch.tensor([[.14, .11], [.9, .8]])
+    spec = {"start": [1, 1], "size": [2, 2], "target": .1}
+    row = make_record("state", field, "nearest_value_location", spec)
+    assert row["oracle"]["values"] == [1, 2]
+    assert "0.1" in row["question"]
+    sampled = sample_spec("nearest_value_location", [2, 2], random.Random(1), z=field)
+    assert sampled["target"] == round(sampled["target"], 1)
+
+
+def test_coordinate_prompt_uses_no_oracle(z):
+    row = make_record("state", z, "region_argmax", {"start": [1, 1], "size": [2, 2]})
+    prompt = build_prompt(row)
+    row["oracle"] = {"values": "SECRET", "valid_coordinates": "SECRET"}
+    row["answer"] = "SECRET"
+    assert build_prompt(row) == prompt
 
 
 def test_region_and_vertical_line_order():
@@ -110,6 +158,18 @@ def test_aggregate_keeps_invalid_answers_in_denominator(z):
     assert metrics["macro_task_point_accuracy"] == .5
 
 
+def test_mixed_task_macro_gives_each_task_equal_weight(z):
+    read = make_record("state", z, "region_values", {"start": [1, 1], "size": [2, 2]})
+    locate = make_record("state", z, "region_argmax", {"start": [1, 1], "size": [2, 2]})
+    rows = [{"task_type": row["task_type"], "shape": "10x12", "field": "Vx",
+             "score": score_answer(row, answer)} for row, answer in ((read, read["answer"]), (locate, "[1, 1]"))]
+    metrics = summarize_scores(rows)
+    assert metrics["scoring_units"] == 5
+    assert metrics["unit_accuracy"] == .8
+    assert metrics["macro_task_answer_accuracy"] == .5
+    assert metrics["by_answer_kind"]["coordinate"]["answer_accuracy"] == 0
+
+
 @pytest.fixture
 def data_fixture(tmp_path):
     source = tmp_path / "source.h5"
@@ -140,6 +200,18 @@ def test_dataset_splits_replay_and_reproducibility(data_fixture, tmp_path):
     assert repeated["files"] == metadata["files"]
     with pytest.raises(FileExistsError):
         build_dataset(config, source, qa)
+
+
+def test_selected_tasks_and_invalid_statistic_region(data_fixture, tmp_path):
+    source, _, config, _ = data_fixture
+    config = copy.deepcopy(config)
+    config["generation"]["tasks"] = ["single_point", "region_mean", "region_argmax"]
+    metadata = build_dataset(config, source, tmp_path / "selected")
+    assert metadata["counts"]["train"] == 24
+    assert metadata["task_counts"]["train"] == {name: 8 for name in config["generation"]["tasks"]}
+    config["generation"]["statistic_region_shapes"] = [[30, 30]]
+    with pytest.raises(ValueError, match="region must fit"):
+        build_dataset(config, source, tmp_path / "bad_region")
 
 
 def test_source_mutation_rejected(data_fixture):
@@ -327,6 +399,20 @@ def test_batching_has_no_duplication_and_is_deterministic(data_fixture):
         dataset.close()
 
 
+def test_automatic_training_budget_respects_selected_tasks(data_fixture):
+    from scripts.train_point_readout import planned_updates
+    source, qa, config, _ = data_fixture
+    dataset = PointReadoutDataset(qa, source, "train")
+    try:
+        training = {**config["training"], "max_updates": None, "epochs": 2}
+        assert planned_updates(dataset.records, training, 42) == 44
+        subset = [r for r in dataset.records if r["task_type"] == "single_point"]
+        assert planned_updates(subset, training, 42) == 4
+        assert planned_updates(subset, {**training, "max_updates": 7}, 42) == 7
+    finally:
+        dataset.close()
+
+
 def test_resume_rejects_wrong_protocol_or_changed_contract():
     from scripts.train_point_readout import CHECKPOINT_TYPE, validate_resume
     with pytest.raises(ValueError, match="multiple-choice"):
@@ -358,7 +444,7 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
     llm_config = copy.deepcopy(example_llm.config)
     config["model"]["gradient_checkpointing"] = True
     config["training"].update(max_updates=2, log_interval=1, save_every_updates=1,
-                              eval_every_updates=2, gradient_accumulation_steps=2)
+                              eval_every_updates=1, gradient_accumulation_steps=2)
     config["experiment_profile"] = "test"
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"profiles": {"smoke": config}}), encoding="utf-8")
@@ -385,24 +471,28 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
     assert (uninterrupted / "best.pt").exists()
     assert not list(uninterrupted.glob("test*"))
     expected = torch.load(uninterrupted / "last.pt", weights_only=True)
-    original_save = trainer.core.atomic_torch_save
-
-    def interrupted_save(path, payload):
-        original_save(path, payload)
-        if Path(path).name == "last.pt" and payload["step"] == 1:
-            raise KeyboardInterrupt("simulated interruption after a complete optimizer update")
-
     interrupted = tmp_path / "interrupted"
-    monkeypatch.setattr(trainer.core, "atomic_torch_save", interrupted_save)
-    with pytest.raises(KeyboardInterrupt):
-        run(interrupted)
-    monkeypatch.setattr(trainer.core, "atomic_torch_save", original_save)
+    run(interrupted, "--stop-after-updates", "1")
+    summary = json.loads((interrupted / "run_summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "stopped" and summary["step"] == 1 and summary["planned_updates"] == 2
+    assert torch.load(interrupted / "last.pt", weights_only=True)["validation_pending"]
     run(interrupted, "--resume", str(interrupted / "last.pt"))
     resumed = torch.load(interrupted / "last.pt", weights_only=True)
+    assert json.loads((interrupted / "run_summary.json").read_text(encoding="utf-8"))["status"] == "completed"
     assert resumed["step"] == expected["step"] == 2
+    assert not resumed["validation_pending"]
+    assert [json.loads(line)["step"] for line in (interrupted / "validation.jsonl").read_text().splitlines()] == [1, 2]
     assert (resumed["epoch"], resumed["cursor"]) == (expected["epoch"], expected["cursor"])
     for name in expected["sidecar"]:
         torch.testing.assert_close(resumed["sidecar"][name], expected["sidecar"][name], rtol=0, atol=0)
+    # Recreate a final-step checkpoint saved before validation; resume must finish
+    # validation even though no optimizer updates remain, and produce best.pt.
+    pending = tmp_path / "pending_final.pt"
+    torch.save({**expected, "validation_pending": True, "best": -1.0}, pending)
+    recovered = tmp_path / "recovered_final"
+    run(recovered, "--resume", str(pending))
+    assert (recovered / "best.pt").exists()
+    assert torch.load(recovered / "last.pt", weights_only=True)["step"] == 2
     evaluation = tmp_path / "test_eval"
     run(evaluation, "--resume", str(interrupted / "best.pt"), "--evaluate-only", "--split", "test")
     online = json.loads((evaluation / "test_metrics.json").read_text(encoding="utf-8"))
@@ -414,3 +504,19 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
         assert online["questions"] == len(dataset)
     finally:
         dataset.close()
+
+
+def test_server_field_inspection_and_download_checksum(data_fixture, tmp_path):
+    import hashlib
+    from scripts.check_field_qa_environment import inspect_fields
+    from scripts.download_pdebench_field import verify
+    source, _, _, _ = data_fixture
+    result = inspect_fields(source, ["Vx", "Vy"])
+    assert result["Vx"] == [20, 3, 24, 28]
+    with pytest.raises(ValueError):
+        inspect_fields(source, ["missing"])
+    artifact = tmp_path / "download.part"
+    artifact.write_bytes(b"complete fixture")
+    verify(artifact, hashlib.md5(b"complete fixture").hexdigest())
+    with pytest.raises(ValueError, match="MD5 mismatch"):
+        verify(artifact, hashlib.md5(b"incomplete fixture").hexdigest())

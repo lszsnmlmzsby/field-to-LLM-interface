@@ -13,7 +13,7 @@ import torch
 
 from tensor_compression.downstream.patch_qa_contract import sha256_file
 from tensor_compression.downstream.point_readout import (
-    FORMAT, PROMPT_VERSION, TASKS, json_hash, make_record, normalize_field,
+    FORMAT, PROMPT_VERSION, TASKS, STAT_TASKS, LOCATION_TASKS, json_hash, make_record, normalize_field,
     sample_spec, validate_record,
 )
 from tensor_compression.downstream.variable_shape import experiment_config, parse_shapes
@@ -62,12 +62,16 @@ def build_dataset(config, hdf5_path, output_dir):
     multi_counts = list(generation.get("multi_counts", [2, 3, 4]))
     line_counts = list(generation.get("line_counts", [3, 4, 5]))
     region_shapes = generation.get("region_shapes", [[2, 2]])
+    statistic_shapes = generation.get("statistic_region_shapes", [[2, 2], [4, 4]])
     for name, counts in (("multi_counts", multi_counts), ("line_counts", line_counts)):
         if not counts or any(type(n) is not int or n < 2 for n in counts):
             raise ValueError(f"{name} must contain integers >= 2")
     if not region_shapes or any(len(size) != 2 or any(type(n) is not int or n < 2 for n in size)
                                for size in region_shapes):
         raise ValueError("region_shapes must contain integer dimensions >= 2")
+    if not statistic_shapes or any(len(size) != 2 or any(type(n) is not int or n < 2 for n in size)
+                                  for size in statistic_shapes):
+        raise ValueError("statistic_region_shapes must contain integer dimensions >= 2")
     for h, w in train_shapes + heldout:
         if "multi_point" in tasks and max(multi_counts) > h * w:
             raise ValueError("A multi-point query exceeds the number of grid cells")
@@ -75,6 +79,8 @@ def build_dataset(config, hdf5_path, output_dir):
             raise ValueError("Every configured line length must fit both axes")
         if "region_values" in tasks and any(rh > h or rw > w for rh, rw in region_shapes):
             raise ValueError("Every configured region must fit every shape")
+        if set(tasks) & set(STAT_TASKS + LOCATION_TASKS) and any(rh > h or rw > w for rh, rw in statistic_shapes):
+            raise ValueError("Every statistic/search region must fit every shape")
     train_count = int(generation["train_states"])
     eval_count = int(generation["eval_states_per_shape"])
     if train_count < len(train_shapes) * len(fields) or eval_count < len(fields):
@@ -105,7 +111,7 @@ def build_dataset(config, hdf5_path, output_dir):
         random.Random(int(generation["split_seed"])).shuffle(samples)
         partitions = {"train": samples[:int(n * .8)], "val": samples[int(n * .8):int(n * .9)],
                       "test": samples[int(n * .9):]}
-        if min(map(len, partitions.values())) < 2:
+        if n < 20 or min(map(len, partitions.values())) < 2:
             raise ValueError("Need at least 20 source trajectories for 80/10/10 splits with >=2 each")
         output_dir.mkdir(parents=True, exist_ok=True)
         marker = output_dir / ".build_in_progress"
@@ -148,7 +154,8 @@ def build_dataset(config, hdf5_path, output_dir):
                 states.append(state)
                 for task in tasks:
                     spec = sample_spec(task, shape, rng, multi_counts=multi_counts,
-                                       line_counts=line_counts, region_shapes=region_shapes)
+                                       line_counts=line_counts, region_shapes=region_shapes,
+                                       statistic_region_shapes=statistic_shapes, z=z)
                     record = make_record(key, z, task, spec, variant=rng.choice(variants),
                                          decimals=decimals, tolerance=tolerance)
                     validate_record(record, z)
@@ -168,6 +175,7 @@ def build_dataset(config, hdf5_path, output_dir):
                             "invalid_answer_counts_as_wrong": True},
                 "rejected_attempts": dict(rejected),
                 "counts": {split: len(rows) for split, rows in records.items()},
+                "task_counts": {split: dict(Counter(r["task_type"] for r in rows)) for split, rows in records.items()},
                 "files": {name: sha256_file(output_dir / name) for name in files}}
     write_json(output_dir / "metadata.json", metadata)
     marker.unlink()
@@ -187,7 +195,7 @@ class PointReadoutDataset:
             raise ValueError("Dataset build did not finish")
         self.metadata = json.loads((self.qa_dir / "metadata.json").read_text(encoding="utf-8"))
         if self.metadata["format"] != FORMAT or self.metadata["prompt_version"] != PROMPT_VERSION:
-            raise ValueError("Unsupported numerical readout protocol")
+            raise ValueError("Unsupported field-QA protocol: rebuild v2 data; v1 prompts/checkpoints are incompatible")
         expected_files = {"states.jsonl", "train.jsonl", "val.jsonl", "test.jsonl"}
         if set(self.metadata["files"]) != expected_files:
             raise ValueError("Incomplete dataset manifest")
@@ -212,6 +220,8 @@ class PointReadoutDataset:
         if not self.records or len({r["qa_id"] for r in self.records}) != len(self.records):
             raise ValueError("Empty dataset or duplicate question IDs")
         for row in self.records:
+            if row["task_type"] not in self.metadata["tasks"]:
+                raise ValueError("Question task is not declared in the manifest")
             state = self.states[row["state_ref"]]
             if state["split"] != split or row["grid_shape"] != state["grid_shape"]:
                 raise ValueError("Question references a wrong split/shape")
