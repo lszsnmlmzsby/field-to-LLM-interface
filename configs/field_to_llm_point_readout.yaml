@@ -1,0 +1,111 @@
+# Real fields only. Open generation of ordered approximate standardized values.
+# This is a separate task protocol; existing multiple-choice runs are unchanged.
+model:
+  name_or_path: Qwen/Qwen2.5-14B-Instruct
+  torch_dtype: bfloat16
+  trust_remote_code: false
+  gradient_checkpointing: true
+data:
+  hdf5_path: ${PDEBENCH_HDF5}
+  fields: [Vx, Vy, density, pressure]
+  patch_size: 16  # Encoder initialization reference; runtime grids remain variable.
+  train_shapes: [8x8, 8x16, 16x8, 16x16]
+  heldout_shapes: [12x20, 20x12]
+  input_cache_size: 8
+generation:
+  seed: 20260915
+  split_seed: 20260905
+  tasks: [single_point, multi_point, line_profile, region_values]
+  multi_counts: [2, 3, 4]
+  line_counts: [3, 4, 5]
+  region_shapes: [[2, 2]]
+  template_variants: [0, 1]
+  answer_decimals: 1
+  absolute_tolerance: 0.2
+  max_attempts_per_state: 200
+field_encoder:
+  normalization:
+    mode: zscore
+    scope: channel
+    stats_path: null
+    clip_min: null
+    clip_max: null
+  model:
+    name: conv_token_autoencoder_2d
+    input_size: [16, 16]
+    base_channels: 32
+    channel_multipliers: []
+    num_res_blocks: 1
+    latent_dim: 8
+    latent_grid: [16, 16]
+    preserve_input_channels: true
+    dropout: 0.0
+    norm: group
+    activation: gelu
+    output_activation: identity
+spatial_adapter:
+  type: full_grid_transformer
+  adapter_dim: 512
+  adapter_layers: 2
+  adapter_heads: 8
+  dropout: 0.0
+memory:
+  value_fourier_bands: 4
+  value_hidden_dim: 128
+cross_attention:
+  layers_1based: [8, 20, 32]
+  bridge_dim: 512
+  heads: 8
+  dropout: 0.0
+  gate_init: 0.0
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  lr: 5.0e-5
+  gate_lr: 5.0e-4
+  weight_decay: 1.0e-4
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.2
+  grad_clip_norm: 1.0
+  value_reconstruction_weight: 0.01
+  max_prompt_tokens: 384
+  max_target_tokens: 96  # Includes EOS; never silently truncate a target.
+  log_interval: 20
+  save_every_updates: 100
+  eval_every_updates: 500
+evaluation:
+  max_new_tokens: 96
+  use_cache: true
+runtime:
+  seed: 42
+profiles:
+  smoke:
+    data:
+      qa_dir: ${FIELD_TO_LLM_ROOT}/data/point_readout/smoke
+      train_shapes: [8x8, 8x16]
+      heldout_shapes: []
+    generation:
+      train_states: 32
+      eval_states_per_shape: 4
+    training:
+      max_updates: 50
+      eval_every_updates: 50
+      save_every_updates: 25
+  pilot:
+    data:
+      qa_dir: ${FIELD_TO_LLM_ROOT}/data/point_readout/pilot
+    generation:
+      train_states: 512
+      eval_states_per_shape: 8
+    training:
+      max_updates: 1000
+  full:
+    data:
+      qa_dir: ${FIELD_TO_LLM_ROOT}/data/point_readout/full
+    generation:
+      train_states: 2048
+      eval_states_per_shape: 32
+    training:
+      max_updates: 4096
+      eval_every_updates: 1024
+      save_every_updates: 256

@@ -23,6 +23,13 @@ full training profile, per-question diagnostics, and independent checkpoint
 evaluation on a common QA set. The original variable-shape configuration
 remains the v1 baseline.
 
+The [point-readout runbook](POINT_READOUT_RUNBOOK.md) adds a separate real-field
+numerical-generation experiment: single points, multiple points, short line
+profiles, and small regions. Answers are ordered arrays of approximate
+standardized values, generated without candidate scoring. The single-device
+entry point supports data-only audits, smoke/pilot/full profiles, strict resume,
+and independent test evaluation while reusing the existing field architecture.
+
 ## Method
 
 The paper pipeline has two training stages:
