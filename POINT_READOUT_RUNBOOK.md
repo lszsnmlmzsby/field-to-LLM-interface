@@ -23,6 +23,8 @@
 统计/定位区域默认从 2×2、4×4 中采样，可修改 `generation.statistic_region_shapes`。
 坐标从 1 开始，相对于完整输入场；区域由左上角、高、宽确定。问题采用英文并随机选择模板。
 全部任务均在完整词表上自回归生成，没有选项、候选打分或任务专用预测头。
+输入使用模型原生 chat template，明确 system/user/assistant 边界；训练只监督 assistant 答案及结束标记。
+推理识别 tokenizer、模型配置和 generation_config 声明的全部 EOS，不将结束标记拼进回答。
 网络仅接收完整场，以及由 `grid_shape`、`question` 构造的文本。结构化查询、任务 ID、oracle 仅用于标签与审计。
 
 标签从真实场计算：先对**整个输入裁剪**做 float32 总体 z-score（分母加 1e-6），
@@ -74,6 +76,8 @@ smoke 形状为 8×8、8×16，无未见形状。pilot/full 训练 8×8、8×16�
 
 **v2 需重建数据、开始新训练，不与 v1 数据/checkpoint 混用。** 新目录为 `data/field_qa_v2/`，
 构建器拒绝覆盖非空目录。
+2026-09-22 的 `native_chat_v1` 修复只改变输入编码和解码停止协议：已构建的 **v2 QA 可以直接复用**，
+但此前采用普通文本提示的 v2 checkpoint 不能续训到新协议，须使用新的 run 目录重新训练。
 
 ## 3. 本机上传 GitHub
 
@@ -204,6 +208,8 @@ python -u scripts/train_point_readout.py --profile pilot \
 Ctrl-C/SIGTERM 请求在当前优化器更新完成后保存退出；验证期间收到信号会完成验证后退出。
 SIGKILL、断电、CUDA 崩溃只能恢复最近已保存 checkpoint。
 pilot 每 500 步验证、100 步保存；验证前也保存 last，保护已完成进度。
+验证控制台同时显示 `valid_rate` 与 `truncated=数量/总题数`。若格式有效率接近零，先检查实际预测，
+不能只根据宏平均正确率判断数值读取能力，也不要仅扩大 `max_new_tokens`。
 如果停在验证之前，恢复时会补做该次验证，包括已经达到最终训练步数的情况。
 
 ## 8. Full 与任务选择
@@ -272,3 +278,37 @@ python scripts/score_point_readout.py \
 `test_non_reentrant_checkpointed_readout_keeps_student_gradient_graph`（检查点重算保存张量数不一致）和
 `test_config_defaults_keep_primary_out_of_lower_auxiliary_layers`（辅助层损失配置检查）。
 本路线不经过旧 Stage 1 训练入口；服务器先运行第 5 节指定的问答测试。
+
+## 11. 从普通文本提示升级到原生对话输入
+
+如果旧 smoke 出现回答后继续编造 `Human:`、输出 `<|endoftext|>` 后仍不停，或者几乎所有题都
+`generation_truncated`，先同步本修复。旧入口没有套用 Instruct 模型的 chat template，且只比较单个 tokenizer EOS。
+修复使用完整原生对话编码，并遵循模型配置中的多 EOS；仍对完整回答严格评分，不截取第一个数组，不放宽误差阈值。
+参考：[Qwen 官方生成配置](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct/blob/main/generation_config.json)。
+
+本机仓库执行：
+
+```powershell
+git add .
+git commit -m "Fix native chat formatting and EOS handling for field QA"
+git push
+```
+
+服务器保留此前的资产环境变量，在仓库根目录执行：
+
+```bash
+git pull --ff-only
+source .venv/bin/activate
+python -m pytest tests/test_point_readout.py \
+  -k 'native or alternative_eos or local_qwen' -q
+python -u scripts/train_point_readout.py --profile smoke \
+  --output-dir "$FIELD_TO_LLM_ROOT/runs/field_qa_v2_smoke_chat_v1"
+```
+
+`FIELD_TO_LLM_MODEL_DIR` 应指向已下载的 Qwen 目录；测试会使用其中的真实分词器/生成配置，
+覆盖全部 11 类题的 prompt/答案边界，不下载或加载完整模型权重。
+启动行应出现 `text_encoding=native_chat_v1`，该 Qwen 的 `stop_token_ids=[151643, 151645]`。
+旧 v2 QA、原始数据和 Qwen 权重均无需重建/重下，旧 smoke 结果保留在原目录。
+
+修复后首先检查格式有效率和截断数，然后检查数值/坐标正确率。50 步仍是小规模闭环测试，
+不承诺修复格式后就能准确读场。若回答已符合协议，再进入 pilot 的学习效果验证。

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -256,6 +257,7 @@ def test_independent_scorer_missing_duplicates_and_unknown_ids(data_fixture):
 
 class CharacterTokenizer:
     pad_token_id, bos_token_id, eos_token_id = 0, 1, 2
+    chat_template = "test-native-chat-v1"
 
     def __call__(self, text, add_special_tokens=True, truncation=False):
         return {"input_ids": ([1] if add_special_tokens else []) + [ord(c) + 3 for c in text]}
@@ -265,6 +267,18 @@ class CharacterTokenizer:
 
     def get_vocab(self):
         return {f"token_{i}": i for i in range(256)}
+
+    def get_chat_template(self):
+        return self.chat_template
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, **kwargs):
+        ids = [self.bos_token_id]
+        for message in messages:
+            ids.extend(self(f"{message['role']}:\n{message['content']}", add_special_tokens=False)["input_ids"])
+            ids.extend([self.eos_token_id, ord("\n") + 3])
+        if add_generation_prompt:
+            ids.extend(self("assistant:\n", add_special_tokens=False)["input_ids"])
+        return ids
 
 
 def tiny_components(config=None):
@@ -299,12 +313,97 @@ def test_answer_masking_and_no_truncation(z):
     first = int(labels.ne(-100).nonzero()[0, 1])
     assert bool(labels[0, :first].eq(-100).all())
     assert int(labels[0, -1]) == tokenizer.eos_token_id
+    supervised = labels[0, labels[0].ne(-100)].tolist()
+    assert tokenizer.decode(supervised[:-1]) == row["answer"]
+    assert "assistant:\n" in tokenizer.decode(ids[0, :first].tolist())
     assert torch.equal(ids[labels.ne(-100)], labels[labels.ne(-100)])
     assert bool(mask.all())
     with pytest.raises(ValueError, match="Prompt"):
         training_tensors([row], tokenizer, {**training, "max_prompt_tokens": 4})
     with pytest.raises(ValueError, match="Answer"):
         training_tensors([row], tokenizer, {**training, "max_target_tokens": 1})
+
+
+def test_native_chat_is_required_and_prefix_must_match(z):
+    from scripts.train_point_readout import encode_prompt, training_tensors
+    row = make_record("state", z, "single_point", {"points": [[1, 1]]})
+    tokenizer = CharacterTokenizer()
+    tokenizer.chat_template = None
+    with pytest.raises(ValueError, match="native chat template"):
+        encode_prompt(row, tokenizer, 2048)
+    class BrokenPrefix(CharacterTokenizer):
+        def apply_chat_template(self, *args, **kwargs):
+            result = super().apply_chat_template(*args, **kwargs)
+            if not kwargs["add_generation_prompt"]:
+                result[0] = 99
+            return result
+    with pytest.raises(ValueError, match="prefix"):
+        training_tensors([row], BrokenPrefix(), {"max_prompt_tokens": 2048, "max_target_tokens": 96})
+
+
+def test_huggingface_native_template_and_supervision(z):
+    """Exercise the real Transformers chat API, including special-token boundaries."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+    from scripts.train_point_readout import training_tensors, encode_prompt
+    backend = Tokenizer(WordLevel({"[UNK]": 0, "<|endoftext|>": 1, "<|im_start|>": 2,
+                                  "<|im_end|>": 3, "[": 4, "]": 5, "0": 6, ".": 7, "3": 8}, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]",
+        eos_token="<|im_end|>", pad_token="<|endoftext|>", additional_special_tokens=["<|im_start|>"])
+    tokenizer.chat_template = ("{% for m in messages %}{{ '<|im_start|>' + m['role'] + '\n' + m['content'] + '<|im_end|>\n' }}"
+                               "{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}")
+    row = make_record("state", z, "single_point", {"points": [[1, 1]]})
+    row["answer"] = "[0.3]"
+    prompt = encode_prompt(row, tokenizer, 2048)
+    ids, _, labels = training_tensors([row], tokenizer, {"max_prompt_tokens": 2048, "max_target_tokens": 96})
+    assert ids[0, :len(prompt)].tolist() == prompt
+    assert labels[0, :len(prompt)].eq(-100).all()
+    assert ids[0, len(prompt):].tolist() == tokenizer("[0.3]", add_special_tokens=False)["input_ids"] + [tokenizer.eos_token_id]
+
+
+@pytest.mark.skipif(not os.environ.get("FIELD_TO_LLM_MODEL_DIR"), reason="Set FIELD_TO_LLM_MODEL_DIR for actual local tokenizer checks")
+def test_local_qwen_chat_template_for_all_tasks(z):
+    """Uses only local tokenizer/config assets, never downloads or loads model weights."""
+    from types import SimpleNamespace
+    from transformers import AutoTokenizer, GenerationConfig
+    from scripts.train_point_readout import encode_prompt, training_tensors, generation_stop_ids
+    path = os.environ["FIELD_TO_LLM_MODEL_DIR"]
+    tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+    generation = GenerationConfig.from_pretrained(path, local_files_only=True)
+    llm = SimpleNamespace(generation_config=generation)
+    assert set(generation.eos_token_id) <= set(generation_stop_ids(llm, tokenizer))
+    for task in TASKS:
+        row = make_record("state", z, task, sample_spec(task, z.shape, random.Random(2), z=z))
+        prompt = encode_prompt(row, tokenizer, 384)
+        assert tokenizer.decode(prompt).endswith("<|im_start|>assistant\n")
+        ids, _, labels = training_tensors([row], tokenizer, {"max_prompt_tokens": 384, "max_target_tokens": 96})
+        assert ids[0, :len(prompt)].tolist() == prompt
+        answer = labels[0, labels[0].ne(-100)].tolist()
+        assert answer[-1] == tokenizer.eos_token_id
+        assert tokenizer.decode(answer[:-1]) == row["answer"]
+
+
+@pytest.mark.parametrize("eos_source", ["generation_config", "config"])
+def test_generation_recognizes_alternative_eos_without_emitting_it(z, monkeypatch, eos_source):
+    trainer, llm, sidecar, tokenizer, _ = tiny_components()
+    llm.eval()
+    sidecar.eval()
+    alternate = 5  # A second EOS, different from tokenizer.eos_token_id.
+    getattr(llm, eos_source).eos_token_id = [tokenizer.eos_token_id, alternate]
+    row = make_record("state", z, "single_point", {"points": [[1, 1]]})
+    sequence = iter(tokenizer("[0.3]", add_special_tokens=False)["input_ids"] + [alternate])
+    def next_logits(hidden):
+        logits = hidden.new_full((hidden.shape[0], 256), -100)
+        logits[:, next(sequence)] = 100
+        return logits
+    monkeypatch.setattr(llm.get_output_embeddings(), "forward", next_logits)
+    result = trainer.generate_answer(llm, sidecar, tokenizer, row, z[None], torch.device("cpu"),
+                                      torch.float32, max_prompt_tokens=2048, max_new_tokens=12)
+    assert result == {"prediction": "[0.3]", "terminated": True, "stop_token_id": alternate, "generated_tokens": 6}
+    assert sidecar._bound_state is None
 
 
 def test_backward_reaches_field_and_bridges_but_not_qwen(z):
@@ -419,6 +518,26 @@ def test_resume_rejects_wrong_protocol_or_changed_contract():
         validate_resume({"checkpoint_type": "old"}, {})
     with pytest.raises(ValueError, match="differs"):
         validate_resume({"checkpoint_type": CHECKPOINT_TYPE, "identity": {"dataset": "old"}}, {"dataset": "new"})
+
+
+def test_resume_binds_native_template_and_generation_stops(data_fixture):
+    source, qa, initial, _ = data_fixture
+    trainer, llm, _, tokenizer, config = tiny_components(initial)
+    dataset = PointReadoutDataset(qa, source, "train")
+    try:
+        identity = trainer.run_identity(config, dataset, llm, tokenizer)
+        old = {k: v for k, v in identity.items() if k != "text_encoding"}
+        with pytest.raises(ValueError, match="chat template/stop protocol"):
+            trainer.validate_resume({"checkpoint_type": trainer.CHECKPOINT_TYPE, "identity": old}, identity)
+        llm.generation_config.eos_token_id = [tokenizer.eos_token_id, 5]
+        changed = trainer.run_identity(config, dataset, llm, tokenizer)
+        assert changed["text_encoding"]["stop_token_ids"] == [2, 5]
+        with pytest.raises(ValueError, match="chat template/stop protocol"):
+            trainer.validate_resume({"checkpoint_type": trainer.CHECKPOINT_TYPE, "identity": identity}, changed)
+        tokenizer.chat_template = "another-native-template"
+        assert trainer.run_identity(config, dataset, llm, tokenizer)["text_encoding"] != changed["text_encoding"]
+    finally:
+        dataset.close()
 
 
 def test_local_model_identity_tracks_weight_contents_and_allows_relocation(tmp_path):

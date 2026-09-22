@@ -28,6 +28,9 @@ from tensor_compression.downstream.point_readout_data import (
 )
 
 CHECKPOINT_TYPE = "qwen_standardized_field_qa_v2"
+TEXT_ENCODING_VERSION = "native_chat_v1"
+SYSTEM_MESSAGE = ("You answer questions about a supplied numerical field. "
+                  "Return only the requested JSON array, with no explanation.")
 
 
 def model_args(config, model_dir=None, *, checkpointing=True):
@@ -58,8 +61,20 @@ def model_args(config, model_dir=None, *, checkpointing=True):
     )
 
 
+def chat_messages(record):
+    return [{"role": "system", "content": SYSTEM_MESSAGE},
+            {"role": "user", "content": build_prompt(record).removesuffix("\nAnswer:")}]
+
+
+def native_chat_ids(tokenizer, messages, *, generation_prompt):
+    if not getattr(tokenizer, "chat_template", None):
+        raise ValueError("The numerical QA interface requires the model's native chat template")
+    return tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=generation_prompt,
+                                         return_dict=False)
+
+
 def encode_prompt(record, tokenizer, max_prompt_tokens):
-    ids = tokenizer(build_prompt(record), add_special_tokens=True, truncation=False)["input_ids"]
+    ids = native_chat_ids(tokenizer, chat_messages(record), generation_prompt=True)
     if not ids or len(ids) > max_prompt_tokens:
         raise ValueError(f"Prompt {record['qa_id']} has {len(ids)} tokens; truncation is forbidden")
     return ids
@@ -71,8 +86,17 @@ def training_tensors(records, tokenizer, training):
     encoded = []
     for row in records:
         prompt = encode_prompt(row, tokenizer, int(training["max_prompt_tokens"]))
-        answer = tokenizer(row["answer"], add_special_tokens=False, truncation=False)["input_ids"]
-        answer = answer + [int(tokenizer.eos_token_id)]
+        # Tokenize the complete conversation to preserve native assistant boundaries
+        # and context-sensitive BPE, rather than joining separately tokenized strings.
+        complete = native_chat_ids(tokenizer, chat_messages(row) +
+                                   [{"role": "assistant", "content": row["answer"]}], generation_prompt=False)
+        if complete[:len(prompt)] != prompt:
+            raise ValueError("Native chat training sequence does not share the generation prompt prefix")
+        answer = complete[len(prompt):]
+        if tokenizer.eos_token_id not in answer:
+            raise ValueError("Native assistant template must terminate with tokenizer.eos_token_id")
+        # The template may add a newline after end-of-turn; generation stops at EOS.
+        answer = answer[:answer.index(tokenizer.eos_token_id) + 1]
         if len(answer) > int(training["max_target_tokens"]):
             raise ValueError(f"Answer {row['qa_id']} exceeds max_target_tokens; truncation is forbidden")
         encoded.append((prompt, answer))
@@ -108,6 +132,17 @@ def training_loss(llm, sidecar, tokenizer, records, fields, device, dtype, train
         raise
 
 
+def generation_stop_ids(llm, tokenizer):
+    ids = {int(tokenizer.eos_token_id)} if tokenizer.eos_token_id is not None else set()
+    for source in (getattr(llm, "generation_config", None), getattr(llm, "config", None)):
+        value = getattr(source, "eos_token_id", None)
+        if value is not None:
+            ids.update(int(n) for n in (value if isinstance(value, (list, tuple)) else [value]))
+    if not ids:
+        raise ValueError("The model/tokenizer must define an EOS token")
+    return sorted(ids)
+
+
 @torch.inference_mode()
 def generate_answer(llm, sidecar, tokenizer, record, field, device, dtype, *,
                     max_prompt_tokens=384, max_new_tokens=96, use_cache=True):
@@ -115,9 +150,11 @@ def generate_answer(llm, sidecar, tokenizer, record, field, device, dtype, *,
     if max_new_tokens <= 0 or tokenizer.eos_token_id is None:
         raise ValueError("Generation requires a positive token budget and an EOS token")
     prompt = encode_prompt(record, tokenizer, max_prompt_tokens)
+    stop_ids = set(generation_stop_ids(llm, tokenizer))
     ids = torch.tensor([prompt], dtype=torch.long, device=device)
     output_ids, past = [], None
     terminated = False
+    stop_token_id = None
     try:
         with core.autocast_context(device, dtype):
             sidecar.bind(field.unsqueeze(0).to(device), mode="correct")
@@ -130,8 +167,9 @@ def generate_answer(llm, sidecar, tokenizer, record, field, device, dtype, *,
                 outputs = core.decoder_backbone(llm)(**kwargs)
                 logits = llm.get_output_embeddings()(outputs.last_hidden_state[:, -1])
                 next_id = int(logits.argmax(dim=-1).item())
-                if next_id == tokenizer.eos_token_id:
+                if next_id in stop_ids:
                     terminated = True
+                    stop_token_id = next_id
                     break
                 output_ids.append(next_id)
                 ids = torch.cat((ids, ids.new_tensor([[next_id]])), dim=1)
@@ -140,7 +178,8 @@ def generate_answer(llm, sidecar, tokenizer, record, field, device, dtype, *,
     finally:
         sidecar.clear()
     return {"prediction": tokenizer.decode(output_ids, skip_special_tokens=False),
-            "terminated": terminated, "generated_tokens": len(output_ids) + int(terminated)}
+            "terminated": terminated, "stop_token_id": stop_token_id,
+            "generated_tokens": len(output_ids) + int(terminated)}
 
 
 def shape_batches(records, batch_size, seed, epoch):
@@ -228,6 +267,9 @@ def run_identity(config, dataset, llm, tokenizer):
         "model", "field_encoder", "spatial_adapter", "memory", "cross_attention", "training", "evaluation", "runtime")}
     recipe["model"].pop("name_or_path", None)
     identity = {"protocol": FORMAT, "prompt_version": PROMPT_VERSION, "dataset": dataset.identity,
+            "text_encoding": {"version": TEXT_ENCODING_VERSION, "system_message": SYSTEM_MESSAGE,
+                              "chat_template_sha256": json_hash(tokenizer.get_chat_template()),
+                              "stop_token_ids": generation_stop_ids(llm, tokenizer)},
             "patch_size": config["data"]["patch_size"], "recipe": recipe,
             "llm_config": {k: v for k, v in llm.config.to_dict().items()
                            if k not in ("_name_or_path", "transformers_version", "torch_dtype", "dtype")},
@@ -266,6 +308,8 @@ def model_asset_identity(model_name_or_path, llm):
 def validate_resume(checkpoint, identity):
     if checkpoint.get("checkpoint_type") != CHECKPOINT_TYPE:
         raise ValueError("Use a point-readout checkpoint, not a previous multiple-choice checkpoint")
+    if checkpoint.get("identity", {}).get("text_encoding") != identity.get("text_encoding"):
+        raise ValueError("Checkpoint chat template/stop protocol differs; reuse v2 QA data but start a new run")
     if checkpoint.get("identity") != identity:
         raise ValueError("Checkpoint dataset/model/tokenizer/recipe differs; resume cannot change an experiment")
 
@@ -410,11 +454,14 @@ def main():
             if score > best:
                 best = score
                 save(output / "best.pt")
-            print(f"validation step={step} macro_task_answer_accuracy={score:.4f}", flush=True)
+            print(f"validation step={step} macro_task_answer_accuracy={score:.4f} "
+                  f"valid_rate={metrics['valid_rate']:.4f} "
+                  f"truncated={metrics['errors'].get('generation_truncated', 0)}/{metrics['questions']}", flush=True)
             save(output / "last.pt")
 
         print(f"startup=point_readout tasks={dataset.metadata['tasks']} updates={maximum} "
-              f"batch={training['batch_size']} accumulation={training['gradient_accumulation_steps']}", flush=True)
+              f"batch={training['batch_size']} accumulation={training['gradient_accumulation_steps']} "
+              f"text_encoding={TEXT_ENCODING_VERSION} stop_token_ids={generation_stop_ids(llm, tokenizer)}", flush=True)
         start = time.perf_counter()
         write_json(output / "training_plan.json", {"planned_updates": maximum, "train_questions": len(train_data),
             "tasks": dataset.metadata["tasks"], "batch_size": training["batch_size"],
