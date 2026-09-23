@@ -21,7 +21,7 @@ for path in (ROOT, ROOT / "src"):
 
 from scripts import train_tensor_qwen_cross_attention as core
 from tensor_compression.downstream.point_readout import (
-    FORMAT, PROMPT_VERSION, build_prompt, json_hash, score_answer, summarize_scores,
+    FORMAT, PROMPT_VERSION, build_prompt, json_hash, score_answer, summarize_evaluation,
 )
 from tensor_compression.downstream.point_readout_data import (
     PointReadoutDataset, load_config, resolve_path, write_json,
@@ -144,42 +144,50 @@ def generation_stop_ids(llm, tokenizer):
 
 
 @torch.inference_mode()
-def generate_answer(llm, sidecar, tokenizer, record, field, device, dtype, *,
-                    max_prompt_tokens=384, max_new_tokens=96, use_cache=True):
-    """One example at a time; field binding and text cache live for one answer only."""
-    if max_new_tokens <= 0 or tokenizer.eos_token_id is None:
+def generate_from_prompt(llm, tokenizer, prompt, device, dtype, *, max_new_tokens=96, use_cache=True):
+    """Shared full-vocabulary greedy decoder for field-memory and serialized inputs."""
+    if not prompt or max_new_tokens <= 0 or tokenizer.eos_token_id is None:
         raise ValueError("Generation requires a positive token budget and an EOS token")
-    prompt = encode_prompt(record, tokenizer, max_prompt_tokens)
     stop_ids = set(generation_stop_ids(llm, tokenizer))
     ids = torch.tensor([prompt], dtype=torch.long, device=device)
     output_ids, past = [], None
     terminated = False
     stop_token_id = None
-    try:
-        with core.autocast_context(device, dtype):
-            sidecar.bind(field.unsqueeze(0).to(device), mode="correct")
-            for _ in range(max_new_tokens):
-                inputs = ids[:, -1:] if use_cache and past is not None else ids
-                kwargs = {"input_ids": inputs, "attention_mask": torch.ones_like(ids),
-                          "use_cache": use_cache, "return_dict": True}
-                if use_cache and past is not None:
-                    kwargs["past_key_values"] = past
-                outputs = core.decoder_backbone(llm)(**kwargs)
-                logits = llm.get_output_embeddings()(outputs.last_hidden_state[:, -1])
-                next_id = int(logits.argmax(dim=-1).item())
-                if next_id in stop_ids:
-                    terminated = True
-                    stop_token_id = next_id
-                    break
-                output_ids.append(next_id)
-                ids = torch.cat((ids, ids.new_tensor([[next_id]])), dim=1)
-                if use_cache:
-                    past = outputs.past_key_values
-    finally:
-        sidecar.clear()
+    with core.autocast_context(device, dtype):
+        for _ in range(max_new_tokens):
+            inputs = ids[:, -1:] if use_cache and past is not None else ids
+            kwargs = {"input_ids": inputs, "attention_mask": torch.ones_like(ids),
+                      "use_cache": use_cache, "return_dict": True}
+            if use_cache and past is not None:
+                kwargs["past_key_values"] = past
+            outputs = core.decoder_backbone(llm)(**kwargs)
+            logits = llm.get_output_embeddings()(outputs.last_hidden_state[:, -1])
+            next_id = int(logits.argmax(dim=-1).item())
+            if next_id in stop_ids:
+                terminated = True
+                stop_token_id = next_id
+                break
+            output_ids.append(next_id)
+            ids = torch.cat((ids, ids.new_tensor([[next_id]])), dim=1)
+            if use_cache:
+                past = outputs.past_key_values
     return {"prediction": tokenizer.decode(output_ids, skip_special_tokens=False),
             "terminated": terminated, "stop_token_id": stop_token_id,
             "generated_tokens": len(output_ids) + int(terminated)}
+
+
+@torch.inference_mode()
+def generate_answer(llm, sidecar, tokenizer, record, field, device, dtype, *,
+                    max_prompt_tokens=384, max_new_tokens=96, use_cache=True):
+    """Field binding and text cache live for one answer only."""
+    prompt = encode_prompt(record, tokenizer, max_prompt_tokens)
+    try:
+        with core.autocast_context(device, dtype):
+            sidecar.bind(field.unsqueeze(0).to(device), mode="correct")
+        return generate_from_prompt(llm, tokenizer, prompt, device, dtype,
+                                    max_new_tokens=max_new_tokens, use_cache=use_cache)
+    finally:
+        sidecar.clear()
 
 
 def shape_batches(records, batch_size, seed, epoch):
@@ -197,7 +205,7 @@ def shape_batches(records, batch_size, seed, epoch):
     return batches
 
 
-def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_path):
+def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_path, *, verbose=False):
     core.set_frozen_llm_execution_mode(llm, checkpoint_training=False)
     sidecar.eval()
     if device.type == "cuda":
@@ -220,20 +228,24 @@ def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_pat
                      "field": dataset.states[row["state_ref"]]["field"], **prediction, "score": score}
             scored.append(entry)
             handle.write(json.dumps(entry, allow_nan=False) + "\n")
-            if (index + 1) % 100 == 0:
+            if verbose and (index + 1) % 100 == 0:
                 print(f"evaluation questions={index + 1}/{len(dataset)}", flush=True)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-    metrics = summarize_scores(scored)
-    seen_shapes = {"x".join(map(str, shape)) for shape in dataset.metadata["train_shapes"]}
-    seen_rows = [row for row in scored if row["shape"] in seen_shapes]
-    metrics["seen_shapes"] = summarize_scores(seen_rows) if seen_rows else None
-    heldout_rows = [row for row in scored if row["shape"] not in seen_shapes]
-    metrics["heldout_shapes"] = summarize_scores(heldout_rows) if heldout_rows else None
+    metrics = summarize_evaluation(scored, dataset.metadata["train_shapes"])
     metrics.update(elapsed_seconds=time.perf_counter() - start,
                    peak_allocated_gib=torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None,
                    generated_tokens=sum(row["generated_tokens"] for row in scored))
     return metrics
+
+
+def print_metric_summary(name, metrics):
+    seen, heldout = metrics["seen_shapes"], metrics["heldout_shapes"]
+    seen_text = f"{seen['macro_task_answer_accuracy']:.4f}" if seen else "n/a"
+    heldout_text = f"{heldout['macro_task_answer_accuracy']:.4f}" if heldout else "n/a"
+    print(f"{name} questions={metrics['questions']} all={metrics['macro_task_answer_accuracy']:.4f} "
+          f"seen={seen_text} heldout={heldout_text} valid={metrics['valid_rate']:.4f} "
+          f"truncated={metrics['errors'].get('generation_truncated', 0)}", flush=True)
 
 
 def validate_config(config):
@@ -280,7 +292,7 @@ def run_identity(config, dataset, llm, tokenizer):
     return json.loads(json.dumps(identity, allow_nan=False))
 
 
-def model_asset_identity(model_name_or_path, llm):
+def model_asset_identity(model_name_or_path, llm, *, verbose=False):
     """Bind local weight contents, or the resolved immutable Hub commit."""
     path = Path(model_name_or_path).expanduser()
     if path.is_dir():
@@ -299,7 +311,8 @@ def model_asset_identity(model_name_or_path, llm):
             # Allow those read-only links, but reject index paths escaping the model directory.
             if relative.is_absolute() or ".." in relative.parts or not weight_path.is_file():
                 raise ValueError("Invalid or missing model weight shard")
-            print(f"model_asset_audit shard={name}", flush=True)
+            if verbose:
+                print(f"model_asset_audit shard={name}", flush=True)
             manifest[name] = core.sha256_file(weight_path)
         return {"local_weights_sha256": json_hash(manifest)}
     return {"hub_model": str(model_name_or_path), "revision": getattr(llm.config, "_commit_hash", None)}
@@ -335,6 +348,9 @@ def main():
     parser.add_argument("--split", choices=("val", "test"), default="val")
     parser.add_argument("--audit-only", action="store_true", help="Replay data without loading Qwen")
     parser.add_argument("--stop-after-updates", type=int, help="Save and stop after N additional updates; preserves the full resume schedule")
+    parser.add_argument("--verbose", action="store_true", help="Show detailed training, model-shard and evaluation progress")
+    parser.add_argument("--console-every-updates", type=int, default=200,
+                        help="Console cadence only; detailed train.jsonl stays unchanged (default: 200)")
     cli = parser.parse_args()
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("This workstation entry point is single-device; use python, not multi-rank torchrun")
@@ -342,6 +358,8 @@ def main():
         parser.error("--evaluate-only requires --resume")
     if cli.stop_after_updates is not None and cli.stop_after_updates <= 0:
         parser.error("--stop-after-updates must be positive")
+    if cli.console_every_updates <= 0:
+        parser.error("--console-every-updates must be positive")
     if cli.split == "test" and not (cli.evaluate_only or cli.audit_only):
         parser.error("The test split is accessible only through explicit evaluation/audit")
     config = load_config(cli.config, cli.profile)
@@ -393,7 +411,7 @@ def main():
         encoder, spatial, _, _ = core.build_scratch_memory_components(args, (1, args.patch_size, args.patch_size))
         sidecar, report = core.build_sidecar(llm, spatial, args, device, encoder)
         identity = run_identity(config, dataset, llm, tokenizer)
-        identity["model_asset"] = model_asset_identity(args.model_name_or_path, llm)
+        identity["model_asset"] = model_asset_identity(args.model_name_or_path, llm, verbose=cli.verbose)
         existing_contract = output / "contract.json"
         if existing_contract.exists() and json.loads(existing_contract.read_text(encoding="utf-8")) != identity:
             raise ValueError("Output directory belongs to another experiment")
@@ -406,9 +424,9 @@ def main():
         write_json(output / "architecture.json", report)
         if cli.evaluate_only:
             metrics = evaluate(llm, sidecar, tokenizer, datasets[cli.split], device, dtype, config,
-                               output / f"{cli.split}_predictions.jsonl")
+                               output / f"{cli.split}_predictions.jsonl", verbose=cli.verbose)
             write_json(output / f"{cli.split}_metrics.json", metrics)
-            print(json.dumps(metrics), flush=True)
+            print_metric_summary(cli.split, metrics)
             return
         optimizer, _ = core.build_optimizer(sidecar, args)
         training = config["training"]
@@ -447,14 +465,17 @@ def main():
         def validate_and_save():
             nonlocal best, validation_pending
             metrics = evaluate(llm, sidecar, tokenizer, datasets["val"], device, dtype, config,
-                               output / f"val_predictions_{step}.jsonl")
+                               output / f"val_predictions_{step}.jsonl", verbose=cli.verbose)
             core.append_jsonl(output / "validation.jsonl", {"step": step, **metrics})
             score = metrics["seen_shapes"]["macro_task_answer_accuracy"]
             validation_pending = False
             if score > best:
                 best = score
                 save(output / "best.pt")
+            heldout = metrics["heldout_shapes"]
+            heldout_text = f"{heldout['macro_task_answer_accuracy']:.4f}" if heldout else "n/a"
             print(f"validation step={step} macro_task_answer_accuracy={score:.4f} "
+                  f"heldout={heldout_text} "
                   f"valid_rate={metrics['valid_rate']:.4f} "
                   f"truncated={metrics['errors'].get('generation_truncated', 0)}/{metrics['questions']}", flush=True)
             save(output / "last.pt")
@@ -500,11 +521,15 @@ def main():
             optimizer.step()
             scheduler.step()
             step += 1
-            if step % training["log_interval"] == 0 or step == 1:
+            log_to_file = step % training["log_interval"] == 0 or step == 1
+            log_to_console = log_to_file if cli.verbose else step == 1 or step % cli.console_every_updates == 0 or step == maximum
+            if log_to_file or log_to_console:
                 entry = {"step": step, "loss": loss_value, "grad_norm": float(grad_norm),
                          "elapsed_seconds": time.perf_counter() - start}
-                core.append_jsonl(output / "train.jsonl", entry)
-                print(json.dumps(entry), flush=True)
+                if log_to_file:
+                    core.append_jsonl(output / "train.jsonl", entry)
+                if log_to_console:
+                    print(json.dumps(entry), flush=True)
             should_stop = stop_requested or (cli.stop_after_updates is not None and step - invocation_start_step >= cli.stop_after_updates)
             validation_pending = step % training["eval_every_updates"] == 0 or step == maximum
             # Save before potentially long validation, so termination loses no completed update.

@@ -313,3 +313,12 @@ def summarize_scores(rows: Sequence[Mapping]) -> dict:
     result["macro_task_point_accuracy"] = sum(v["point_accuracy"] for v in result["by_task_type"].values()) / len(result["by_task_type"])
     result["macro_task_answer_accuracy"] = sum(v["answer_accuracy"] for v in result["by_task_type"].values()) / len(result["by_task_type"])
     return result
+
+
+def summarize_evaluation(rows: Sequence[Mapping], train_shapes) -> dict:
+    result = summarize_scores(rows)
+    seen = {"x".join(map(str, shape)) for shape in train_shapes}
+    for key, selected in (("seen_shapes", [r for r in rows if r["shape"] in seen]),
+                          ("heldout_shapes", [r for r in rows if r["shape"] not in seen])):
+        result[key] = summarize_scores(selected) if selected else None
+    return result

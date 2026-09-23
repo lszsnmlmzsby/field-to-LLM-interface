@@ -48,6 +48,7 @@ Thumbs.db
 !/scripts/build_point_readout_qa.py
 !/scripts/train_point_readout.py
 !/scripts/score_point_readout.py
+!/scripts/benchmark_point_readout.py
 !/scripts/setup_field_qa_server.sh
 !/scripts/check_field_qa_environment.py
 !/scripts/download_pdebench_field.py

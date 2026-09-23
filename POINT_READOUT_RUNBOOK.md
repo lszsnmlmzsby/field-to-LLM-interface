@@ -312,3 +312,84 @@ python -u scripts/train_point_readout.py --profile smoke \
 
 修复后首先检查格式有效率和截断数，然后检查数值/坐标正确率。50 步仍是小规模闭环测试，
 不承诺修复格式后就能准确读场。若回答已符合协议，再进入 pilot 的学习效果验证。
+
+## 12. 原始 Qwen 的生成式 benchmark
+
+旧 `benchmark_tensor_qwen_inference.py` 和 `evaluate_frozen_qwen_patch_qa.py` 服务于选择题，
+不能直接测当前 11 类生成题。新入口 `scripts/benchmark_point_readout.py` 使用原始 Qwen 权重，
+不创建或加载场编码器、spatial adapter、交叉注意力桥，也不训练参数。
+
+将**完整标准化场**序列化为逐行 JSON 矩阵，精确保留输入的 FP16→FP32 值。不只给查询点，
+不额外舍入到一位小数，不重新归一化，不附加 oracle 或参考答案。
+使用同一份 v2 QA、同一物理场、问题、原生对话格式、greedy 解码器、输出 token 上限和评分规则。
+仅调整输入说明以描述文本矩阵，系统指令相同。文本输入默认最多 16,384 tokens，超过就报错，绝不截断矩阵。
+该上限用于容纳数值文本，与场接口较短的文字提示长度不同。所有题在加载权重前进行分词检查。
+
+它衡量“原始模型读取矩阵文本”的零样本准确率。与训练后的场接口相比，输入表示和场侧训练都不同，
+差值不能单独解释为训练本身的因果效果。无需改数据、重新训练或下载另一份模型。
+
+新脚本已加入 Git 白名单。本机上传：
+
+```powershell
+git add .
+git commit -m "Add generative field QA baseline and compact console logs"
+git push
+```
+
+服务器进入仓库，保留原资产环境变量：
+
+```bash
+git pull --ff-only
+source .venv/bin/activate
+```
+
+**直接与现有 full 验证结果配对**（本次最优步骤为 11,264）：
+
+```bash
+python -u scripts/benchmark_point_readout.py --profile full --split val \
+  --compare-predictions "$FIELD_TO_LLM_ROOT/runs/field_qa_v2_full_chat_v1/val_predictions_11264.jsonl" \
+  --output-dir "$FIELD_TO_LLM_ROOT/runs/field_qa_v2_full_baseline_val"
+```
+
+可省略 `--compare-predictions` 单独评测。配对时预测文件旁须有原来的 `contract.json`，
+核对数据、模型权重、分词器、配方及完整题目 ID 集合，并重新评分，不信任文件自带的 score。
+拒绝缺题、重复题或混用 val/test。现有 `native_chat_v1` checkpoint/预测无需迁移。
+
+控制台 `all` 为全部形状的宏平均，`seen` 才对应训练日志的 `macro_task_answer_accuracy`（例如 58.81%）。
+`heldout` 独立报告未见形状；不要拿 baseline 的 all 与接口的 seen 相减。
+最后的分任务对照表合并所有形状；各形状组的分任务对照保存在 `comparison.json`。
+
+**正式测试集配对**：使用已选好的 best checkpoint 生成接口预测，再测原始 Qwen。
+
+```bash
+python scripts/train_point_readout.py --profile full \
+  --resume "$FIELD_TO_LLM_ROOT/runs/field_qa_v2_full_chat_v1/best.pt" \
+  --evaluate-only --split test \
+  --output-dir "$FIELD_TO_LLM_ROOT/runs/field_qa_v2_full_interface_test" &&
+python -u scripts/benchmark_point_readout.py --profile full --split test \
+  --compare-predictions "$FIELD_TO_LLM_ROOT/runs/field_qa_v2_full_interface_test/test_predictions.jsonl" \
+  --output-dir "$FIELD_TO_LLM_ROOT/runs/field_qa_v2_full_baseline_test"
+```
+
+输出目录须为新的空目录。测试用于报告，不用于继续挑 checkpoint。
+测试和验证各需完整生成一遍原始 Qwen 答案；矩阵文本更长，耗时不能直接用训练步速估计。
+若只检查数据和 prompt 长度，不加载 14B 权重：
+
+```bash
+python scripts/benchmark_point_readout.py --profile full --split val --audit-only \
+  --output-dir "$FIELD_TO_LLM_ROOT/runs/field_qa_v2_full_baseline_audit"
+```
+
+输出有 `data_and_prompt_audit.json`、`baseline_contract.json`、`val/test_predictions.jsonl`、
+`val/test_metrics.json`，配对时另有 `comparison.json`。`interface_minus_baseline_pp` 为接口减原始模型的百分点差。
+预测可继续用第 9 节离线评分器核对。耗时和峰值显存仅描述本次运行，不作为经过预热和重复的正式性能 benchmark。
+
+## 13. 控制台日志长度
+
+默认训练每 200 次更新打印一行（以及首步、末步），每次验证保留一行，并附带未见形状分数。
+取消逐权重分片、每 100 道验证题的默认打印。`train.jsonl`、`validation.jsonl` 和逐题预测仍保留详细记录。
+独立评估只打印摘要，完整指标在 JSON 文件。
+
+使用 `--console-every-updates 500` 可进一步减少打印，或用 `--verbose` 恢复详细进度。
+这些选项不进入训练配方，不影响已有 checkpoint 的严格续训。
+benchmark 默认每 500 题显示进度，`--verbose` 时每 100 题显示一次。

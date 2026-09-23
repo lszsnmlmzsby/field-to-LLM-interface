@@ -564,6 +564,8 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
     config["model"]["gradient_checkpointing"] = True
     config["training"].update(max_updates=2, log_interval=1, save_every_updates=1,
                               eval_every_updates=1, gradient_accumulation_steps=2)
+    config["training"]["max_target_tokens"] = 48
+    config["evaluation"]["max_new_tokens"] = 48
     config["experiment_profile"] = "test"
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"profiles": {"smoke": config}}), encoding="utf-8")
@@ -595,7 +597,7 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
     summary = json.loads((interrupted / "run_summary.json").read_text(encoding="utf-8"))
     assert summary["status"] == "stopped" and summary["step"] == 1 and summary["planned_updates"] == 2
     assert torch.load(interrupted / "last.pt", weights_only=True)["validation_pending"]
-    run(interrupted, "--resume", str(interrupted / "last.pt"))
+    run(interrupted, "--resume", str(interrupted / "last.pt"), "--console-every-updates", "1", "--verbose")
     resumed = torch.load(interrupted / "last.pt", weights_only=True)
     assert json.loads((interrupted / "run_summary.json").read_text(encoding="utf-8"))["status"] == "completed"
     assert resumed["step"] == expected["step"] == 2
@@ -621,6 +623,81 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
         offline = score_predictions(dataset, predictions)
         assert online["point_accuracy"] == offline["point_accuracy"]
         assert online["questions"] == len(dataset)
+    finally:
+        dataset.close()
+
+    # Benchmark the same test questions on an untouched tiny Qwen and verify that
+    # the baseline never constructs an encoder/adapter/bridge.
+    from scripts import benchmark_point_readout as benchmark
+    def forbidden_sidecar(*args, **kwargs):
+        raise AssertionError("Baseline must not construct a field sidecar")
+    monkeypatch.setattr(trainer.core, "build_sidecar", forbidden_sidecar)
+    baseline_output = tmp_path / "baseline"
+    baseline_args = ["benchmark_point_readout.py", "--config", str(config_path), "--profile", "smoke",
+                     "--qa-dir", str(qa), "--hdf5-path", str(source), "--split", "test", "--device", "cpu",
+                     "--compare-predictions", str(evaluation / "test_predictions.jsonl")]
+    monkeypatch.setattr(sys, "argv", baseline_args + ["--output-dir", str(baseline_output)])
+    benchmark.main()
+    comparison = json.loads((baseline_output / "comparison.json").read_text())
+    baseline = json.loads((baseline_output / "test_metrics.json").read_text())
+    assert comparison["overall"]["questions"] == online["questions"] == baseline["questions"]
+    assert comparison["seen_shapes"]["interface"] == online["seen_shapes"]["macro_task_answer_accuracy"]
+    assert json.loads((baseline_output / "baseline_contract.json").read_text())["trainable_parameters"] == 0
+    wrong_comparison = tmp_path / "wrong_comparison"
+    wrong_comparison.mkdir()
+    (wrong_comparison / "test_predictions.jsonl").write_bytes((evaluation / "test_predictions.jsonl").read_bytes())
+    contract = json.loads((evaluation / "contract.json").read_text())
+    contract["dataset"] = "different_dataset"
+    write_json(wrong_comparison / "contract.json", contract)
+    invalid_args = list(baseline_args)
+    invalid_args[invalid_args.index("--compare-predictions") + 1] = str(wrong_comparison / "test_predictions.jsonl")
+    monkeypatch.setattr(sys, "argv", invalid_args + ["--output-dir", str(tmp_path / "bad_baseline")])
+    with pytest.raises(ValueError, match="Interface contract differs"):
+        benchmark.main()
+    def forbidden_model(*args, **kwargs):
+        raise AssertionError("Audit-only must not load model weights")
+    monkeypatch.setattr(trainer.core, "load_llm_with_bounded_host_memory", forbidden_model)
+    audit_output = tmp_path / "baseline_audit"
+    monkeypatch.setattr(sys, "argv", baseline_args + ["--output-dir", str(audit_output), "--audit-only"])
+    benchmark.main()
+    assert (audit_output / "data_and_prompt_audit.json").exists()
+    assert not (audit_output / "test_metrics.json").exists()
+
+
+def test_baseline_serializes_entire_field_exactly_and_no_oracle(z):
+    from scripts.benchmark_point_readout import serialized_messages, encode_serialized_prompt
+    row = make_record("state", z, "single_point", {"points": [[1, 1]]})
+    messages = serialized_messages(row, z[None])
+    matrix = json.loads(messages[1]["content"].splitlines()[2])
+    assert matrix == z.tolist()
+    assert row["question"] in messages[1]["content"]
+    poisoned = {**row, "oracle": "SECRET", "answer": "SECRET", "task_type": "SECRET", "state_ref": "SECRET"}
+    assert serialized_messages(poisoned, z) == messages
+    with pytest.raises(ValueError, match="Truncation is forbidden"):
+        encode_serialized_prompt(row, z, CharacterTokenizer(), 10)
+    with pytest.raises(ValueError, match="complete public grid"):
+        serialized_messages(row, z[:2, :2])
+
+
+def test_benchmark_pairing_rescores_answers_and_requires_complete_coverage(data_fixture):
+    from scripts.benchmark_point_readout import score_complete_predictions, compare_metrics
+    source, qa, _, _ = data_fixture
+    dataset = PointReadoutDataset(qa, source, "val")
+    try:
+        perfect = [{"qa_id": row["qa_id"], "prediction": row["answer"], "terminated": True}
+                   for row in dataset.records]
+        correct = score_complete_predictions(dataset, perfect)
+        wrong = [{**p, "prediction": "garbage", "score": {"all_correct": True}} for p in perfect]
+        incorrect = score_complete_predictions(dataset, wrong)
+        paired = compare_metrics(incorrect, correct)
+        assert paired["overall"]["interface_minus_baseline_pp"] == 100
+        assert paired["heldout_shapes"]["interface"] == 1
+        assert paired["seen_shapes"]["by_task_type"]["single_point"]["interface_minus_baseline_pp"] == 100
+        for predictions in (perfect[:-1], perfect + perfect[:1], [{**perfect[0], "qa_id": "alien"}]):
+            with pytest.raises(ValueError):
+                score_complete_predictions(dataset, predictions)
+        with pytest.raises(ValueError, match="terminated"):
+            score_complete_predictions(dataset, [{k: v for k, v in p.items() if k != "terminated"} for p in perfect])
     finally:
         dataset.close()
 

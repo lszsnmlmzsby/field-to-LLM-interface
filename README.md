@@ -31,6 +31,10 @@ chat template and configured EOS tokens. The single-device entry
 point supports audits, smoke/pilot/full profiles, task-dependent epoch budgets,
 graceful stop/resume and independent test evaluation. The runbook includes a
 fresh-server installer, verified PDEBench download and complete experiment commands.
+`scripts/benchmark_point_readout.py` evaluates untouched Qwen on the same
+generative questions with complete serialized field values and can compare saved
+interface predictions under the same scoring protocol. Console logs are compact
+by default; detailed JSONL records remain available.
 
 ## Method
 
