@@ -49,6 +49,7 @@ Thumbs.db
 !/scripts/train_point_readout.py
 !/scripts/score_point_readout.py
 !/scripts/benchmark_point_readout.py
+!/scripts/chat_point_readout.py
 !/scripts/setup_field_qa_server.sh
 !/scripts/check_field_qa_environment.py
 !/scripts/download_pdebench_field.py
@@ -74,6 +75,7 @@ Thumbs.db
 !/tests/test_tensor_qwen_cross_attention.py
 !/tests/test_variable_shape_fields.py
 !/tests/test_point_readout.py
+!/tests/test_chat_point_readout.py
 !/tests/test_mixed_shape_fields.py
 !/tests/test_tensor_qwen_inference_benchmark.py
 !/tests/test_tensor_qwen_stage1_ablation.py

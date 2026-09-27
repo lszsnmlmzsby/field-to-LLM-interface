@@ -393,3 +393,60 @@ python scripts/benchmark_point_readout.py --profile full --split val --audit-onl
 使用 `--console-every-updates 500` 可进一步减少打印，或用 `--verbose` 恢复详细进度。
 这些选项不进入训练配方，不影响已有 checkpoint 的严格续训。
 benchmark 默认每 500 题显示进度，`--verbose` 时每 100 题显示一次。
+
+## 14. 自己与模型交互
+
+交互脚本复用现有数据、原生 chat template 和 greedy 解码，不训练、不修改 checkpoint。
+先按前文设置 `FIELD_TO_LLM_ROOT`、`PDEBENCH_HDF5`、`FIELD_TO_LLM_MODEL_DIR`。
+需要已有 full 数据集和对应的生成式问答检查点；不支持旧选择题检查点。
+
+```bash
+python -u scripts/chat_point_readout.py --profile full --split val \
+  --mode both \
+  --checkpoint "$FIELD_TO_LLM_ROOT/runs/field_qa_v2_full_chat_v1/best.pt" \
+  --response-format free \
+  --transcript "$FIELD_TO_LLM_ROOT/runs/chat_free_01.jsonl"
+```
+
+`both` 只加载一份 Qwen 权重，依次显示 baseline 和 interface 的回答。baseline 接收完整标准化矩阵文本，
+且场接口被禁用；interface 通过训练后的场记忆接收相同数值，不接收矩阵文本。
+两边分别保留历史，互相看不到对方的回答。`--mode baseline` 不需要 checkpoint，也不构建接口；
+`--mode interface` 只回答接口一侧。
+
+输入中文或英文问题后回车。例如：
+
+```text
+/examples
+请读取第 2 行第 3 列的标准化值。
+再读取同一行下一列的值。
+/reset
+Read the approximate standardized value at row 2, column 3. Return [value].
+/grid
+/field 1
+/quit
+```
+
+- `/examples`：显示当前场的已有问题，不向模型注入答案。
+- `/grid`：向操作者显示标准化矩阵，不加入模型对话。
+- `/field N`：按从 0 开始的场序号切换，自动清空双方历史。启动可用 `--field-index N`。
+- `/reset`：保留当前场，清空历史。`--single-turn` 则让每个问题独立处理。
+- `/quit`：退出；也可以 Ctrl-D 或 Ctrl-C。
+
+`--response-format json`（默认）沿用训练的 JSON 输出要求；`free` 改为自然语言回答提示。
+自由回答、中文问题和多轮追问尚未专门训练，模型仍可能输出数组；这里不强制修正输出，
+也不为任意问题自动编造标准答案。这是交互探索，不是正式 benchmark。
+查看 test 场并据此调整模型会污染测试用途，日常交互请使用默认 val。
+
+单问单答并退出（与训练更接近的格式，生成预算也设为 benchmark 的 96）：
+
+```bash
+python -u scripts/chat_point_readout.py --profile full --split val --mode both \
+  --checkpoint "$FIELD_TO_LLM_ROOT/runs/field_qa_v2_full_chat_v1/best.pt" \
+  --response-format json --max-new-tokens 96 \
+  --question "Read the approximate standardized value at row 2, column 3. Return [value]."
+```
+
+交互默认最多生成 256 tokens，完整历史不允许静默截断；超长时提示 `/reset`。
+需要长回答可提高 `--max-new-tokens`。`--transcript` 可选，保存双方实际提示和输出，拒绝覆盖已有文件；
+JSONL 已在 `.gitignore` 中。每次新会话请换文件名。接口会严格核对数据集、配置、Qwen 权重及 tokenizer
+与 checkpoint 是否匹配；训练时使用了自定义配置或数据目录，需要传入相同的 `--config` / `--qa-dir`。
