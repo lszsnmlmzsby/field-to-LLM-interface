@@ -100,6 +100,8 @@ def main():
     parser.add_argument("--qa-dir")
     parser.add_argument("--hdf5-path")
     parser.add_argument("--model-dir")
+    parser.add_argument("--block-shape", type=int, nargs=2, metavar=("H", "W"),
+                        help="Reference interface recipe for --compare-predictions; baseline stays unchanged")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-prompt-tokens", type=int, default=16384)
@@ -112,6 +114,8 @@ def main():
     if cli.max_prompt_tokens <= 0:
         parser.error("--max-prompt-tokens must be positive")
     config = load_config(cli.config, cli.profile)
+    if cli.block_shape is not None:
+        config["memory"]["block_shape"] = cli.block_shape
     trainer.validate_config(config)
     qa_dir = resolve_path(cli.qa_dir or config["data"]["qa_dir"])
     hdf5_path = resolve_path(cli.hdf5_path or os.environ.get("PDEBENCH_HDF5") or config["data"]["hdf5_path"])

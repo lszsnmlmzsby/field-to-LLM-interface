@@ -73,6 +73,7 @@ def main():
     parser.add_argument("--qa-dir")
     parser.add_argument("--hdf5-path")
     parser.add_argument("--model-dir")
+    parser.add_argument("--block-shape", type=int, nargs=2, metavar=("H", "W"))
     parser.add_argument("--checkpoint", help="Point-readout best.pt or last.pt; required for interface/both")
     parser.add_argument("--mode", choices=("baseline", "interface", "both"), default="both")
     parser.add_argument("--response-format", choices=("json", "free"), default="json")
@@ -93,6 +94,8 @@ def main():
     if cli.question is not None and (not cli.question.strip() or cli.question.startswith("/")):
         parser.error("--question must be a nonempty question, not an interactive command")
     config = load_config(cli.config, cli.profile)
+    if cli.block_shape is not None:
+        config["memory"]["block_shape"] = cli.block_shape
     trainer.validate_config(config)
     dataset = PointReadoutDataset(resolve_path(cli.qa_dir or config["data"]["qa_dir"]),
         resolve_path(cli.hdf5_path or os.environ.get("PDEBENCH_HDF5") or config["data"]["hdf5_path"]), cli.split)

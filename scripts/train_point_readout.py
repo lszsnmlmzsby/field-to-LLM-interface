@@ -53,6 +53,7 @@ def model_args(config, model_dir=None, *, checkpointing=True):
         freeze_spatial_backbone=False, latent_channel_policy="all",
         value_fourier_bands=int(memory["value_fourier_bands"]),
         value_hidden_dim=int(memory["value_hidden_dim"]),
+        memory_block_shape=tuple(memory.get("block_shape", (1, 1))),
         bridge_dim=int(bridge["bridge_dim"]), bridge_heads=int(bridge["heads"]),
         cross_attention_layers=list(bridge["layers_1based"]),
         bridge_dropout=float(bridge.get("dropout", 0)), gate_init=float(bridge.get("gate_init", 0)),
@@ -225,6 +226,8 @@ def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_pat
             score = score_answer(row, prediction["prediction"], terminated=prediction["terminated"])
             entry = {"qa_id": row["qa_id"], "task_type": row["task_type"],
                      "shape": "x".join(map(str, row["grid_shape"])),
+                     "field_tokens": math.prod((n + p - 1) // p for n, p in
+                                               zip(row["grid_shape"], sidecar.memory.block_shape)),
                      "field": dataset.states[row["state_ref"]]["field"], **prediction, "score": score}
             scored.append(entry)
             handle.write(json.dumps(entry, allow_nan=False) + "\n")
@@ -249,6 +252,8 @@ def print_metric_summary(name, metrics):
 
 
 def validate_config(config):
+    from tensor_compression.downstream.block_tokens import block_shape
+    block_shape(config["memory"].get("block_shape", (1, 1)))
     t, e = config["training"], config["evaluation"]
     for key in ("batch_size", "gradient_accumulation_steps", "epochs", "max_prompt_tokens",
                 "max_target_tokens", "log_interval", "save_every_updates", "eval_every_updates"):
@@ -341,6 +346,8 @@ def main():
     parser.add_argument("--qa-dir")
     parser.add_argument("--hdf5-path")
     parser.add_argument("--model-dir")
+    parser.add_argument("--block-shape", type=int, nargs=2, metavar=("H", "W"),
+                        help="Cells per field token; e.g. 1 1 or 2 2. Requires a matching checkpoint when resuming.")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--resume", help="Strict resume from this numerical-generation experiment")
@@ -363,6 +370,8 @@ def main():
     if cli.split == "test" and not (cli.evaluate_only or cli.audit_only):
         parser.error("The test split is accessible only through explicit evaluation/audit")
     config = load_config(cli.config, cli.profile)
+    if cli.block_shape is not None:
+        config["memory"]["block_shape"] = cli.block_shape
     validate_config(config)
     qa_dir = resolve_path(cli.qa_dir or config["data"]["qa_dir"])
     hdf5_path = resolve_path(cli.hdf5_path or os.environ.get("PDEBENCH_HDF5") or config["data"]["hdf5_path"])
@@ -481,6 +490,7 @@ def main():
             save(output / "last.pt")
 
         print(f"startup=point_readout tasks={dataset.metadata['tasks']} updates={maximum} "
+              f"block_shape={args.memory_block_shape} "
               f"batch={training['batch_size']} accumulation={training['gradient_accumulation_steps']} "
               f"text_encoding={TEXT_ENCODING_VERSION} stop_token_ids={generation_stop_ids(llm, tokenizer)}", flush=True)
         start = time.perf_counter()

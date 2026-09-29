@@ -651,13 +651,17 @@ class FullGridSpatialBackbone(nn.Module):
         adapter_heads: int,
         dropout: float,
         dynamic_grid: bool = False,
+        block_shape: Sequence[int] = (1, 1),
     ) -> None:
         super().__init__()
         self.dynamic_grid = bool(dynamic_grid)
+        from tensor_compression.downstream.block_tokens import block_shape as validate_block_shape
+        self.block_shape = validate_block_shape(block_shape)
+        self.block_cells = math.prod(self.block_shape)
         self.latent_grid = tuple(int(value) for value in latent_grid)
         if len(self.latent_grid) != 2 or any(value <= 0 for value in self.latent_grid):
             raise ValueError(f"Invalid full-grid spatial shape: {self.latent_grid}.")
-        self.latent_token_count = int(self.latent_grid[0] * self.latent_grid[1])
+        self.latent_token_count = math.prod((n + p - 1) // p for n, p in zip(self.latent_grid, self.block_shape))
         self.adapter_dim = int(adapter_dim)
         if self.adapter_dim <= 0 or int(adapter_layers) <= 0 or int(adapter_heads) <= 0:
             raise ValueError("Spatial adapter dimension, layers, and heads must be positive.")
@@ -665,11 +669,12 @@ class FullGridSpatialBackbone(nn.Module):
             raise ValueError("Spatial adapter dimension must be divisible by its head count.")
         if not 0.0 <= float(dropout) < 1.0:
             raise ValueError("Spatial adapter dropout must be in [0,1).")
-        self.latent_projection = nn.Linear(int(latent_channels), self.adapter_dim)
-        self.local_residual_projection = nn.Linear(int(latent_channels), self.adapter_dim)
+        packed_dim = int(latent_channels) * self.block_cells + (self.block_cells if self.block_cells > 1 else 0)
+        self.latent_projection = nn.Linear(packed_dim, self.adapter_dim)
+        self.local_residual_projection = nn.Linear(packed_dim, self.adapter_dim)
         self.register_buffer(
             "spatial_pos_encoding",
-            sinusoidal_2d_position_encoding(*self.latent_grid, self.adapter_dim),
+            self.position_encoding(self.latent_grid),
             persistent=True,
         )
         self.register_buffer("spatial_pos_scale", torch.tensor(1.0), persistent=True)
@@ -685,18 +690,30 @@ class FullGridSpatialBackbone(nn.Module):
             ]
         )
 
+    def position_encoding(self, grid) -> torch.Tensor:
+        # Absolute original-cell row/column of each block's top-left corner.
+        h, w = grid
+        ph, pw = self.block_shape
+        table = sinusoidal_2d_position_encoding(h, w, self.adapter_dim)
+        return table.reshape(1, h, w, self.adapter_dim)[:, ::ph, ::pw].reshape(1, -1, self.adapter_dim)
+
     def spatial_input_states(self, latent_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if latent_map.ndim != 4 or (not self.dynamic_grid and tuple(int(value) for value in latent_map.shape[-2:]) != self.latent_grid):
             raise ValueError(
                 f"Expected encoded field [B,C,{self.latent_grid[0]},{self.latent_grid[1]}], "
                 f"got {tuple(latent_map.shape)}."
             )
-        latent_tokens = latent_map.flatten(2).transpose(1, 2).contiguous()
+        if self.block_cells == 1:
+            latent_tokens = latent_map.flatten(2).transpose(1, 2).contiguous()
+        else:
+            from tensor_compression.downstream.block_tokens import pack_blocks
+            packed, valid = pack_blocks(latent_map, self.block_shape)
+            latent_tokens = torch.cat((packed.flatten(2), valid.to(packed.dtype)), dim=-1)
         latent_tokens = latent_tokens.to(dtype=self.latent_projection.weight.dtype)
         local_residual = self.local_residual_projection(latent_tokens)
         content = self.latent_projection(latent_tokens)
         grid = tuple(int(value) for value in latent_map.shape[-2:])
-        position_table = self.spatial_pos_encoding if grid == self.latent_grid else sinusoidal_2d_position_encoding(*grid, self.adapter_dim)
+        position_table = self.spatial_pos_encoding if grid == self.latent_grid else self.position_encoding(grid)
         position = self.spatial_pos_scale.to(dtype=content.dtype) * position_table.to(
             device=content.device,
             dtype=content.dtype,
@@ -712,7 +729,7 @@ class DenseMemoryState:
 
 
 class DenseTensorMemory(nn.Module):
-    """Full-grid spatial states plus a shared, query-independent exact-z path."""
+    """Cell or block spatial states plus a query-independent original-z path."""
 
     def __init__(
         self,
@@ -724,10 +741,12 @@ class DenseTensorMemory(nn.Module):
     ) -> None:
         super().__init__()
         if spatial_backbone.adapter_type != "spatial_transformer":
-            raise ValueError("Dense memory requires a one-token-per-cell spatial_transformer initializer.")
+            raise ValueError("Dense memory requires a spatial_transformer initializer.")
         self.spatial_backbone = spatial_backbone
         self.field_encoder = field_encoder
         self.memory_dim = int(spatial_backbone.adapter_dim)
+        self.block_shape = getattr(spatial_backbone, "block_shape", (1, 1))
+        self.block_cells = math.prod(self.block_shape)
         self.fourier_bands = int(fourier_bands)
         self.freeze_spatial_backbone = bool(freeze_spatial_backbone)
         if self.fourier_bands < 0:
@@ -743,11 +762,11 @@ class DenseTensorMemory(nn.Module):
         hidden_dim = max(8, int(value_hidden_dim))
         self.content_norm = nn.LayerNorm(self.memory_dim)
         self.value_encoder = nn.Sequential(
-            nn.Linear(basis_dim, hidden_dim),
+            nn.Linear(basis_dim * self.block_cells + (self.block_cells if self.block_cells > 1 else 0), hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, self.memory_dim),
         )
-        self.value_reconstruction = nn.Linear(self.memory_dim, 1)
+        self.value_reconstruction = nn.Linear(self.memory_dim, self.block_cells)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -792,6 +811,16 @@ class DenseTensorMemory(nn.Module):
         z_values = field_input[:, 0].flatten(1)
         latent_map = self.field_encoder(field_input) if self.field_encoder is not None else field_input
         content = self.content_norm(self._spatial_states(latent_map))
+        if self.block_cells > 1:
+            from tensor_compression.downstream.block_tokens import pack_blocks, masked_reconstruction
+            packed, valid = pack_blocks(field_input[:, :1], self.block_shape)
+            z_values = packed.squeeze(-1)
+            if z_values.shape[1] != content.shape[1]:
+                raise ValueError("Spatial and scalar blocks must have identical token grids")
+            basis = self._value_basis(z_values) * valid.unsqueeze(-1)
+            value = self.value_encoder(torch.cat((basis.flatten(2), valid.to(basis.dtype)), dim=-1))
+            reconstruction_loss = masked_reconstruction(self.value_reconstruction(value), z_values, valid)
+            return DenseMemoryState(content=content, value=value, reconstruction_loss=reconstruction_loss)
         if int(z_values.shape[1]) != int(content.shape[1]):
             raise ValueError(
                 "Exact scalar grid and spatial memory must have one-to-one cells: "
@@ -2067,6 +2096,7 @@ def build_scratch_memory_components(
         adapter_heads=int(spatial.get("adapter_heads", 8)),
         dropout=float(spatial.get("dropout", 0.0)),
         dynamic_grid=dynamic,
+        block_shape=getattr(args, "memory_block_shape", (1, 1)),
     )
     state_sha256 = _module_state_sha256(
         {"field_encoder": field_encoder, "spatial_backbone": spatial_backbone}
@@ -2155,6 +2185,9 @@ def build_sidecar(
         **install_report,
         "llm_hidden_size": llm_hidden_size,
         "memory_dim": int(memory.memory_dim),
+        "block_shape": list(memory.block_shape),
+        "cells_per_token": memory.block_cells,
+        "packing": "row-major blocks and slots; bottom/right padding with slot mask",
         "bridge_dim": int(args.bridge_dim),
         "heads": int(args.bridge_heads),
         "gate_init": float(args.gate_init),

@@ -1,5 +1,7 @@
 # 真实场生成式问答 v2：完整实验流程
 
+多个点对应一个 token 的独立可行性实验见 [BLOCK_READOUT_RUNBOOK.md](BLOCK_READOUT_RUNBOOK.md)。
+
 冻结 Qwen2.5-14B-Instruct，根据整个标准化场和自然语言问题直接生成数值或坐标。
 复用现有逐格 CNN、二维 spatial adapter、数值编码和交叉注意力；场侧模块从头训练。
 不需要旧服务器的 Stage 1、Direct-QA 或选择题 checkpoint。原选择题入口保持独立。
@@ -445,7 +447,7 @@ python -u scripts/chat_point_readout.py --profile full --split val --mode both \
   --response-format json --max-new-tokens 96 \
   --question "Read the approximate standardized value at row 2, column 3. Return [value]."
 ```
-
+或者可以使用参数`--single-turn`
 交互默认最多生成 256 tokens，完整历史不允许静默截断；超长时提示 `/reset`。
 需要长回答可提高 `--max-new-tokens`。`--transcript` 可选，保存双方实际提示和输出，拒绝覆盖已有文件；
 JSONL 已在 `.gitignore` 中。每次新会话请换文件名。接口会严格核对数据集、配置、Qwen 权重及 tokenizer

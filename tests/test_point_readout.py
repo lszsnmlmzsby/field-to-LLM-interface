@@ -553,7 +553,8 @@ def test_local_model_identity_tracks_weight_contents_and_allows_relocation(tmp_p
     assert model_asset_identity(str(second), None) != expected
 
 
-def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path, monkeypatch):
+@pytest.mark.parametrize("block", [None, 2], ids=["legacy", "2x2"])
+def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path, monkeypatch, block):
     """Exercise the actual CLI loop with a tiny real Qwen, including interrupted resume."""
     import yaml
     from transformers import Qwen2ForCausalLM
@@ -582,6 +583,8 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
     monkeypatch.setattr(trainer.core, "load_llm_with_bounded_host_memory", load_model)
     base = ["train_point_readout.py", "--config", str(config_path), "--profile", "smoke",
             "--qa-dir", str(qa), "--hdf5-path", str(source), "--device", "cpu"]
+    if block:
+        base += ["--block-shape", str(block), str(block)]
 
     def run(out, *extra):
         monkeypatch.setattr(sys, "argv", base + ["--output-dir", str(out), *extra])
@@ -623,6 +626,10 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
         offline = score_predictions(dataset, predictions)
         assert online["point_accuracy"] == offline["point_accuracy"]
         assert online["questions"] == len(dataset)
+        for prediction, record in zip(predictions, dataset.records):
+            ph = block or 1
+            h, w = record["grid_shape"]
+            assert prediction["field_tokens"] == ((h+ph-1)//ph)*((w+ph-1)//ph)
     finally:
         dataset.close()
 
@@ -636,6 +643,8 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
     baseline_args = ["benchmark_point_readout.py", "--config", str(config_path), "--profile", "smoke",
                      "--qa-dir", str(qa), "--hdf5-path", str(source), "--split", "test", "--device", "cpu",
                      "--compare-predictions", str(evaluation / "test_predictions.jsonl")]
+    if block:
+        baseline_args += ["--block-shape", str(block), str(block)]
     monkeypatch.setattr(sys, "argv", baseline_args + ["--output-dir", str(baseline_output)])
     benchmark.main()
     comparison = json.loads((baseline_output / "comparison.json").read_text())
