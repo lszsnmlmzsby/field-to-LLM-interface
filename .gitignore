@@ -55,7 +55,6 @@ Thumbs.db
 !/scripts/setup_field_qa_server.sh
 !/scripts/check_field_qa_environment.py
 !/scripts/download_pdebench_field.py
-!/scripts/download_point_readout_data.py
 !/scripts/mixed_shape_qa.py
 !/scripts/analyze_field_predictions.py
 !/scripts/evaluate_variable_shape_checkpoint.py
@@ -78,7 +77,6 @@ Thumbs.db
 !/tests/test_tensor_qwen_cross_attention.py
 !/tests/test_variable_shape_fields.py
 !/tests/test_point_readout.py
-!/tests/test_point_readout_download.py
 !/tests/test_block_readout.py
 !/tests/test_chat_point_readout.py
 !/tests/test_mixed_shape_fields.py

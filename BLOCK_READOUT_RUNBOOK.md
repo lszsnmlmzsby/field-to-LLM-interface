@@ -96,55 +96,7 @@ python scripts/check_field_qa_environment.py --require-cuda \
 [下载清单](https://github.com/pdebench/PDEBench/blob/main/pdebench/data_download/pdebench_data_urls.csv)。
 下载可以在没有 GPU 的准备时段执行（若平台提供），tmux 只防 SSH 断开，不延长资源租期。
 
-### 慢速线路：按需下载真实场
-
-若完整文件下载需要数天，使用 `scripts/download_point_readout_data.py`。
-它调用同一个 QA 生成器，保留原文件全部 trajectory/time 轴、随机种子、80/10/10 划分和任务预算。
-每次只取得采样需要的一个物理量、一个时刻的完整原始网格，再按原规则裁剪、标准化并生成问题。
-不是取文件前几 MB，也不把轨迹池缩小到前几十条。两组仍共用同一份固定的 QA 数据。
-
-需要先同步新脚本、`point_readout_data.py` 和 Git 白名单；新脚本不依赖 aria2，不需要安装额外 Python 包。
-先只探测布局，不创建缓存或 QA：
-
-```bash
-python -u scripts/download_point_readout_data.py --probe-only
-```
-
-支持 HTTP 206、稳定的 ETag/Last-Modified，以及连续存储、无压缩的 float32 HDF5 场。
-若实际文件布局不满足要求，会停止，不回退到整文件下载。
-探测成功后，在 tmux 内执行（不需要 GPU）：
-
-```bash
-python -u scripts/download_point_readout_data.py --profile smoke pilot
-```
-
-按 128×128 float32 计算，两个 profile 共 1,200 个有效场，原始 payload 约 75 MiB；
-元数据、重复/无效候选和网络重试会增加实际传输量。每 20 个新场报告一次下载量和耗时。
-这里不保证下载用时，远端请求延迟也会影响速度。Ctrl+C 后重复同一命令即可：
-已完成的 profile 会校验后复用；未完成的 profile 从原种子重建，但已缓存的场不重新下载。
-
-缓存的名称是原名的 `.selected.hdf5` 版本，仍放在 `tensor_llm_assets/raw/`：
-
-```bash
-export PDEBENCH_HDF5="$FIELD_TO_LLM_ROOT/raw/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.selected.hdf5"
-python scripts/check_field_qa_environment.py --require-cuda \
-  --hdf5-path "$PDEBENCH_HDF5" \
-  --output "$F2LLM_HOME/tensor_llm_outputs/environment/selected_data.json"
-```
-
-之后跳过下面 smoke/pilot 的 `build_point_readout_qa.py`，因为 QA 已由下载器生成并通过离线重放审计。
-普通构建器会拒绝重新采样该缓存；需要 full 时用下载器 `--profile full` 获取额外场，不从未下载部分取值。
-当前训练、续训和独立评估命令保持一致；它们只读本地缓存，不需要网络。
-每次重新登录或进入 tmux 都要设置上面的 `PDEBENCH_HDF5`，也可以把这条 export 写入登录脚本。
-
-缓存保留原始轴编号，未获取的位置填 NaN，明确标记为局部缓存，不是完整官方原文件。
-已有场的 SHA256、来源 URL、源文件大小、ETag/Last-Modified 和各 QA 的原始裁剪哈希会被记录/校验。
-因为没有取得全部字节，不能宣称通过了官方整文件 MD5；不得把缓存重命名成完整原文件或供其他实验任意采样。
-QA 先写入同一父目录下的 staging，所有 split 离线审计成功后再发布；失败的 staging 保留且不用于训练。
-
-### 完整文件下载
-
-线路速度足够时，仍可使用完整文件流程：
+本实验下载完整的官方 HDF5，通过官方整文件 MD5 校验后再构建 QA；局部缓存或未完成文件不能替代它。
 
 ```bash
 python -u scripts/download_pdebench_field.py \

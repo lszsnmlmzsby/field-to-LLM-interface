@@ -6,7 +6,6 @@ import json
 import os
 import random
 from collections import Counter, OrderedDict
-from contextlib import nullcontext
 from pathlib import Path
 
 import h5py
@@ -47,7 +46,7 @@ def write_jsonl(path, rows):
             handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
 
 
-def build_dataset(config, hdf5_path, output_dir, *, source_handle=None):
+def build_dataset(config, hdf5_path, output_dir):
     config = copy.deepcopy(config)
     data, generation = config["data"], config["generation"]
     tasks = list(generation["tasks"])
@@ -99,12 +98,7 @@ def build_dataset(config, hdf5_path, output_dir, *, source_handle=None):
         raise FileExistsError(f"Use a new empty dataset directory: {output_dir}")
     rng = random.Random(int(generation["seed"]))
     rejected = Counter()
-    # A remote-backed handle must expose the original trajectory/time axes and
-    # exact raw crops. Sampling, RNG consumption and QA generation remain here.
-    with (nullcontext(source_handle) if source_handle is not None else h5py.File(hdf5_path, "r")) as handle:
-        if source_handle is None and handle.attrs.get("field_qa_range_cache"):
-            raise ValueError("This is a selected-frame cache, not a complete source. "
-                             "Use download_point_readout_data.py to build another profile.")
+    with h5py.File(hdf5_path, "r") as handle:
         layouts = {field: list(handle[field].shape) for field in fields}
         if any(len(shape) != 4 for shape in layouts.values()) or len({tuple(s) for s in layouts.values()}) != 1:
             raise ValueError("Fields must share [trajectory,time,height,width] axes in this HDF5 file")
