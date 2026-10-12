@@ -727,6 +727,38 @@ def test_server_field_inspection_and_download_checksum(data_fixture, tmp_path):
         verify(artifact, hashlib.md5(b"incomplete fixture").hexdigest())
 
 
+def test_local_model_preflight_requires_all_indexed_shards_and_tensor_names(tmp_path):
+    from safetensors.torch import save_file
+    from scripts.check_field_qa_environment import inspect_weight_files
+
+    shard_a, shard_b = "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"
+    index = {"weight_map": {"a": shard_a, "b": shard_b}}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
+    save_file({"a": torch.ones(2)}, str(tmp_path / shard_a))
+    with pytest.raises(FileNotFoundError, match="Missing/empty"):
+        inspect_weight_files(tmp_path)
+    save_file({"wrong_name": torch.ones(2)}, str(tmp_path / shard_b))
+    with pytest.raises(ValueError, match="indexed tensors"):
+        inspect_weight_files(tmp_path)
+    save_file({"b": torch.ones(2)}, str(tmp_path / shard_b))
+    result = inspect_weight_files(tmp_path)
+    assert result["weight_files"] == [shard_a, shard_b]
+    assert result["weight_size_gib"] == sum(p.stat().st_size for p in tmp_path.glob("*.safetensors")) / 2**30
+
+
+def test_local_model_preflight_rejects_truncated_safetensors(tmp_path):
+    from safetensors import SafetensorError
+    from safetensors.torch import save_file
+    from scripts.check_field_qa_environment import inspect_weight_files
+
+    shard = tmp_path / "model.safetensors"
+    save_file({"a": torch.ones(16)}, str(shard))
+    assert inspect_weight_files(tmp_path)["weight_files"] == [shard.name]
+    shard.write_bytes(shard.read_bytes()[:-1])
+    with pytest.raises(SafetensorError):
+        inspect_weight_files(tmp_path)
+
+
 def test_download_restarts_partial_transfer_without_discarding_bytes(tmp_path, monkeypatch):
     import subprocess
     from scripts import download_pdebench_field as downloader

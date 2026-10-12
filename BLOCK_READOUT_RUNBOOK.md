@@ -1,6 +1,6 @@
 # 多点一个 token：真实场可行性实验
 
-沿用 `POINT_READOUT_RUNBOOK.md` 的服务器环境、Qwen 及 PDEBench 数据。只新增局部块编码，
+使用本手册的托管服务器流程、Qwen 及 PDEBench 数据。只新增局部块编码，
 冻结 Qwen，保留 11 类生成任务、单小数位训练答案和绝对误差 0.2 的评分规则。
 
 ## 结构与兼容性
@@ -38,64 +38,212 @@ token 数为 ceil(H/ph)×ceil(W/pw)。17×90 用 2×2 得到 405 tokens，而不
 pilot/full 未见形状：16×64、64×16、17×90、90×17。原 HDF5 两轴至少 90 才能构建完整实验。
 pilot 验证和测试各 64 场、704 问答（每种形状 8 场）；轨迹仍按 80/10/10 隔离。
 pilot 每 2,816 次更新验证，5,632 次结束；batch=1、累积=4、两轮。任务和学习率两组一致。
-full 每种评估形状 32 场；本次不必运行 full。
+full 每种评估形状 32 场，验证和测试各 2,816 问答；每 1,024 次更新验证，加末尾验证共 22 次/组。
+先完成 pilot，再决定是否投入 full。
 
 ## 服务器命令
 
-在服务器仓库根目录、已激活的 tcenv 环境中执行。保持已有的 `FIELD_TO_LLM_ROOT` 和 `PDEBENCH_HDF5`。
+当前资源是一张 A800 80 GB，PyTorch 2.4.1+cu124；入口是单设备训练，使用 `python`，不用多进程 `torchrun`。
+两组顺序运行。80 GB 能否覆盖真实 14B、最大场形状和验证阶段，仍需实测。
+继续使用已申请环境；不运行 `setup_field_qa_server.sh`，不直接安装仓库的完整 requirements，避免替换平台 Torch/CUDA。
+包的“available=True”只说明可以找到包，不能证明 Qwen 实现可导入或版本相容。
+
+目录固定为：
+
+```text
+/workspace/wyx/f2llm/
+  tensor-compression/                  # Git 仓库
+  tensor_llm_assets/raw/               # PDEBench 原始 HDF5
+  tensor_llm_assets/data/              # 固定的 QA 数据清单
+  tensor_llm_assets/models/            # 本地 Qwen 权重和 tokenizer
+  tensor_llm_outputs/runs/             # 检查点、训练日志和评估
+  tensor_llm_outputs/logs/             # 终端输出日志
+  tensor_llm_outputs/environment/      # 环境检查结果
+  hf_cache/                           # Hugging Face 缓存
+```
+
+每次登录先 `source`（不能用 `bash` 代替，因为环境变量要留在当前 shell）。
+如果新容器提示 git/curl/tmux 不存在，可在当前 root 容器按平台允许的方式恢复这些工具：
 
 ```bash
-git pull
-export FIELD_TO_LLM_MODEL_DIR="$FIELD_TO_LLM_ROOT/models/Qwen2.5-14B-Instruct"
+apt-get update
+apt-get install -y git curl tmux
+source /workspace/wyx/f2llm/enter_f2llm.sh
+git status --short
+git rev-parse HEAD
+```
+
+服务器应包含 `21f9d79` 的实验实现，以及本手册配套的最新环境检查脚本。
+如果工作区干净、远端已有需要的更新，用 `git pull --ff-only` 同步；有本地修改时先检查，不强制覆盖。
+以下命令中的新 `--model-dir` 检查参数需要先同步本次修改到服务器。
+
+```bash
 export BLOCK_CONFIG=configs/field_to_llm_block_readout.yaml
+df -h "$F2LLM_HOME"
+free -h
+python scripts/check_field_qa_environment.py --require-cuda \
+  --model-dir "$FIELD_TO_LLM_MODEL_DIR" \
+  --output "$F2LLM_HOME/tensor_llm_outputs/environment/before_data.json"
+```
+
+检查实际 Qwen 类导入、本地配置、tokenizer/chat template，以及索引引用的全部 safetensors 分片。
+分片检查读取头部及索引，不加载 14B 权重，也不代替官方的全文件校验和。
+需要同时保留原数据（约 51.2 GiB）、14B 权重、缓存和输出空间；不能只看 GPU 显存。
+模型加载还需要主机 RAM；`free -h` 之外也应确认平台给当前容器的 RAM 配额。
+当前 `pip check` 的 ninja 平台提示需要记录，但这个实验没有调用 ninja 编译扩展，先以导入/测试结果判断。
+
+下载一份 2D CFD Rand 128 数据即可，不需要整个 PDEBench。源地址和 MD5 来自官方
+[下载清单](https://github.com/pdebench/PDEBench/blob/main/pdebench/data_download/pdebench_data_urls.csv)。
+下载可以在没有 GPU 的准备时段执行（若平台提供），tmux 只防 SSH 断开，不延长资源租期。
+
+### 慢速线路：按需下载真实场
+
+若完整文件下载需要数天，使用 `scripts/download_point_readout_data.py`。
+它调用同一个 QA 生成器，保留原文件全部 trajectory/time 轴、随机种子、80/10/10 划分和任务预算。
+每次只取得采样需要的一个物理量、一个时刻的完整原始网格，再按原规则裁剪、标准化并生成问题。
+不是取文件前几 MB，也不把轨迹池缩小到前几十条。两组仍共用同一份固定的 QA 数据。
+
+需要先同步新脚本、`point_readout_data.py` 和 Git 白名单；新脚本不依赖 aria2，不需要安装额外 Python 包。
+先只探测布局，不创建缓存或 QA：
+
+```bash
+python -u scripts/download_point_readout_data.py --probe-only
+```
+
+支持 HTTP 206、稳定的 ETag/Last-Modified，以及连续存储、无压缩的 float32 HDF5 场。
+若实际文件布局不满足要求，会停止，不回退到整文件下载。
+探测成功后，在 tmux 内执行（不需要 GPU）：
+
+```bash
+python -u scripts/download_point_readout_data.py --profile smoke pilot
+```
+
+按 128×128 float32 计算，两个 profile 共 1,200 个有效场，原始 payload 约 75 MiB；
+元数据、重复/无效候选和网络重试会增加实际传输量。每 20 个新场报告一次下载量和耗时。
+这里不保证下载用时，远端请求延迟也会影响速度。Ctrl+C 后重复同一命令即可：
+已完成的 profile 会校验后复用；未完成的 profile 从原种子重建，但已缓存的场不重新下载。
+
+缓存的名称是原名的 `.selected.hdf5` 版本，仍放在 `tensor_llm_assets/raw/`：
+
+```bash
+export PDEBENCH_HDF5="$FIELD_TO_LLM_ROOT/raw/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.selected.hdf5"
+python scripts/check_field_qa_environment.py --require-cuda \
+  --hdf5-path "$PDEBENCH_HDF5" \
+  --output "$F2LLM_HOME/tensor_llm_outputs/environment/selected_data.json"
+```
+
+之后跳过下面 smoke/pilot 的 `build_point_readout_qa.py`，因为 QA 已由下载器生成并通过离线重放审计。
+普通构建器会拒绝重新采样该缓存；需要 full 时用下载器 `--profile full` 获取额外场，不从未下载部分取值。
+当前训练、续训和独立评估命令保持一致；它们只读本地缓存，不需要网络。
+每次重新登录或进入 tmux 都要设置上面的 `PDEBENCH_HDF5`，也可以把这条 export 写入登录脚本。
+
+缓存保留原始轴编号，未获取的位置填 NaN，明确标记为局部缓存，不是完整官方原文件。
+已有场的 SHA256、来源 URL、源文件大小、ETag/Last-Modified 和各 QA 的原始裁剪哈希会被记录/校验。
+因为没有取得全部字节，不能宣称通过了官方整文件 MD5；不得把缓存重命名成完整原文件或供其他实验任意采样。
+QA 先写入同一父目录下的 staging，所有 split 离线审计成功后再发布；失败的 staging 保留且不用于训练。
+
+### 完整文件下载
+
+线路速度足够时，仍可使用完整文件流程：
+
+```bash
+python -u scripts/download_pdebench_field.py \
+  --output-dir "$FIELD_TO_LLM_ROOT/raw"
+python scripts/check_field_qa_environment.py --require-cuda \
+  --model-dir "$FIELD_TO_LLM_MODEL_DIR" --hdf5-path "$PDEBENCH_HDF5" \
+  --output "$F2LLM_HOME/tensor_llm_outputs/environment/before_training.json"
 python -m pytest tests/test_block_readout.py tests/test_point_readout.py -q
 ```
 
+下载中断后重复同一命令，会保留并续传 `.part`，MD5 成功后才变成正式 HDF5。
+若之前已用 aria2 分块下载该 `.part`，应继续使用 aria2 及其 `.aria2` 控制文件，不能切回按文件长度续传的 curl。
+若校验失败，先检查部分文件，不绕过校验直接构建训练数据。
+训练用的 `data/` 是从 `raw/` 生成的 JSONL 清单，场数据仍从原始 HDF5 按需读取；训练时不能移动/删除原文件。
+
 先检查训练/生成闭环，包含奇数形状。构建器拒绝覆盖已有数据；已经成功构建则跳过 build。
-输出目录也必须是新的。两组依次运行，不同时占用 A6000。
+输出目录也必须是新的。审计会重放 train/val/test 标签，但不进行测试集预测或用测试集选检查点。
 
 ```bash
 python scripts/build_point_readout_qa.py --config "$BLOCK_CONFIG" --profile smoke
+python scripts/train_point_readout.py --config "$BLOCK_CONFIG" --profile smoke \
+  --audit-only --output-dir "$FIELD_TO_LLM_RUNS_DIR/block_audit_smoke"
 python -u scripts/train_point_readout.py --config "$BLOCK_CONFIG" --profile smoke \
-  --block-shape 1 1 --output-dir "$FIELD_TO_LLM_ROOT/runs/block_smoke_1x1"
+  --device cuda --block-shape 1 1 --output-dir "$FIELD_TO_LLM_RUNS_DIR/block_smoke_1x1"
 python -u scripts/train_point_readout.py --config "$BLOCK_CONFIG" --profile smoke \
-  --block-shape 2 2 --output-dir "$FIELD_TO_LLM_ROOT/runs/block_smoke_2x2"
+  --device cuda --block-shape 2 2 --output-dir "$FIELD_TO_LLM_RUNS_DIR/block_smoke_2x2"
 ```
 
-主实验：
+主实验先分别做 200 次更新的计时段。它使用正式 pilot 形状和原定两轮的学习率日程；
+不使用随机场或改小 epochs/max_updates 来估时。每组使用独立的新输出目录，数据只生成一次。
 
 ```bash
 python scripts/build_point_readout_qa.py --config "$BLOCK_CONFIG" --profile pilot
+python scripts/train_point_readout.py --config "$BLOCK_CONFIG" --profile pilot \
+  --audit-only --output-dir "$FIELD_TO_LLM_RUNS_DIR/block_audit_pilot"
 python -u scripts/train_point_readout.py --config "$BLOCK_CONFIG" --profile pilot \
-  --block-shape 1 1 --output-dir "$FIELD_TO_LLM_ROOT/runs/block_pilot_1x1"
+  --device cuda --block-shape 1 1 --output-dir "$FIELD_TO_LLM_RUNS_DIR/block_pilot_1x1" \
+  --stop-after-updates 200
 python -u scripts/train_point_readout.py --config "$BLOCK_CONFIG" --profile pilot \
-  --block-shape 2 2 --output-dir "$FIELD_TO_LLM_ROOT/runs/block_pilot_2x2"
+  --device cuda --block-shape 2 2 --output-dir "$FIELD_TO_LLM_RUNS_DIR/block_pilot_2x2" \
+  --stop-after-updates 200
 ```
 
-需要先估算时间时，第一次训练可添加 `--stop-after-updates 200`，会按原完整日程保存并退出。
-之后去掉该参数，使用相同命令、相同输出目录，并加 `--resume .../last.pt` 继续。
-不得为了短跑修改 epochs/max_updates 后再恢复。示例：
+另一个终端可用 `nvidia-smi -l 5` 观察峰值和进程。200 次更新尚不触发 pilot 的完整验证；
+smoke 也不覆盖最大评估场。因此，这两项通过后仍应监控 pilot 第一次包含 17×90/90×17 的验证。
+
+在首次 200 次更新结束、尚未续训时，可从第 20 到第 200 次更新估算纯训练时间：
+
+```bash
+python - <<'PY'
+import json, os
+from pathlib import Path
+root = Path(os.environ['FIELD_TO_LLM_RUNS_DIR'])
+for name in ['block_pilot_1x1', 'block_pilot_2x2']:
+    path = root / name
+    rows = [json.loads(line) for line in (path / 'train.jsonl').read_text().splitlines()]
+    rows = [row for row in rows if 20 <= row['step'] <= 200]
+    if len(rows) < 2:
+        raise ValueError(f'{name}: need at least two timing records')
+    first, last = rows[0], rows[-1]
+    seconds = (last['elapsed_seconds'] - first['elapsed_seconds']) / (last['step'] - first['step'])
+    updates = json.loads((path / 'training_plan.json').read_text())['planned_updates']
+    print(f'{name}: {seconds:.2f} s/update; {updates * seconds / 3600:.2f} h training only')
+PY
+```
+
+每组 pilot 总时间约为 `5632 × 秒/更新 + 2 × 完整验证秒数 + 加载/保存开销`，两组顺序运行则相加。
+验证耗时记录在 `validation.jsonl` 的 `elapsed_seconds`；首次 200 步只能测训练部分。
+不要把 smoke 的更新速度外推到 pilot，也不要默认 2×2 的总训练速度会快四倍，Qwen 文本解码仍保留。
+`train.jsonl` 的计时在每次进程启动时归零，上述估算不能混用不同续训段的首末行。
+
+完成计时后，去掉停止参数、加 `--resume last.pt`，两组依次继续，直到 5,632 次更新及末尾验证结束：
 
 ```bash
 python -u scripts/train_point_readout.py --config "$BLOCK_CONFIG" --profile pilot \
-  --block-shape 2 2 --output-dir "$FIELD_TO_LLM_ROOT/runs/block_pilot_2x2" \
-  --resume "$FIELD_TO_LLM_ROOT/runs/block_pilot_2x2/last.pt"
+  --device cuda --block-shape 1 1 --output-dir "$FIELD_TO_LLM_RUNS_DIR/block_pilot_1x1" \
+  --resume "$FIELD_TO_LLM_RUNS_DIR/block_pilot_1x1/last.pt"
+python -u scripts/train_point_readout.py --config "$BLOCK_CONFIG" --profile pilot \
+  --device cuda --block-shape 2 2 --output-dir "$FIELD_TO_LLM_RUNS_DIR/block_pilot_2x2" \
+  --resume "$FIELD_TO_LLM_RUNS_DIR/block_pilot_2x2/last.pt"
 ```
+
+普通中断信号会在完整 optimizer 更新后保存；强制结束/租期结束可能回退到最后一次保存。
+资源到期前主动停止并确认 `last.pt`/`run_summary.json` 已落盘，换同一环境后严格续训，不跨组加载。
 
 独立评估两个 best（避免将训练期显存和独立推理显存混用）：
 
 ```bash
 python -u scripts/train_point_readout.py --config "$BLOCK_CONFIG" --profile pilot \
-  --block-shape 1 1 --evaluate-only --split val \
-  --resume "$FIELD_TO_LLM_ROOT/runs/block_pilot_1x1/best.pt" \
-  --output-dir "$FIELD_TO_LLM_ROOT/runs/block_eval_1x1"
+  --device cuda --block-shape 1 1 --evaluate-only --split val \
+  --resume "$FIELD_TO_LLM_RUNS_DIR/block_pilot_1x1/best.pt" \
+  --output-dir "$FIELD_TO_LLM_RUNS_DIR/block_eval_1x1"
 python -u scripts/train_point_readout.py --config "$BLOCK_CONFIG" --profile pilot \
-  --block-shape 2 2 --evaluate-only --split val \
-  --resume "$FIELD_TO_LLM_ROOT/runs/block_pilot_2x2/best.pt" \
-  --output-dir "$FIELD_TO_LLM_ROOT/runs/block_eval_2x2"
+  --device cuda --block-shape 2 2 --evaluate-only --split val \
+  --resume "$FIELD_TO_LLM_RUNS_DIR/block_pilot_2x2/best.pt" \
+  --output-dir "$FIELD_TO_LLM_RUNS_DIR/block_eval_2x2"
 python scripts/compare_block_readout.py \
-  --reference "$FIELD_TO_LLM_ROOT/runs/block_eval_1x1" \
-  --compressed "$FIELD_TO_LLM_ROOT/runs/block_eval_2x2"
+  --reference "$FIELD_TO_LLM_RUNS_DIR/block_eval_1x1" \
+  --compressed "$FIELD_TO_LLM_RUNS_DIR/block_eval_2x2"
 ```
 
 比较工具要求除 block_shape 外训练身份一致，并校验双方问题 ID 集合。输出每任务整题/逐元素准确率、
@@ -110,7 +258,7 @@ seen/heldout、场 token 范围、推理峰值分配显存、总耗时及生成 
 ```bash
 python -u scripts/chat_point_readout.py --config "$BLOCK_CONFIG" --profile pilot \
   --block-shape 2 2 --split val --mode both --response-format json --single-turn \
-  --checkpoint "$FIELD_TO_LLM_ROOT/runs/block_pilot_2x2/best.pt"
+  --checkpoint "$FIELD_TO_LLM_RUNS_DIR/block_pilot_2x2/best.pt"
 ```
 
 这里的 both 仍然表示“原始 Qwen 文本矩阵 vs 压缩接口”。1×1 和 2×2 接口之间的比较使用上面的独立评估。
@@ -124,4 +272,5 @@ python -u scripts/chat_point_readout.py --config "$BLOCK_CONFIG" --profile pilot
 训练产生 `resolved_config.json`、`architecture.json`、`train.jsonl`、`validation.jsonl`、`best.pt`、`last.pt`。
 块大小记录在配置和 architecture 中，每条评估预测记录 field_tokens。
 本地 CPU 小型 Qwen 测试验证槽位排列、奇数边界、梯度、冻结主干、保存恢复和旧 1×1 路径；
-真实 Qwen 14B 的 A6000 显存、速度和精度需要服务器 smoke/pilot 实测。
+本地验证环境的 Torch 与服务器 Torch 2.4.1 不同，因此服务器仍需运行依赖导入、测试和 smoke。
+真实 Qwen 14B 的 A800 80 GB 显存、速度和精度需要服务器 smoke/pilot 实测。
