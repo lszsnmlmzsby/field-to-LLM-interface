@@ -34,14 +34,15 @@ def tensor_hash(value: torch.Tensor) -> str:
     return hashlib.sha256(array.tobytes()).hexdigest()
 
 
-def normalize_field(raw: torch.Tensor) -> tuple[torch.Tensor, dict]:
+def normalize_field(raw: torch.Tensor, *, allow_singleton: bool = False) -> tuple[torch.Tensor, dict]:
     raw = raw.detach().cpu().float().contiguous()
     if raw.ndim != 2 or min(raw.shape) < 1 or not bool(torch.isfinite(raw).all()):
         raise ValueError("nonfinite_or_invalid_field")
     mean, std = raw.mean(), raw.std(unbiased=False)
     scale = std + 1e-6
     z = ((raw - mean) / scale).half().float()
-    if not bool(torch.isfinite(z).all()) or float(z.min()) == float(z.max()):
+    if not bool(torch.isfinite(z).all()) or (float(z.min()) == float(z.max())
+                                           and not (allow_singleton and raw.numel() == 1)):
         raise ValueError("constant_or_nonfinite_standardized_field")
     return z, {"mean": float(mean), "std": float(std), "scale": float(scale),
                "raw_sha256": tensor_hash(raw), "z_sha256": tensor_hash(z)}
@@ -65,8 +66,8 @@ def query_points(task: str, spec: Mapping, shape: Sequence[int]) -> list[list[in
         points = [[start[0] + i * step[0], start[1] + i * step[1]] for i in range(count)]
     elif task == "region_values" or task in STAT_TASKS + LOCATION_TASKS:
         start, size = spec["start"], spec["size"]
-        if len(size) != 2 or any(type(n) is not int or n < 2 for n in size):
-            raise ValueError("Region dimensions must be integers >= 2")
+        if len(size) != 2 or any(type(n) is not int or n < 1 for n in size):
+            raise ValueError("Region dimensions must be positive integers")
         points = [[start[0] + i, start[1] + j] for i in range(size[0]) for j in range(size[1])]
     else:
         raise ValueError(f"Unsupported point readout task: {task}")

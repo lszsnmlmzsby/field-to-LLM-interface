@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from tensor_compression.downstream.point_readout import TASKS
-from tensor_compression.downstream.point_readout_data import build_dataset, load_config, resolve_path
+from tensor_compression.downstream.point_readout_data import build_dataset, load_config, resolve_path, source_path
 
 
 def main():
@@ -27,7 +27,7 @@ def main():
         config["data"]["fields"] = cli.fields
     if cli.tasks:
         config["generation"]["tasks"] = cli.tasks
-    path = resolve_path(cli.hdf5_path or os.environ.get("PDEBENCH_HDF5") or config["data"]["hdf5_path"])
+    path = source_path(config, cli.hdf5_path)
     output = resolve_path(cli.output_dir or config["data"]["qa_dir"])
     result = build_dataset(config, path, output)
     print(f"dataset={output} tasks={result['tasks']} counts={result['counts']}", flush=True)

@@ -34,6 +34,7 @@ Thumbs.db
 !/configs/field_to_llm_variable_shape_mixed.yaml
 !/configs/field_to_llm_point_readout.yaml
 !/configs/field_to_llm_block_readout.yaml
+!/configs/field_to_llm_ins_tracer.yaml
 !/configs/field_to_llm_benchmark.yaml
 !/configs/field_to_llm_stage1_adapter_ablation.yaml
 !/configs/field_to_llm_no_learned_stage1_ablation.yaml
@@ -55,6 +56,7 @@ Thumbs.db
 !/scripts/setup_field_qa_server.sh
 !/scripts/check_field_qa_environment.py
 !/scripts/download_pdebench_field.py
+!/scripts/download_ins_tracer.py
 !/scripts/mixed_shape_qa.py
 !/scripts/analyze_field_predictions.py
 !/scripts/evaluate_variable_shape_checkpoint.py
@@ -78,6 +80,7 @@ Thumbs.db
 !/tests/test_variable_shape_fields.py
 !/tests/test_point_readout.py
 !/tests/test_block_readout.py
+!/tests/test_ins_tracer_readout.py
 !/tests/test_chat_point_readout.py
 !/tests/test_mixed_shape_fields.py
 !/tests/test_tensor_qwen_inference_benchmark.py

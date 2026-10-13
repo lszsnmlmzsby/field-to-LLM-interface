@@ -24,7 +24,7 @@ from tensor_compression.downstream.point_readout import (
     FORMAT, PROMPT_VERSION, build_prompt, json_hash, score_answer, summarize_evaluation,
 )
 from tensor_compression.downstream.point_readout_data import (
-    PointReadoutDataset, load_config, resolve_path, write_json,
+    PointReadoutDataset, load_config, resolve_path, source_path, write_json,
 )
 
 CHECKPOINT_TYPE = "qwen_standardized_field_qa_v2"
@@ -339,6 +339,44 @@ def planned_updates(records, training, seed):
     return math.ceil(count * training["epochs"] / training["gradient_accumulation_steps"])
 
 
+def check_geometry(llm, sidecar, tokenizer, dataset, device, dtype, config):
+    """One real forward/backward per boundary shape, without optimizer updates."""
+    rows = dataset.records
+    criteria = [lambda r: math.prod(r["grid_shape"]),
+                lambda r: (-r["grid_shape"][0], r["grid_shape"][1]),
+                lambda r: (-r["grid_shape"][1], r["grid_shape"][0]),
+                lambda r: -math.prod(r["grid_shape"])]
+    indices = list(dict.fromkeys(max(range(len(rows)), key=lambda i: key(rows[i])) for key in criteria))
+    report = []
+    sidecar.train()
+    for index in indices:
+        row, field = dataset[index]
+        sidecar.zero_grad(set_to_none=True)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize(device)
+        started = time.perf_counter()
+        try:
+            loss, values = training_loss(llm, sidecar, tokenizer, [row], field[None], device, dtype,
+                                         config["training"])
+            loss.backward()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            entry = {"shape": row["grid_shape"], **values,
+                     "seconds": time.perf_counter() - started,
+                     "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30
+                     if device.type == "cuda" else None}
+            report.append(entry)
+            print("geometry_check=" + json.dumps(entry), flush=True)
+            del loss
+        finally:
+            sidecar.clear()
+            sidecar.zero_grad(set_to_none=True)
+    return {"status": "geometry_forward_backward_only", "optimizer_updates": 0, "checks": report,
+            "limitation": "Does not measure optimizer-state memory or full validation/generation cost"}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(ROOT / "configs/field_to_llm_point_readout.yaml"))
@@ -354,11 +392,15 @@ def main():
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument("--split", choices=("val", "test"), default="val")
     parser.add_argument("--audit-only", action="store_true", help="Replay data without loading Qwen")
+    parser.add_argument("--geometry-check-only", action="store_true",
+                        help="Load real Qwen and check boundary-shape forward/backward; no training updates")
     parser.add_argument("--stop-after-updates", type=int, help="Save and stop after N additional updates; preserves the full resume schedule")
     parser.add_argument("--verbose", action="store_true", help="Show detailed training, model-shard and evaluation progress")
     parser.add_argument("--console-every-updates", type=int, default=200,
                         help="Console cadence only; detailed train.jsonl stays unchanged (default: 200)")
     cli = parser.parse_args()
+    if cli.geometry_check_only and (cli.audit_only or cli.evaluate_only or cli.resume):
+        parser.error("--geometry-check-only requires a fresh run and cannot be combined with audit/evaluation/resume")
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("This workstation entry point is single-device; use python, not multi-rank torchrun")
     if cli.evaluate_only and not cli.resume:
@@ -374,7 +416,7 @@ def main():
         config["memory"]["block_shape"] = cli.block_shape
     validate_config(config)
     qa_dir = resolve_path(cli.qa_dir or config["data"]["qa_dir"])
-    hdf5_path = resolve_path(cli.hdf5_path or os.environ.get("PDEBENCH_HDF5") or config["data"]["hdf5_path"])
+    hdf5_path = source_path(config, cli.hdf5_path)
     output = resolve_path(cli.output_dir)
     if output.exists() and any(output.iterdir()) and not (cli.resume and not cli.evaluate_only):
         raise FileExistsError("Use a new empty output directory (except when resuming training)")
@@ -431,6 +473,10 @@ def main():
         write_json(output / "contract.json", identity)
         write_json(output / "resolved_config.json", config)
         write_json(output / "architecture.json", report)
+        if cli.geometry_check_only:
+            write_json(output / "geometry_check.json", check_geometry(
+                llm, sidecar, tokenizer, datasets["train"], device, dtype, config))
+            return
         if cli.evaluate_only:
             metrics = evaluate(llm, sidecar, tokenizer, datasets[cli.split], device, dtype, config,
                                output / f"{cli.split}_predictions.jsonl", verbose=cli.verbose)

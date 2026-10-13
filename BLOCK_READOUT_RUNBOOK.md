@@ -1,6 +1,137 @@
 # 多点一个 token：真实场可行性实验
 
-使用本手册的托管服务器流程、Qwen 及 PDEBench 数据。只新增局部块编码，
+## 当前实验：完整 INS-Tracer + 随机整数形状（2026-10-13）
+
+用户已选择完整 INS-Tracer，并授权扩大训练规模与随机形状范围。
+使用 `configs/field_to_llm_ins_tracer.yaml`，新建 QA 和训练输出目录。
+原 PDEBench 配置和下文历史流程仅用于复现原实验，不能混入当前 INS-Tracer 运行。
+
+### 完整源文件和下载
+
+作者发布文件是 `dedalus_v5.1_Baseline2D_INSTracer_icA_noP_db1_nu0.001D0.01_seed0.hdf5`，
+20,250,643,760 字节。`sol/u, sol/v, sol/b` 均为 float32 `[1000,101,128,128]`。
+它是本次选定的完整 INS-Tracer 发布文件，不是 PDEFoundry-2 的全部主题数据。
+来源见 [作者下载脚本](https://github.com/functoreality/pdefoundry-2/blob/main/download/adaptation_single_pde_data.sh)。
+没有已核实的作者公开 MD5/SHA256；不能沿用 PDEBench 的 MD5，也不能将 multipart ETag 当 MD5。
+
+同步本次代码之后，在服务器执行（可以使用不占 GPU 的在线终端）：
+
+```bash
+source /workspace/wyx/f2llm/enter_f2llm.sh
+python -u scripts/download_ins_tracer.py --output-dir "$FIELD_TO_LLM_ROOT/raw/ins_tracer"
+```
+
+中断后重复同一命令；保留 `.part`。不要同时启动多个进程写同一文件。
+脚本先续传完整文件，检查精确字节数、三个场的布局、坐标，以及每个场的全部数值是否有限，
+再计算整文件 SHA256；成功后才将 `.part` 改为正式文件，并写 `.verified.json`。
+全量有限值扫描不会裁剪、筛掉轨迹或改变数据；有异常会停止并报告。
+本地 SHA256 用于后续一致性检查，不等同于作者提供的真实性校验。
+构建 QA 前必须有验证记录，并重新检查整文件 SHA256。
+
+### 随机形状、任务与科学范围
+
+原生网格允许 H,W 各取 1..128 的正整数，无步长、奇偶或 17×90 的特殊限制。
+该上限来自原文件尺寸，配置支持改为其他源能够容纳的范围；不插值、拼接来制造更大流场。
+不能在无限正整数上定义均匀采样。本实验在有限整数形状域内实施可复现采样。
+
+轨迹按固定种子分成 800/100/100。形状域另固定预留约 20% 给未见形状评估；
+其余组合中均匀随机抽取训练形状，不根据场值挑选形状。
+每个字段额外覆盖 1×1、1×128、128×1、128×128 四个边界，属于明确声明的边界检查。
+验证和测试都包含边界、训练实际出现过的形状、以及预留的未见形状。
+各 split 的实际形状、场数、任务数、拒绝原因和不适用任务写入 metadata.json。
+
+1×1 经逐裁剪 z-score 后必为零，作为退化边界样本保留；它不能证明非平凡数值读取能力。
+多点和线段问题在 1×1 上不适用，会明确记录；其他尺寸只采样能够容纳的点数、线段与区域。
+区域支持正整数边长；1×1 区域仅在没有更大区域可用时使用。
+其它常量或非有限裁剪仍按原规则拒绝并计数；完整源文件不被删减。
+
+全量源和实验 QA 是不同层次：完整 HDF5 必须下载，训练仍从其中采样固定的 QA 清单。
+当前研究目标是标准化场数值读取，不是预测下一时刻或证明掌握不可压缩流体动力学。
+INS-Tracer 三个场来自同一类物理问题；多初值、轨迹隔离和形状隔离支持相应的泛化评估，
+不能宣称已验证跨物理主题泛化。当前先使用这份完整文件，没有自动追加或混合其他主题。
+后续若增加 INS-Pipe 等完整文件，应保留源身份，并另设跨主题评估，避免把来源混合误称泛化。
+
+### 训练预算与运行
+
+| profile | 训练裁剪数 | 验证/测试裁剪数（各） | 用途 |
+|---|---:|---:|---|
+| smoke | 12 | 24 | 覆盖所有字段和最大/细长/退化边界，20 次更新 |
+| pilot | 1,024 | 96 | 时间、显存、收敛趋势试跑，两轮 |
+| full | 16,384 | 512 | 正式实验，两轮，约 18 万条训练 QA |
+
+full 比旧 PDEBench full 的裁剪数增加四倍。每组 batch=1、累积=4，实际更新数
+为 ceil(实际训练 QA 数×2/4)，约 9 万次；不适用任务使精确数量略有减少。
+当前固定种子下的形状计划有 9,328 种训练形状、180,214 条训练 QA、90,107 次更新/组；
+这些是采样计划的本地核算，不代表真实源文件已构建成功或训练已执行。
+1×1 token 和 2×2 token 两组共用同一个不可变 QA 清单和相同训练预算，分别从头训练接口。
+预设量级不保证已充分收敛；要根据验证曲线判断是否继续，测试集不参与调参或选检查点。
+
+```bash
+export INS_CONFIG=configs/field_to_llm_ins_tracer.yaml
+export INS_TRACER_HDF5="$FIELD_TO_LLM_ROOT/raw/ins_tracer/dedalus_v5.1_Baseline2D_INSTracer_icA_noP_db1_nu0.001D0.01_seed0.hdf5"
+python scripts/check_field_qa_environment.py --require-cuda \
+  --model-dir "$FIELD_TO_LLM_MODEL_DIR" --hdf5-path "$INS_TRACER_HDF5" \
+  --fields sol/u sol/v sol/b \
+  --output "$F2LLM_HOME/tensor_llm_outputs/environment/ins_tracer_before_training.json"
+python scripts/build_point_readout_qa.py --config "$INS_CONFIG" --profile smoke
+
+# 先对真实 Qwen 14B 检查最大面积、两个细长方向和 1×1 的前向/反向。
+# 此项没有优化器更新，也不等于训练完成或完整生成显存检查。
+for block in 1 2; do
+  python -u scripts/train_point_readout.py --config "$INS_CONFIG" --profile smoke \
+    --block-shape "$block" "$block" --geometry-check-only \
+    --output-dir "$FIELD_TO_LLM_RUNS_DIR/ins_tracer_geometry_${block}x${block}" || break
+done
+```
+
+检查两组 geometry_check.json 均成功后，再单独执行 smoke 训练/生成闭环：
+
+```bash
+for block in 1 2; do
+  python -u scripts/train_point_readout.py --config "$INS_CONFIG" --profile smoke \
+    --block-shape "$block" "$block" \
+    --output-dir "$FIELD_TO_LLM_RUNS_DIR/ins_tracer_smoke_${block}x${block}" || break
+done
+```
+
+上述新目录必须为空。最大 128×128 场在 1×1 组有 16,384 个场 token，在 2×2 组有 4,096 个。
+真实 A800 80GB 能否容纳与需要多久必须由服务器实测，不能由本地 tiny-Qwen 测试推断。
+geometry 检查不包含优化器状态和完整生成过程的峰值，随后必须通过 smoke 闭环。
+发生 OOM 不会自动缩小源、尺寸、跳过大样本或削减训练预算。
+
+完整闭环通过后，构建一次 full QA，先运行 100 次更新测实际速度，再用同一目录续训：
+
+```bash
+python scripts/build_point_readout_qa.py --config "$INS_CONFIG" --profile full
+python -u scripts/train_point_readout.py --config "$INS_CONFIG" --profile full \
+  --block-shape 1 1 --stop-after-updates 100 \
+  --output-dir "$FIELD_TO_LLM_RUNS_DIR/ins_tracer_full_1x1"
+```
+
+查看 run_summary.json、train.jsonl 的实际耗时和计划更新数，再安排完整训练时长。
+续训及第二组命令如下；逐条执行，遇到失败应先处理，不继续下一阶段：
+
+```bash
+python -u scripts/train_point_readout.py --config "$INS_CONFIG" --profile full \
+  --block-shape 1 1 --resume "$FIELD_TO_LLM_RUNS_DIR/ins_tracer_full_1x1/last.pt" \
+  --output-dir "$FIELD_TO_LLM_RUNS_DIR/ins_tracer_full_1x1"
+python -u scripts/train_point_readout.py --config "$INS_CONFIG" --profile full \
+  --block-shape 2 2 --output-dir "$FIELD_TO_LLM_RUNS_DIR/ins_tracer_full_2x2"
+
+for block in 1 2; do
+  python -u scripts/train_point_readout.py --config "$INS_CONFIG" --profile full \
+    --block-shape "$block" "$block" --evaluate-only --split test \
+    --resume "$FIELD_TO_LLM_RUNS_DIR/ins_tracer_full_${block}x${block}/best.pt" \
+    --output-dir "$FIELD_TO_LLM_RUNS_DIR/ins_tracer_test_${block}x${block}" || break
+done
+```
+
+`--stop-after-updates` 保留完整训练计划、调度器及可续训状态，100 步不代表完成 full。
+新配置使用 INS_TRACER_HDF5，不会被登录脚本中遗留的 PDEBENCH_HDF5 覆盖。
+
+## 以下为历史 PDEBench 流程（用于复现旧实验）
+
+使用托管服务器流程、Qwen 及 PDEBench 数据。只新增局部块编码，
 冻结 Qwen，保留 11 类生成任务、单小数位训练答案和绝对误差 0.2 的评分规则。
 
 ## 结构与兼容性
@@ -94,11 +225,14 @@ python scripts/check_field_qa_environment.py --require-cuda \
 
 下载一份 2D CFD Rand 128 数据即可，不需要整个 PDEBench。源地址和 MD5 来自官方
 [下载清单](https://github.com/pdebench/PDEBench/blob/main/pdebench/data_download/pdebench_data_urls.csv)。
-下载可以在没有 GPU 的准备时段执行（若平台提供），tmux 只防 SSH 断开，不延长资源租期。
+本平台手册提供不占 GPU 的“在线终端”，下载、校验和文件整理优先在该终端完成，文件保存到同一项目的 `/workspace`。
+终端时限与依赖可用性仍需确认；tmux 不延长资源租期。
 
 本实验下载完整的官方 HDF5，通过官方整文件 MD5 校验后再构建 QA；局部缓存或未完成文件不能替代它。
+若曾按旧的局部缓存建议设置过 `PDEBENCH_HDF5`，需要恢复为下面的完整原文件路径；登录脚本会保留已有变量。
 
 ```bash
+export PDEBENCH_HDF5="$FIELD_TO_LLM_ROOT/raw/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5"
 python -u scripts/download_pdebench_field.py \
   --output-dir "$FIELD_TO_LLM_ROOT/raw"
 python scripts/check_field_qa_environment.py --require-cuda \
@@ -109,6 +243,7 @@ python -m pytest tests/test_block_readout.py tests/test_point_readout.py -q
 
 下载中断后重复同一命令，会保留并续传 `.part`，MD5 成功后才变成正式 HDF5。
 若之前已用 aria2 分块下载该 `.part`，应继续使用 aria2 及其 `.aria2` 控制文件，不能切回按文件长度续传的 curl。
+下载脚本发现对应 `.aria2` 控制文件时会主动拒绝 curl 续传；不要删除控制文件来绕过此检查。
 若校验失败，先检查部分文件，不绕过校验直接构建训练数据。
 训练用的 `data/` 是从 `raw/` 生成的 JSONL 清单，场数据仍从原始 HDF5 按需读取；训练时不能移动/删除原文件。
 

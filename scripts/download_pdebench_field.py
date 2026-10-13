@@ -28,6 +28,10 @@ def download_partial(partial, resume_retries=5):
     if resume_retries < 0:
         raise ValueError("resume_retries must be nonnegative")
     partial = Path(partial)
+    if partial.with_name(partial.name + ".aria2").exists():
+        raise ValueError("An aria2 control file exists for this partial download. "
+                         "Resume with the original aria2 command and keep its control file; "
+                         "curl cannot infer completed ranges from the file length.")
     for attempt in range(resume_retries + 1):
         try:
             subprocess.run(["curl", "--fail", "--location", "--retry", "5", "--connect-timeout", "30",

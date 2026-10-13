@@ -759,6 +759,22 @@ def test_local_model_preflight_rejects_truncated_safetensors(tmp_path):
         inspect_weight_files(tmp_path)
 
 
+def test_download_refuses_aria2_partial_without_starting_curl(tmp_path, monkeypatch):
+    from scripts import download_pdebench_field as downloader
+
+    partial = tmp_path / "source.hdf5.part"
+    partial.write_bytes(b"preserve downloaded ranges")
+    control = partial.with_name(partial.name + ".aria2")
+    control.write_bytes(b"preserve aria2 progress")
+    calls = []
+    monkeypatch.setattr(downloader.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    with pytest.raises(ValueError, match="aria2 control file"):
+        downloader.download_partial(partial)
+    assert not calls
+    assert partial.read_bytes() == b"preserve downloaded ranges"
+    assert control.read_bytes() == b"preserve aria2 progress"
+
+
 def test_download_restarts_partial_transfer_without_discarding_bytes(tmp_path, monkeypatch):
     import subprocess
     from scripts import download_pdebench_field as downloader

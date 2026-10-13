@@ -18,6 +18,9 @@ from tensor_compression.downstream.point_readout import (
 )
 from tensor_compression.downstream.variable_shape import experiment_config, parse_shapes
 from tensor_compression.utils.pipeline_config import load_yaml_mapping
+from tensor_compression.downstream.random_readout_shapes import (
+    shape_pools, training_plan, evaluation_plan, fitting_tasks,
+)
 
 
 def load_config(path, profile):
@@ -29,6 +32,12 @@ def resolve_path(value) -> Path:
     if not value or "${" in expanded:
         raise ValueError(f"Set the environment variable or pass an explicit path: {value}")
     return Path(expanded).expanduser().resolve()
+
+
+def source_path(config, explicit=None):
+    # New experiments opt out of the legacy PDEBENCH_HDF5 override explicitly.
+    variable = config["data"].get("hdf5_env", "PDEBENCH_HDF5")
+    return resolve_path(explicit or os.environ.get(variable) or config["data"]["hdf5_path"])
 
 
 def write_json(path, value):
@@ -55,8 +64,10 @@ def build_dataset(config, hdf5_path, output_dir):
     fields = list(data["fields"])
     if not fields or len(set(fields)) != len(fields):
         raise ValueError("Select at least one unique HDF5 field")
-    train_shapes = parse_shapes(data["train_shapes"], allow_odd=True)
-    heldout = parse_shapes(data.get("heldout_shapes", []), allow_odd=True) if data.get("heldout_shapes") else []
+    random_shapes = data.get("shape_sampling")
+    train_shapes = [] if random_shapes else parse_shapes(data["train_shapes"], allow_odd=True)
+    heldout = [] if random_shapes else (parse_shapes(data["heldout_shapes"], allow_odd=True)
+                                       if data.get("heldout_shapes") else [])
     if set(train_shapes) & set(heldout):
         raise ValueError("Held-out shapes must be disjoint from training shapes")
     multi_counts = list(generation.get("multi_counts", [2, 3, 4]))
@@ -66,12 +77,13 @@ def build_dataset(config, hdf5_path, output_dir):
     for name, counts in (("multi_counts", multi_counts), ("line_counts", line_counts)):
         if not counts or any(type(n) is not int or n < 2 for n in counts):
             raise ValueError(f"{name} must contain integers >= 2")
-    if not region_shapes or any(len(size) != 2 or any(type(n) is not int or n < 2 for n in size)
+    min_region = 1 if random_shapes else 2
+    if not region_shapes or any(len(size) != 2 or any(type(n) is not int or n < min_region for n in size)
                                for size in region_shapes):
-        raise ValueError("region_shapes must contain integer dimensions >= 2")
-    if not statistic_shapes or any(len(size) != 2 or any(type(n) is not int or n < 2 for n in size)
+        raise ValueError(f"region_shapes must contain integer dimensions >= {min_region}")
+    if not statistic_shapes or any(len(size) != 2 or any(type(n) is not int or n < min_region for n in size)
                                   for size in statistic_shapes):
-        raise ValueError("statistic_region_shapes must contain integer dimensions >= 2")
+        raise ValueError(f"statistic_region_shapes must contain integer dimensions >= {min_region}")
     for h, w in train_shapes + heldout:
         if "multi_point" in tasks and max(multi_counts) > h * w:
             raise ValueError("A multi-point query exceeds the number of grid cells")
@@ -82,7 +94,7 @@ def build_dataset(config, hdf5_path, output_dir):
         if set(tasks) & set(STAT_TASKS + LOCATION_TASKS) and any(rh > h or rw > w for rh, rw in statistic_shapes):
             raise ValueError("Every statistic/search region must fit every shape")
     train_count = int(generation["train_states"])
-    eval_count = int(generation["eval_states_per_shape"])
+    eval_count = int(generation["eval_states"] if random_shapes else generation["eval_states_per_shape"])
     if train_count < len(train_shapes) * len(fields) or eval_count < len(fields):
         raise ValueError("State counts must cover every shape and field")
     variants = list(generation.get("template_variants", [0, 1]))
@@ -97,12 +109,18 @@ def build_dataset(config, hdf5_path, output_dir):
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"Use a new empty dataset directory: {output_dir}")
     rng = random.Random(int(generation["seed"]))
-    rejected = Counter()
+    rejected, inapplicable = Counter(), Counter()
+    source_verification = None
+    if data.get("require_complete_ins_tracer"):
+        from tensor_compression.downstream.ins_tracer_source import verify_receipt
+        source_verification = verify_receipt(hdf5_path)
     with h5py.File(hdf5_path, "r") as handle:
         layouts = {field: list(handle[field].shape) for field in fields}
         if any(len(shape) != 4 for shape in layouts.values()) or len({tuple(s) for s in layouts.values()}) != 1:
             raise ValueError("Fields must share [trajectory,time,height,width] axes in this HDF5 file")
         n, times, source_h, source_w = layouts[fields[0]]
+        if random_shapes:
+            pool, heldout, anchors = shape_pools(random_shapes, (source_h, source_w))
         if min(times, source_h, source_w) < 1:
             raise ValueError("Source HDF5 contains an empty axis")
         if any(h > source_h or w > source_w for h, w in train_shapes + heldout):
@@ -120,11 +138,18 @@ def build_dataset(config, hdf5_path, output_dir):
         seen_sources = set()
         for split, ids in partitions.items():
             if split == "train":
-                pairs = [(shape, field) for shape in train_shapes for field in fields]
-                plan = [pairs[i % len(pairs)] for i in range(train_count)]
+                if random_shapes:
+                    plan = training_plan(pool, anchors, fields, train_count, rng)
+                    train_shapes = sorted({shape for shape, _ in plan})
+                else:
+                    pairs = [(shape, field) for shape in train_shapes for field in fields]
+                    plan = [pairs[i % len(pairs)] for i in range(train_count)]
             else:
-                plan = [(shape, fields[i % len(fields)]) for shape in train_shapes + heldout
-                        for i in range(eval_count)]
+                if random_shapes:
+                    plan = evaluation_plan(train_shapes, heldout, anchors, fields, eval_count, rng)
+                else:
+                    plan = [(shape, fields[i % len(fields)]) for shape in train_shapes + heldout
+                            for i in range(eval_count)]
             rows = []
             for shape, field in plan:
                 h, w = shape
@@ -141,7 +166,7 @@ def build_dataset(config, hdf5_path, output_dir):
                     raw = torch.from_numpy(handle[field][source["sample_index"], source["time_index"],
                                                          r:r + h, c:c + w].copy())
                     try:
-                        z, audit = normalize_field(raw)
+                        z, audit = normalize_field(raw, allow_singleton=bool(random_shapes))
                     except ValueError as exc:
                         rejected[str(exc)] += 1
                         continue
@@ -152,10 +177,15 @@ def build_dataset(config, hdf5_path, output_dir):
                 seen_sources.add(key)
                 state = {"state_ref": key, "split": split, **source, "normalization": audit}
                 states.append(state)
-                for task in tasks:
-                    spec = sample_spec(task, shape, rng, multi_counts=multi_counts,
-                                       line_counts=line_counts, region_shapes=region_shapes,
-                                       statistic_region_shapes=statistic_shapes, z=z)
+                active, multi, lines, regions, stats = (fitting_tasks(
+                    tasks, shape, multi_counts, line_counts, region_shapes, statistic_shapes)
+                    if random_shapes else (tasks, multi_counts, line_counts, region_shapes, statistic_shapes))
+                for task in set(tasks) - set(active):
+                    inapplicable[f"{split}/{h}x{w}/{task}"] += 1
+                for task in active:
+                    spec = sample_spec(task, shape, rng, multi_counts=multi,
+                                       line_counts=lines, region_shapes=regions,
+                                       statistic_region_shapes=stats, z=z)
                     record = make_record(key, z, task, spec, variant=rng.choice(variants),
                                          decimals=decimals, tolerance=tolerance)
                     validate_record(record, z)
@@ -177,6 +207,15 @@ def build_dataset(config, hdf5_path, output_dir):
                 "counts": {split: len(rows) for split, rows in records.items()},
                 "task_counts": {split: dict(Counter(r["task_type"] for r in rows)) for split, rows in records.items()},
                 "files": {name: sha256_file(output_dir / name) for name in files}}
+    if random_shapes:
+        metadata.update(shape_sampling=random_shapes, allow_singleton=True,
+                        shape_boundary_anchors=anchors, inapplicable_tasks=dict(inapplicable),
+                        state_counts=dict(Counter(s["split"] for s in states)),
+                        shape_counts={split: dict(Counter("x".join(map(str, s["grid_shape"]))
+                                                       for s in states if s["split"] == split))
+                                      for split in partitions})
+    if source_verification:
+        metadata["source"]["complete_file_verification"] = source_verification
     write_json(output_dir / "metadata.json", metadata)
     marker.unlink()
     return metadata
@@ -250,7 +289,8 @@ class PointReadoutDataset:
         if not (0 <= sample < dataset.shape[0] and 0 <= time < dataset.shape[1]
                 and 0 <= r <= dataset.shape[2] - h and 0 <= c <= dataset.shape[3] - w):
             raise ValueError("Source crop is outside HDF5 bounds")
-        z, audit = normalize_field(torch.from_numpy(dataset[sample, time, r:r+h, c:c+w].copy()))
+        z, audit = normalize_field(torch.from_numpy(dataset[sample, time, r:r+h, c:c+w].copy()),
+                                   allow_singleton=self.metadata.get("allow_singleton", False))
         if audit != state["normalization"]:
             raise ValueError(f"Source crop changed: {state_ref}")
         if self.cache_size:

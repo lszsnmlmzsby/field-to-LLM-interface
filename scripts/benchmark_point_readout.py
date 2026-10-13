@@ -17,7 +17,7 @@ for path in (ROOT, ROOT / "src"):
 from scripts import train_point_readout as trainer
 from tensor_compression.downstream.point_readout import build_prompt, score_answer, summarize_evaluation
 from tensor_compression.downstream.point_readout_data import (
-    PointReadoutDataset, load_config, read_jsonl, resolve_path, write_json,
+    PointReadoutDataset, load_config, read_jsonl, resolve_path, source_path, write_json,
 )
 
 BASELINE = "frozen_qwen_full_serialized_field_v1"
@@ -118,7 +118,7 @@ def main():
         config["memory"]["block_shape"] = cli.block_shape
     trainer.validate_config(config)
     qa_dir = resolve_path(cli.qa_dir or config["data"]["qa_dir"])
-    hdf5_path = resolve_path(cli.hdf5_path or os.environ.get("PDEBENCH_HDF5") or config["data"]["hdf5_path"])
+    hdf5_path = source_path(config, cli.hdf5_path)
     output = resolve_path(cli.output_dir)
     if output.exists() and any(output.iterdir()):
         raise FileExistsError("Use a new empty benchmark output directory")

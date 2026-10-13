@@ -15,7 +15,7 @@ for path in (ROOT, ROOT / "src"):
 
 from scripts import train_point_readout as trainer
 from scripts.benchmark_point_readout import serialized_messages
-from tensor_compression.downstream.point_readout_data import PointReadoutDataset, load_config, resolve_path
+from tensor_compression.downstream.point_readout_data import PointReadoutDataset, load_config, resolve_path, source_path
 
 FREE_SYSTEM = ("You answer questions about a supplied numerical field. Answer naturally in the user's "
                "language. Values are standardized, not in original physical units. "
@@ -98,7 +98,7 @@ def main():
         config["memory"]["block_shape"] = cli.block_shape
     trainer.validate_config(config)
     dataset = PointReadoutDataset(resolve_path(cli.qa_dir or config["data"]["qa_dir"]),
-        resolve_path(cli.hdf5_path or os.environ.get("PDEBENCH_HDF5") or config["data"]["hdf5_path"]), cli.split)
+        source_path(config, cli.hdf5_path), cli.split)
     transcript = None
     try:
         refs = list(dict.fromkeys(row["state_ref"] for row in dataset.records))
