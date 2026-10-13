@@ -24,7 +24,15 @@ from tensor_compression.downstream.random_readout_shapes import (
 
 
 def load_config(path, profile):
-    return experiment_config(load_yaml_mapping(path), profile)
+    # Use the JSON parser for saved recipes: YAML 1.1 may treat JSON's 5e-05 as text.
+    config = (json.loads(Path(path).read_text(encoding="utf-8"))
+              if Path(path).suffix.lower() == ".json" else load_yaml_mapping(path))
+    if not isinstance(config, dict):
+        raise ValueError("Configuration must be a mapping")
+    # Reuse exactly the CLI-resolved recipe for resume, evaluation, baseline and chat.
+    if "profiles" not in config and config.get("experiment_profile") == profile:
+        return config
+    return experiment_config(config, profile)
 
 
 def resolve_path(value) -> Path:

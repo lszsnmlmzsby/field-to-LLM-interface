@@ -136,6 +136,7 @@ def test_geometry_check_is_not_training_and_covers_extremes():
     config = load_config(ROOT / "configs/field_to_llm_ins_tracer.yaml", "smoke")
     config["field_encoder"]["model"]["norm"] = "identity"
     trainer, llm, sidecar, tokenizer, config = tiny_components(config)
+    config["training"]["batch_size"] = 3
     class Data:
         def __init__(self):
             self.fields = [normalize_field(torch.arange(h*w).reshape(h, w).float(), allow_singleton=True)[0]
@@ -147,6 +148,7 @@ def test_geometry_check_is_not_training_and_covers_extremes():
     before = {k: v.clone() for k, v in sidecar.state_dict().items()}
     report = trainer.check_geometry(llm, sidecar, tokenizer, Data(), torch.device("cpu"), torch.float32, config)
     assert report["optimizer_updates"] == 0
+    assert all(row["batch_size"] == 3 for row in report["checks"])
     assert {tuple(row["shape"]) for row in report["checks"]} == {(1, 1), (1, 13), (9, 1), (9, 13)}
     assert all(torch.equal(v, sidecar.state_dict()[k]) for k, v in before.items())
     assert all(p.grad is None for p in sidecar.parameters())

@@ -59,12 +59,67 @@ INS-Tracer 三个场来自同一类物理问题；多初值、轨迹隔离和形
 | pilot | 1,024 | 96 | 时间、显存、收敛趋势试跑，两轮 |
 | full | 16,384 | 512 | 正式实验，两轮，约 18 万条训练 QA |
 
-full 比旧 PDEBench full 的裁剪数增加四倍。每组 batch=1、累积=4，实际更新数
+full 比旧 PDEBench full 的裁剪数增加四倍。配置保留旧运行的默认 batch=1、累积=4，实际更新数
 为 ceil(实际训练 QA 数×2/4)，约 9 万次；不适用任务使精确数量略有减少。
 当前固定种子下的形状计划有 9,328 种训练形状、180,214 条训练 QA、90,107 次更新/组；
 这些是采样计划的本地核算，不代表真实源文件已构建成功或训练已执行。
 1×1 token 和 2×2 token 两组共用同一个不可变 QA 清单和相同训练预算，分别从头训练接口。
 预设量级不保证已充分收敛；要根据验证曲线判断是否继续，测试集不参与调参或选检查点。
+
+### A800 80GB：真实 batch=32 的新运行
+
+训练入口支持 `--batch-size`、`--gradient-accumulation-steps`、`--epochs`、
+`--save-every-updates`、`--eval-every-updates`，覆盖选定 profile 的相应值。
+指定 `--batch-size 32 --gradient-accumulation-steps 1` 会把多条 QA 放入同一次前向和反向，
+不是串行累计 32 次 batch=1。两个参数互相独立，只改 batch 不会自动取消原来的梯度累积。
+`--epochs` 只适用于 max_updates=null 的 profile，避免被 smoke 的固定步数静默覆盖。
+
+当前保留同形状组批规则，不裁剪、插值、丢弃或重复补齐尾批。
+因此 batch=32 是每次前向的上限，不保证所有批次都有 32 条。
+按固定 INS 采样计划核算：180,214 条 QA、每轮 11,114 个 batch，平均 16.215 条，
+其中 1,786 个 batch 满 32 条；累积=1、两轮共 22,228 次更新。
+精确数量以服务器启动输出 `batch_statistics` 和 `training_plan.json` 为准。
+不能用 ceil(QA总数/32) 代替按形状分桶后的 batch 数。
+
+同步代码并停止旧训练进程后，使用已经构建的 full QA：
+
+```bash
+source /workspace/wyx/f2llm/enter_f2llm.sh
+(
+  set -e
+  for block in 1 2; do
+    python -u scripts/train_point_readout.py \
+      --config configs/field_to_llm_ins_tracer.yaml --profile full \
+      --block-shape "$block" "$block" \
+      --batch-size 32 --gradient-accumulation-steps 1 --epochs 2 \
+      --save-every-updates 512 --eval-every-updates 2048 \
+      --console-every-updates 20 \
+      --output-dir "$FIELD_TO_LLM_RUNS_DIR/ins_tracer_full_${block}x${block}" \
+      --overwrite-output-dir
+  done
+)
+```
+
+`--overwrite-output-dir` 将已有训练目录改名为同级 `.backup-时间-随机后缀` 目录，
+保留旧检查点和日志，再创建空目录从头训练。只允许备份带 contract.json 和 resolved_config.json
+的训练目录，不能与 resume、evaluate-only、audit-only 或 geometry-check-only 同用。
+它不会停止旧进程，执行前必须停止旧训练。中断训练会先保存检查点，再返回退出码 130，
+让 set -e 循环停止，不会误启动下一组。
+
+日志记录每次已记录更新的 questions_in_update、micro_batch_sizes，以及本次运行的 CUDA
+peak_allocated_gib / peak_reserved_gib。两轮结束的最后一次累积不足时不会读入第三轮补齐。
+保存/验证间隔按约四分之一更新数设置，以接近旧运行按样本数计的间隔；学习率不自动缩放。
+
+几何检查现在也使用配置/CLI 的真实 batch 大小，通过重复边界样本测量该 batch 的前向和反向，
+这些重复仅用于检查，不写入训练 QA。可在正式运行前使用 `--geometry-check-only --batch-size 32`
+并指定独立空输出目录。它不涵盖优化器状态及完整验证生成的峰值。
+80GB 上 batch=32 的显存和速度尚需实测；OOM 会直接报错，不自动降低 batch 或跳过大场。
+
+命令行覆盖后的完整配置写入每组输出目录的 `resolved_config.json`。
+后续 resume、test、baseline 和 chat 可直接将该文件传给 `--config`，使用相同 `--profile full`，
+不必重新手填所有覆盖参数；不同 batch 的旧检查点仍拒绝续训。
+
+### 默认配置的检查与复现流程
 
 ```bash
 export INS_CONFIG=configs/field_to_llm_ins_tracer.yaml

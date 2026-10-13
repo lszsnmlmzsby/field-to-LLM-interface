@@ -11,7 +11,9 @@ import signal
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import torch
 
@@ -206,6 +208,43 @@ def shape_batches(records, batch_size, seed, epoch):
     return batches
 
 
+def batch_statistics(batches, batch_size):
+    sizes = [len(batch) for batch in batches]
+    return {"micro_batches_per_epoch": len(sizes), "questions_per_epoch": sum(sizes),
+            "micro_batch_min": min(sizes), "micro_batch_max": max(sizes),
+            "micro_batch_mean": sum(sizes) / len(sizes),
+            "partial_micro_batches_per_epoch": sum(n < batch_size for n in sizes)}
+
+
+def prepare_output_directory(path, *, resume=False, overwrite=False):
+    """Reuse a run name only by preserving its previous contents in a sibling backup."""
+    if not path or "${" in str(path):
+        raise ValueError("Set output path environment variables or pass an explicit path")
+    path = Path(path).expanduser()
+    if path.is_symlink():
+        raise ValueError("Output directory must not be a symlink")
+    path = path.resolve()
+    if overwrite and resume:
+        raise ValueError("Overwrite cannot be combined with resume")
+    if path.exists() and not path.is_dir():
+        raise ValueError("Output path must be a directory")
+    if path.exists() and any(path.iterdir()):
+        if overwrite:
+            if (path == ROOT or path in ROOT.parents or path == Path.cwd()
+                    or path in Path.cwd().parents):
+                raise ValueError("Cannot overwrite the project or a working-directory ancestor")
+            if not all((path / name).is_file() for name in ("contract.json", "resolved_config.json")):
+                raise ValueError("Overwrite requires a recognized training output directory")
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = path.with_name(f"{path.name}.backup-{stamp}-{uuid4().hex[:8]}")
+            path.rename(backup)
+            print(f"previous_output_backup={backup}", flush=True)
+        elif not resume:
+            raise FileExistsError("Use a new empty output directory, --resume, or --overwrite-output-dir")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_path, *, verbose=False):
     core.set_frozen_llm_execution_mode(llm, checkpoint_training=False)
     sidecar.eval()
@@ -275,7 +314,7 @@ def validate_config(config):
     if bridge["heads"] <= 0 or bridge["bridge_dim"] % bridge["heads"]:
         raise ValueError("Bridge dimension must be divisible by positive head count")
     if config["model"]["torch_dtype"] not in ("bfloat16", "float32"):
-        raise ValueError("Use bfloat16 on A6000 or float32 for CPU tests; FP16 needs a separate scaler")
+        raise ValueError("Use bfloat16 on a supported GPU or float32 for CPU tests; FP16 needs a separate scaler")
 
 
 def run_identity(config, dataset, llm, tokenizer):
@@ -340,7 +379,7 @@ def planned_updates(records, training, seed):
 
 
 def check_geometry(llm, sidecar, tokenizer, dataset, device, dtype, config):
-    """One real forward/backward per boundary shape, without optimizer updates."""
+    """Stress each boundary at the requested batch size, without optimizer updates."""
     rows = dataset.records
     criteria = [lambda r: math.prod(r["grid_shape"]),
                 lambda r: (-r["grid_shape"][0], r["grid_shape"][1]),
@@ -348,6 +387,7 @@ def check_geometry(llm, sidecar, tokenizer, dataset, device, dtype, config):
                 lambda r: -math.prod(r["grid_shape"])]
     indices = list(dict.fromkeys(max(range(len(rows)), key=lambda i: key(rows[i])) for key in criteria))
     report = []
+    batch_size = config["training"]["batch_size"]
     sidecar.train()
     for index in indices:
         row, field = dataset[index]
@@ -358,12 +398,14 @@ def check_geometry(llm, sidecar, tokenizer, dataset, device, dtype, config):
             torch.cuda.synchronize(device)
         started = time.perf_counter()
         try:
-            loss, values = training_loss(llm, sidecar, tokenizer, [row], field[None], device, dtype,
+            loss, values = training_loss(llm, sidecar, tokenizer, [row] * batch_size,
+                                         field[None].repeat(batch_size, 1, 1, 1), device, dtype,
                                          config["training"])
             loss.backward()
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
-            entry = {"shape": row["grid_shape"], **values,
+            entry = {"shape": row["grid_shape"], "batch_size": batch_size,
+                     "repeated_example_for_memory_check": True, **values,
                      "seconds": time.perf_counter() - started,
                      "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30
                      if device.type == "cuda" else None}
@@ -387,6 +429,16 @@ def main():
     parser.add_argument("--block-shape", type=int, nargs=2, metavar=("H", "W"),
                         help="Cells per field token; e.g. 1 1 or 2 2. Requires a matching checkpoint when resuming.")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--overwrite-output-dir", action="store_true",
+                        help="Archive an existing training output to a sibling backup, then start fresh; stop its process first")
+    for option, help_text in (
+        ("batch-size", "Maximum questions per real forward/backward batch; batches contain equal grid shapes"),
+        ("gradient-accumulation-steps", "Forward/backward batches accumulated per optimizer update"),
+        ("epochs", "Training epochs when config max_updates is null"),
+        ("save-every-updates", "Checkpoint cadence in optimizer updates"),
+        ("eval-every-updates", "Validation cadence in optimizer updates"),
+    ):
+        parser.add_argument("--" + option, type=int, help=help_text + "; overrides the selected profile")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--resume", help="Strict resume from this numerical-generation experiment")
     parser.add_argument("--evaluate-only", action="store_true")
@@ -399,6 +451,8 @@ def main():
     parser.add_argument("--console-every-updates", type=int, default=200,
                         help="Console cadence only; detailed train.jsonl stays unchanged (default: 200)")
     cli = parser.parse_args()
+    if cli.overwrite_output_dir and (cli.resume or cli.evaluate_only or cli.audit_only or cli.geometry_check_only):
+        parser.error("--overwrite-output-dir is only for fresh training")
     if cli.geometry_check_only and (cli.audit_only or cli.evaluate_only or cli.resume):
         parser.error("--geometry-check-only requires a fresh run and cannot be combined with audit/evaluation/resume")
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
@@ -412,15 +466,22 @@ def main():
     if cli.split == "test" and not (cli.evaluate_only or cli.audit_only):
         parser.error("The test split is accessible only through explicit evaluation/audit")
     config = load_config(cli.config, cli.profile)
+    for key in ("batch_size", "gradient_accumulation_steps", "epochs", "save_every_updates", "eval_every_updates"):
+        value = getattr(cli, key)
+        if value is not None:
+            if value <= 0:
+                parser.error(f"--{key.replace('_', '-')} must be positive")
+            config["training"][key] = value
+    if cli.epochs is not None and config["training"].get("max_updates") is not None:
+        parser.error("--epochs requires a profile with max_updates: null")
     if cli.block_shape is not None:
         config["memory"]["block_shape"] = cli.block_shape
     validate_config(config)
     qa_dir = resolve_path(cli.qa_dir or config["data"]["qa_dir"])
     hdf5_path = source_path(config, cli.hdf5_path)
-    output = resolve_path(cli.output_dir)
-    if output.exists() and any(output.iterdir()) and not (cli.resume and not cli.evaluate_only):
-        raise FileExistsError("Use a new empty output directory (except when resuming training)")
-    output.mkdir(parents=True, exist_ok=True)
+    output = prepare_output_directory(os.path.expandvars(cli.output_dir),
+                                      resume=bool(cli.resume and not cli.evaluate_only),
+                                      overwrite=cli.overwrite_output_dir)
     datasets = {}
     stop_requested = False
     def request_stop(signum, frame):
@@ -504,6 +565,7 @@ def main():
             raise ValueError("Checkpoint step exceeds configured training budget")
         train_data = datasets["train"]
         batches = shape_batches(train_data.records, training["batch_size"], args.seed, epoch)
+        batch_stats = batch_statistics(batches, training["batch_size"])
         invocation_start_step = step
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.signal(signum, request_stop)
@@ -540,9 +602,14 @@ def main():
               f"batch={training['batch_size']} accumulation={training['gradient_accumulation_steps']} "
               f"text_encoding={TEXT_ENCODING_VERSION} stop_token_ids={generation_stop_ids(llm, tokenizer)}", flush=True)
         start = time.perf_counter()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        print("batch_statistics=" + json.dumps(batch_stats), flush=True)
         write_json(output / "training_plan.json", {"planned_updates": maximum, "train_questions": len(train_data),
             "tasks": dataset.metadata["tasks"], "batch_size": training["batch_size"],
             "gradient_accumulation_steps": training["gradient_accumulation_steps"],
+            "effective_batch_upper_bound": training["batch_size"] * training["gradient_accumulation_steps"],
+            **batch_stats,
             "selection_metric": "seen_shapes.macro_task_answer_accuracy"})
         # A stop or decoder failure immediately before validation must not skip it,
         # including a checkpoint already at the final optimizer update.
@@ -552,6 +619,8 @@ def main():
             micro_batches = []
             for _ in range(training["gradient_accumulation_steps"]):
                 if cursor >= len(batches):
+                    if training.get("max_updates") is None and epoch + 1 >= training["epochs"]:
+                        break  # A final partial update must not consume another epoch.
                     epoch += 1
                     cursor = 0
                     batches = shape_batches(train_data.records, training["batch_size"], args.seed, epoch)
@@ -581,6 +650,12 @@ def main():
             log_to_console = log_to_file if cli.verbose else step == 1 or step % cli.console_every_updates == 0 or step == maximum
             if log_to_file or log_to_console:
                 entry = {"step": step, "loss": loss_value, "grad_norm": float(grad_norm),
+                         "questions_in_update": total_records,
+                         "micro_batch_sizes": [len(indices) for indices in micro_batches],
+                         "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30
+                         if device.type == "cuda" else None,
+                         "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30
+                         if device.type == "cuda" else None,
                          "elapsed_seconds": time.perf_counter() - start}
                 if log_to_file:
                     core.append_jsonl(output / "train.jsonl", entry)
@@ -603,6 +678,8 @@ def main():
         write_json(output / "run_summary.json", {"status": "completed" if step == maximum else "stopped",
             "step": step, "planned_updates": maximum, "best_score": best if best >= 0 else None,
             "elapsed_this_invocation_seconds": time.perf_counter() - start, "last_checkpoint": str(output / "last.pt")})
+        if stop_requested:
+            raise SystemExit(130)  # Let a shell loop using set -e stop after Ctrl+C.
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)

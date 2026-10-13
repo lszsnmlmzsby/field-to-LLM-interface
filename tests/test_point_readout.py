@@ -498,6 +498,81 @@ def test_batching_has_no_duplication_and_is_deterministic(data_fixture):
         dataset.close()
 
 
+def test_batch32_preserves_tail_samples_and_reports_actual_size():
+    from scripts.train_point_readout import shape_batches, batch_statistics, planned_updates
+    rows = [{"grid_shape": [2, 3]} for _ in range(35)] + [{"grid_shape": [3, 2]} for _ in range(11)]
+    batches = shape_batches(rows, 32, 42, 0)
+    assert sorted(map(len, batches)) == [3, 11, 32]
+    assert sorted(i for batch in batches for i in batch) == list(range(46))
+    stats = batch_statistics(batches, 32)
+    assert stats["questions_per_epoch"] == 46
+    assert stats["micro_batch_mean"] == pytest.approx(46 / 3)
+    assert stats["partial_micro_batches_per_epoch"] == 2
+    assert planned_updates(rows, {"batch_size": 32, "epochs": 2, "gradient_accumulation_steps": 1}, 42) == 6
+
+
+def test_overwrite_preserves_old_run_and_rejects_unrecognized_directory(tmp_path):
+    from scripts.train_point_readout import prepare_output_directory
+    output = tmp_path / "run"
+    output.mkdir()
+    (output / "last.pt").write_bytes(b"original checkpoint")
+    with pytest.raises(FileExistsError):
+        prepare_output_directory(output)
+    with pytest.raises(ValueError, match="recognized"):
+        prepare_output_directory(output, overwrite=True)
+    for name in ("contract.json", "resolved_config.json"):
+        (output / name).write_text("{}")
+    with pytest.raises(ValueError, match="resume"):
+        prepare_output_directory(output, overwrite=True, resume=True)
+    prepare_output_directory(output, overwrite=True)
+    assert not list(output.iterdir())
+    backups = list(tmp_path.glob("run.backup-*"))
+    assert len(backups) == 1
+    assert (backups[0] / "last.pt").read_bytes() == b"original checkpoint"
+
+
+@pytest.mark.parametrize("flag,value", [("--batch-size", "0"), ("--gradient-accumulation-steps", "-1"),
+                                      ("--save-every-updates", "0"), ("--eval-every-updates", "-2")])
+def test_invalid_training_override_fails_before_output_creation(tmp_path, monkeypatch, flag, value):
+    from scripts import train_point_readout as trainer
+    output = tmp_path / "unused"
+    monkeypatch.setattr(sys, "argv", ["train_point_readout.py", "--profile", "full",
+                                     "--output-dir", str(output), flag, value])
+    with pytest.raises(SystemExit) as error:
+        trainer.main()
+    assert error.value.code == 2
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("block", [1, 2])
+def test_true_batch32_matches_question_weighted_single_sample_gradients(block):
+    trainer, llm, sidecar, tokenizer, config = tiny_components()
+    config["memory"]["block_shape"] = [block, block]
+    trainer, llm, sidecar, tokenizer, config = tiny_components(config)
+    sidecar.eval()
+    llm.eval()
+    fields = torch.randn(32, 1, 3, 5)
+    rows = [make_record(str(i), fields[i, 0], "single_point", {"points": [[1, 1]]}) for i in range(32)]
+    loss, _ = trainer.training_loss(llm, sidecar, tokenizer, rows, fields,
+                                    torch.device("cpu"), torch.float32, config["training"])
+    loss.backward()
+    expected_loss = loss.detach()
+    expected_gradients = {name: p.grad.clone() for name, p in sidecar.named_parameters() if p.grad is not None}
+    sidecar.clear()
+    sidecar.zero_grad(set_to_none=True)
+    actual_loss = 0.
+    for i in range(32):
+        loss, _ = trainer.training_loss(llm, sidecar, tokenizer, rows[i:i+1], fields[i:i+1],
+                                        torch.device("cpu"), torch.float32, config["training"])
+        (loss / 32).backward()
+        actual_loss += loss.detach() / 32
+        sidecar.clear()
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=1e-5, atol=1e-6)
+    for name, p in sidecar.named_parameters():
+        if name in expected_gradients:
+            torch.testing.assert_close(p.grad, expected_gradients[name], rtol=2e-4, atol=2e-6)
+
+
 def test_automatic_training_budget_respects_selected_tasks(data_fixture):
     from scripts.train_point_readout import planned_updates
     source, qa, config, _ = data_fixture
@@ -582,7 +657,9 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
     monkeypatch.setattr(trainer.core, "load_tokenizer", lambda args: tokenizer)
     monkeypatch.setattr(trainer.core, "load_llm_with_bounded_host_memory", load_model)
     base = ["train_point_readout.py", "--config", str(config_path), "--profile", "smoke",
-            "--qa-dir", str(qa), "--hdf5-path", str(source), "--device", "cpu"]
+            "--qa-dir", str(qa), "--hdf5-path", str(source), "--device", "cpu",
+            "--batch-size", "3", "--gradient-accumulation-steps", "2",
+            "--save-every-updates", "1", "--eval-every-updates", "1"]
     if block:
         base += ["--block-shape", str(block), str(block)]
 
@@ -595,6 +672,11 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
     assert (uninterrupted / "best.pt").exists()
     assert not list(uninterrupted.glob("test*"))
     expected = torch.load(uninterrupted / "last.pt", weights_only=True)
+    resolved = json.loads((uninterrupted / "resolved_config.json").read_text())
+    assert resolved["training"]["batch_size"] == 3
+    entries = [json.loads(line) for line in (uninterrupted / "train.jsonl").read_text().splitlines()]
+    assert all(entry["questions_in_update"] == sum(entry["micro_batch_sizes"]) for entry in entries)
+    assert any(3 in entry["micro_batch_sizes"] for entry in entries)
     interrupted = tmp_path / "interrupted"
     run(interrupted, "--stop-after-updates", "1")
     summary = json.loads((interrupted / "run_summary.json").read_text(encoding="utf-8"))
@@ -602,6 +684,8 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
     assert torch.load(interrupted / "last.pt", weights_only=True)["validation_pending"]
     run(interrupted, "--resume", str(interrupted / "last.pt"), "--console-every-updates", "1", "--verbose")
     resumed = torch.load(interrupted / "last.pt", weights_only=True)
+    with pytest.raises(ValueError, match="another experiment|differs"):
+        run(interrupted, "--resume", str(interrupted / "last.pt"), "--batch-size", "2")
     assert json.loads((interrupted / "run_summary.json").read_text(encoding="utf-8"))["status"] == "completed"
     assert resumed["step"] == expected["step"] == 2
     assert not resumed["validation_pending"]
@@ -640,7 +724,7 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
         raise AssertionError("Baseline must not construct a field sidecar")
     monkeypatch.setattr(trainer.core, "build_sidecar", forbidden_sidecar)
     baseline_output = tmp_path / "baseline"
-    baseline_args = ["benchmark_point_readout.py", "--config", str(config_path), "--profile", "smoke",
+    baseline_args = ["benchmark_point_readout.py", "--config", str(evaluation / "resolved_config.json"), "--profile", "smoke",
                      "--qa-dir", str(qa), "--hdf5-path", str(source), "--split", "test", "--device", "cpu",
                      "--compare-predictions", str(evaluation / "test_predictions.jsonl")]
     if block:
@@ -671,6 +755,54 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
     benchmark.main()
     assert (audit_output / "data_and_prompt_audit.json").exists()
     assert not (audit_output / "test_metrics.json").exists()
+
+
+def test_epoch_budget_tail_and_signal_exit(data_fixture, tmp_path, monkeypatch):
+    import signal
+    import yaml
+    from transformers import Qwen2ForCausalLM
+    source, qa, initial, _ = data_fixture
+    trainer, example_llm, _, tokenizer, config = tiny_components(initial)
+    llm_config = copy.deepcopy(example_llm.config)
+    config["training"].update(max_updates=None, epochs=2, log_interval=1)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"profiles": {"full": config}}), encoding="utf-8")
+    monkeypatch.setattr(trainer.core, "load_tokenizer", lambda args: tokenizer)
+    monkeypatch.setattr(trainer.core, "load_llm_with_bounded_host_memory",
+                        lambda args, device: (Qwen2ForCausalLM(copy.deepcopy(llm_config)).to(device), torch.float32))
+    # Isolate the training budget/interrupt behavior; generation is covered by the integration test above.
+    monkeypatch.setattr(trainer, "evaluate", lambda *a, **k: {
+        "seen_shapes": {"macro_task_answer_accuracy": 0.}, "heldout_shapes": None,
+        "valid_rate": 0., "errors": {}, "questions": 66})
+    base = ["train_point_readout.py", "--config", str(config_path), "--profile", "full",
+            "--qa-dir", str(qa), "--hdf5-path", str(source), "--device", "cpu",
+            "--batch-size", "32", "--gradient-accumulation-steps", "3", "--epochs", "2",
+            "--save-every-updates", "100", "--eval-every-updates", "100"]
+    out = tmp_path / "epochs"
+    monkeypatch.setattr(sys, "argv", base + ["--output-dir", str(out)])
+    trainer.main()
+    entries = [json.loads(line) for line in (out / "train.jsonl").read_text().splitlines()]
+    assert sum(entry["questions_in_update"] for entry in entries) == 88 * 2
+    assert len(entries[-1]["micro_batch_sizes"]) == 2
+    resolved = out / "resolved_config.json"
+    assert load_config(resolved, "full")["training"]["batch_size"] == 32
+    assert isinstance(load_config(resolved, "full")["training"]["lr"], float)
+    with pytest.raises(ValueError):
+        load_config(resolved, "smoke")
+
+    original_loss = trainer.training_loss
+    def interrupt_after_loss(*args, **kwargs):
+        result = original_loss(*args, **kwargs)
+        signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+        return result
+    monkeypatch.setattr(trainer, "training_loss", interrupt_after_loss)
+    out = tmp_path / "interrupted"
+    monkeypatch.setattr(sys, "argv", base + ["--output-dir", str(out)])
+    with pytest.raises(SystemExit) as error:
+        trainer.main()
+    assert error.value.code == 130
+    assert (out / "last.pt").is_file()
+    assert json.loads((out / "run_summary.json").read_text())["status"] == "stopped"
 
 
 def test_baseline_serializes_entire_field_exactly_and_no_oracle(z):
