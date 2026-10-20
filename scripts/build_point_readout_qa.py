@@ -24,6 +24,8 @@ def main():
     cli = parser.parse_args()
     config = load_config(cli.config, cli.profile)
     if cli.fields:
+        if config["data"].get("sources"):
+            parser.error("For multi-source QA, set each data.sources[].fields explicitly in the configuration")
         config["data"]["fields"] = cli.fields
     if cli.tasks:
         config["generation"]["tasks"] = cli.tasks

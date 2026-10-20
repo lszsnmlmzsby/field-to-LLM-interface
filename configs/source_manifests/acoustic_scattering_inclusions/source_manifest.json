@@ -1,0 +1,327 @@
+{
+  "schema": "the_well_manifest_v1",
+  "provider": "huggingface",
+  "dataset": "acoustic_scattering_inclusions",
+  "repo_id": "polymathic-ai/acoustic_scattering_inclusions",
+  "revision": "c17cd1d16fd351594ccea628e575650b404c4a91",
+  "metadata_endpoint": "https://huggingface.co",
+  "scope": "all_current_data_split_hdf5_and_text_metadata",
+  "files": [
+    {
+      "path": ".gitattributes",
+      "split": null,
+      "size_bytes": 5940,
+      "sha256": null,
+      "git_blob_sha1": "109b003c9ad891faf7f021c5cf3cd0fc08ce67c0"
+    },
+    {
+      "path": "README.md",
+      "split": null,
+      "size_bytes": 5980,
+      "sha256": null,
+      "git_blob_sha1": "adc8bfee536eef7d27809f762f31feedc4a6855f"
+    },
+    {
+      "path": "acoustic_scattering_inclusions.yaml",
+      "split": null,
+      "size_bytes": 412,
+      "sha256": null,
+      "git_blob_sha1": "154f62f29f269b17cdfdb8410ca2d9f87f43818c"
+    },
+    {
+      "path": "data/test/acoustic_scattering_inclusions_chunk_36.hdf5",
+      "split": "test",
+      "size_bytes": 8111783936,
+      "sha256": "3fb61d20c20acf76ab97e426d8532e2eb19f2b6ce9b11c07f58701d92a4b92fa",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/acoustic_scattering_inclusions_chunk_37.hdf5",
+      "split": "test",
+      "size_bytes": 8111783936,
+      "sha256": "7d6ea7f56f54e77b8f3aa7f2f7203c6f2c7126f757655ae625152a50f3a31cbe",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/acoustic_scattering_inclusions_chunk_38.hdf5",
+      "split": "test",
+      "size_bytes": 8111783936,
+      "sha256": "79445e9eb4f9e66f3438351ab78e73bd6294160c175cb1fcb1d82720a5c7bb0c",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/acoustic_scattering_inclusions_chunk_39.hdf5",
+      "split": "test",
+      "size_bytes": 8111783936,
+      "sha256": "a93c307872c8b3aaddbae235ce21f8a552a85e227ac9e8e0251c3f268cf65b15",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_0.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "daaa7a4cf5b11eb48ab718d2ce95e9bdc2b9f8461424886643d765ca612d49cd",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_1.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "9eb17ed10afd0a722b1a479aae73a29c9848c31882b36db3e5b9be7fbc5b7d5c",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_10.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "1e28163c997757810ce48cbce261fe8bf62e35b27ce8f31a799bfd3cc5891c18",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_11.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "812edda7d81bd2de142363aef0a2bd30c686db3cb1798616329e934deabe3310",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_12.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "ff95c72e9104397c0904bb99ea2e67aa08e280e312d9c65acfe2e44de5a4c7bf",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_13.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "5cafb15d2cc661bc10736d75952d9b771f1687eec89c0481e4497d08f3222436",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_14.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "60ff223d1cf5c90f0ef38f75cd357d45849fcf40e2f7bcac02fccef42f13c4af",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_15.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "13f84fbb5941469faa42b50562e7d9d83eebe25ca3474d810b02e3093a03e009",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_16.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "d44b01728a067ce770ef7697e4f317df4aefcd00b7b6590a70151b07e4559531",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_17.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "ad912239d7ac30a6f8959c9f423b5369cadab43866df5faa4e4536add825a200",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_18.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "4bda8555ca58ecec0ade0b496115d576bbca65eb337cf36af17b26e30fe5cd56",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_19.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "e53637ba7d85ddab67d62fd478f1e3539fa78b777c7d747aa142f2612af49027",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_2.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "169cc05e0169b495e9eff4b55bd8a805ec771af8abf66e6a33a30f14e1719ff0",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_20.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "b289c5a0b74b7f016868dfe8c05d2fd6470c418565f9df74e94f50aa80d7d709",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_21.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "4c858db5c4debf2570c817e430714fb5d0b7835084fdf1981409324b069fc942",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_22.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "a83059d0ca764b6087a6d759e28513adad89f7f6f247a6d5a5d26c47dec9ed35",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_23.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "5c27416ac16c69473ffad43aec245123f3439b8e9a2a2b1dcc5f6fad1d0523df",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_24.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "35b7c4ee489b0d8fb84ecd766bab38eb653f5372ecb37889b515620a285335e7",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_25.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "2f4d8176861b7d966d3edae6b33b1e0173d3f6514ec3b5e6b81c9844c3660efb",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_26.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "ca8391d92fb9b38179e441ca0e30168bb6ac49b0971bcc0ed641a4250d7c5d02",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_27.hdf5",
+      "split": "train",
+      "size_bytes": 8036286464,
+      "sha256": "6a2fbaaa30c88f8df375e6c45a714f75badcad6e597e19062e708e1a138e982e",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_3.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "837019204be78a5017cc76682f6c9fcd8e1e92c261e26208469c47e240711139",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_4.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "aec60ed990309606aee65ff11c8076f5192deb46478868ee6c84daa6f005af2b",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_5.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "3324bf00e48c28ceb0645f87aaa7afbeedd4f733ddc94f7f3820d9bd4a33d9f4",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_6.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "5846ccdca08b1e88b6d659644020f74d2f0301284fb14887fe3533d829969577",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_7.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "f316af883fcac2f4e1c9a3ebdbd372cab10f13eaf54409425ff273b036854f03",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_8.hdf5",
+      "split": "train",
+      "size_bytes": 8036286464,
+      "sha256": "7c1335dbefe80025a1d772694e2102ff1f53aacd398cef0fe6ef2fec717f4e96",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/acoustic_scattering_inclusions_chunk_9.hdf5",
+      "split": "train",
+      "size_bytes": 8111783936,
+      "sha256": "be7c5e34c297363dbee4397b5de208d9eeb779ca5624a5cd3943e5527d904a3d",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/acoustic_scattering_inclusions_chunk_32.hdf5",
+      "split": "valid",
+      "size_bytes": 8111783936,
+      "sha256": "28560c12c864060c192e2edba41609889c987f93d1f369f6491b5e710080f2d1",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/acoustic_scattering_inclusions_chunk_33.hdf5",
+      "split": "valid",
+      "size_bytes": 8111783936,
+      "sha256": "e905821efebb95065e26528a17de5570f5dd082fc5222a313056e8dc07289a79",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/acoustic_scattering_inclusions_chunk_34.hdf5",
+      "split": "valid",
+      "size_bytes": 8111783936,
+      "sha256": "475e362319003554a76d8d5d75a79709d99504ba88e806b12bc2c6cc89748149",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/acoustic_scattering_inclusions_chunk_35.hdf5",
+      "split": "valid",
+      "size_bytes": 8111783936,
+      "sha256": "04673c488ea9093249c4a2e010f5aa04bd4a20adea15a82bff754f75061dff10",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "generation/acoustics_2d_interface_random_medium.py",
+      "split": null,
+      "size_bytes": 9289,
+      "sha256": null,
+      "git_blob_sha1": "26edb5374b5cb0bf05184ce6b4cf29433216a22a"
+    },
+    {
+      "path": "generation/generate_acoustics_data.py",
+      "split": null,
+      "size_bytes": 4954,
+      "sha256": null,
+      "git_blob_sha1": "3505272749785abaca2866111c2142a6ac612c45"
+    },
+    {
+      "path": "stats.yaml",
+      "split": null,
+      "size_bytes": 594,
+      "sha256": null,
+      "git_blob_sha1": "e7e0b17ad96561f8c670766a32a4d261f801d79f"
+    }
+  ],
+  "excluded_files": [
+    {
+      "path": "generation/run_inclusions.sh",
+      "reason": "auxiliary_visualization_or_non_source_asset"
+    },
+    {
+      "path": "gif/inclusions_density.png",
+      "reason": "auxiliary_visualization_or_non_source_asset"
+    },
+    {
+      "path": "old_and_problematic_data/train/acoustic_scattering_inclusions_chunk_27.hdf5",
+      "reason": "publisher_archived_old_and_problematic_data"
+    },
+    {
+      "path": "old_and_problematic_data/train/acoustic_scattering_inclusions_chunk_8.hdf5",
+      "reason": "publisher_archived_old_and_problematic_data"
+    },
+    {
+      "path": "visualization_acoustic_scattering_inclusions.ipynb",
+      "reason": "auxiliary_visualization_or_non_source_asset"
+    }
+  ]
+}

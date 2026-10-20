@@ -34,15 +34,21 @@ def tensor_hash(value: torch.Tensor) -> str:
     return hashlib.sha256(array.tobytes()).hexdigest()
 
 
-def normalize_field(raw: torch.Tensor, *, allow_singleton: bool = False) -> tuple[torch.Tensor, dict]:
+def normalize_field(raw: torch.Tensor, *, allow_singleton: bool = False,
+                    allow_constant: bool = False) -> tuple[torch.Tensor, dict]:
     raw = raw.detach().cpu().float().contiguous()
     if raw.ndim != 2 or min(raw.shape) < 1 or not bool(torch.isfinite(raw).all()):
         raise ValueError("nonfinite_or_invalid_field")
-    mean, std = raw.mean(), raw.std(unbiased=False)
+    if allow_constant and bool(torch.all(raw == raw.reshape(-1)[0])):
+        # Avoid float32 reduction roundoff turning a constant field into a small
+        # nonzero standardized field. This opt-in policy is frozen in new QA.
+        mean, std = raw.reshape(-1)[0], raw.new_zeros(())
+    else:
+        mean, std = raw.mean(), raw.std(unbiased=False)
     scale = std + 1e-6
     z = ((raw - mean) / scale).half().float()
     if not bool(torch.isfinite(z).all()) or (float(z.min()) == float(z.max())
-                                           and not (allow_singleton and raw.numel() == 1)):
+                                           and not (allow_constant or (allow_singleton and raw.numel() == 1))):
         raise ValueError("constant_or_nonfinite_standardized_field")
     return z, {"mean": float(mean), "std": float(std), "scale": float(scale),
                "raw_sha256": tensor_hash(raw), "z_sha256": tensor_hash(z)}
@@ -322,4 +328,14 @@ def summarize_evaluation(rows: Sequence[Mapping], train_shapes) -> dict:
     for key, selected in (("seen_shapes", [r for r in rows if r["shape"] in seen]),
                           ("heldout_shapes", [r for r in rows if r["shape"] not in seen])):
         result[key] = summarize_scores(selected) if selected else None
+    # Provenance is used for reporting only, never as a neural model input.
+    for key in ("source_id", "family", "is_static", "is_constant"):
+        if any(key in row for row in rows):
+            if any(key not in row for row in rows):
+                raise ValueError(f"Incomplete evaluation provenance: {key}")
+            groups = defaultdict(list)
+            for row in rows:
+                groups[str(row[key])].append(row)
+            result[f"by_{key}"] = {name: summarize_scores(group)
+                                     for name, group in sorted(groups.items())}
     return result

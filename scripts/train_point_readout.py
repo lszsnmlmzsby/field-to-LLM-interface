@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from array import array
 import copy
 import json
 import math
@@ -10,7 +11,7 @@ import random
 import signal
 import sys
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -83,38 +84,94 @@ def encode_prompt(record, tokenizer, max_prompt_tokens):
     return ids
 
 
-def training_tensors(records, tokenizer, training):
+def encode_training_record(row, tokenizer, training):
+    prompt = encode_prompt(row, tokenizer, int(training["max_prompt_tokens"]))
+    # Tokenize the complete conversation to preserve native assistant boundaries
+    # and context-sensitive BPE, rather than joining separately tokenized strings.
+    complete = native_chat_ids(tokenizer, chat_messages(row) +
+                               [{"role": "assistant", "content": row["answer"]}], generation_prompt=False)
+    if complete[:len(prompt)] != prompt:
+        raise ValueError("Native chat training sequence does not share the generation prompt prefix")
+    answer = complete[len(prompt):]
+    if tokenizer.eos_token_id not in answer:
+        raise ValueError("Native assistant template must terminate with tokenizer.eos_token_id")
+    answer = answer[:answer.index(tokenizer.eos_token_id) + 1]
+    if len(answer) > int(training["max_target_tokens"]):
+        raise ValueError(f"Answer {row['qa_id']} exceeds max_target_tokens; truncation is forbidden")
+    return prompt, answer
+
+
+class TrainingTokenCache:
+    """Run-local bounded CPU token cache; no tensor memory or autograd state.
+
+    Cache keys include the actual prompt and answer, not just a possibly reused
+    QA ID. Compact integer arrays avoid one Python integer object per token.
+    max_bytes bounds accounted token/key storage; max_entries also bounds the
+    Python dictionary overhead. Zero disables caching without changing results.
+    """
+
+    def __init__(self, tokenizer, training, *, max_bytes=256 * 2**20, max_entries=262144):
+        if max_bytes < 0 or max_entries < 0:
+            raise ValueError("Token cache limits must be nonnegative")
+        if tokenizer.eos_token_id is None or tokenizer.pad_token_id is None:
+            raise ValueError("Numerical generation requires an EOS and a padding token")
+        self.tokenizer = tokenizer
+        self.limits = (int(training["max_prompt_tokens"]), int(training["max_target_tokens"]))
+        self.signature = (tokenizer.eos_token_id, tokenizer.pad_token_id, tokenizer.chat_template)
+        self.max_bytes, self.max_entries = int(max_bytes), int(max_entries)
+        self.entries, self.bytes = OrderedDict(), 0
+        self.hits = self.misses = 0
+
+    def statistics(self):
+        return {"hits": self.hits, "misses": self.misses, "entries": len(self.entries),
+                "accounted_bytes": self.bytes, "max_bytes": self.max_bytes, "max_entries": self.max_entries}
+
+    def get(self, row, tokenizer, training):
+        if (tokenizer is not self.tokenizer or
+                self.signature != (tokenizer.eos_token_id, tokenizer.pad_token_id, tokenizer.chat_template) or
+                self.limits != (int(training["max_prompt_tokens"]), int(training["max_target_tokens"]))):
+            raise ValueError("Token cache belongs to a different tokenizer or token budget")
+        key = json_hash({"messages": chat_messages(row), "answer": row["answer"]})
+        cached = self.entries.get(key)
+        if cached is not None:
+            self.hits += 1
+            self.entries.move_to_end(key)
+            return cached[0]
+        self.misses += 1
+        pair = encode_training_record(row, tokenizer, training)
+        if not self.max_bytes or not self.max_entries:
+            return pair
+        packed = tuple(array("I", tokens) for tokens in pair)
+        cost = sys.getsizeof(key) + sys.getsizeof(packed) + sum(sys.getsizeof(tokens) for tokens in packed)
+        if self.max_entries and cost <= self.max_bytes:
+            while self.entries and (self.bytes + cost > self.max_bytes or len(self.entries) >= self.max_entries):
+                _, (_, evicted_cost) = self.entries.popitem(last=False)
+                self.bytes -= evicted_cost
+            self.entries[key] = packed, cost
+            self.bytes += cost
+        return packed
+
+
+def training_tensors(records, tokenizer, training, *, token_cache=None):
     if tokenizer.eos_token_id is None or tokenizer.pad_token_id is None:
         raise ValueError("Numerical generation requires an EOS and a padding token")
     encoded = []
     for row in records:
-        prompt = encode_prompt(row, tokenizer, int(training["max_prompt_tokens"]))
-        # Tokenize the complete conversation to preserve native assistant boundaries
-        # and context-sensitive BPE, rather than joining separately tokenized strings.
-        complete = native_chat_ids(tokenizer, chat_messages(row) +
-                                   [{"role": "assistant", "content": row["answer"]}], generation_prompt=False)
-        if complete[:len(prompt)] != prompt:
-            raise ValueError("Native chat training sequence does not share the generation prompt prefix")
-        answer = complete[len(prompt):]
-        if tokenizer.eos_token_id not in answer:
-            raise ValueError("Native assistant template must terminate with tokenizer.eos_token_id")
-        # The template may add a newline after end-of-turn; generation stops at EOS.
-        answer = answer[:answer.index(tokenizer.eos_token_id) + 1]
-        if len(answer) > int(training["max_target_tokens"]):
-            raise ValueError(f"Answer {row['qa_id']} exceeds max_target_tokens; truncation is forbidden")
+        prompt, answer = (token_cache.get(row, tokenizer, training) if token_cache is not None else
+                          encode_training_record(row, tokenizer, training))
         encoded.append((prompt, answer))
     width = max(len(p) + len(a) for p, a in encoded)
     ids = torch.full((len(records), width), tokenizer.pad_token_id, dtype=torch.long)
     mask, labels = torch.zeros_like(ids), torch.full_like(ids, -100)
     for i, (prompt, answer) in enumerate(encoded):
-        ids[i, :len(prompt) + len(answer)] = torch.tensor(prompt + answer)
+        ids[i, :len(prompt) + len(answer)] = torch.tensor(list(prompt) + list(answer))
         mask[i, :len(prompt) + len(answer)] = 1
-        labels[i, len(prompt):len(prompt) + len(answer)] = torch.tensor(answer)
+        labels[i, len(prompt):len(prompt) + len(answer)] = torch.tensor(list(answer))
     return ids, mask, labels
 
 
-def training_loss(llm, sidecar, tokenizer, records, fields, device, dtype, training):
-    ids, mask, labels = [x.to(device) for x in training_tensors(records, tokenizer, training)]
+def training_loss(llm, sidecar, tokenizer, records, fields, device, dtype, training, *, token_cache=None):
+    ids, mask, labels = [x.to(device) for x in training_tensors(records, tokenizer, training, token_cache=token_cache)]
     try:
         with core.autocast_context(device, dtype):
             memory = sidecar.bind(fields.to(device), mode="correct")
@@ -245,6 +302,7 @@ def prepare_output_directory(path, *, resume=False, overwrite=False):
     return path
 
 
+@torch.inference_mode()
 def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_path, *, verbose=False):
     core.set_frozen_llm_execution_mode(llm, checkpoint_training=False)
     sidecar.eval()
@@ -254,30 +312,50 @@ def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_pat
     start, scored = time.perf_counter(), []
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8", newline="\n") as handle:
-        for index in range(len(dataset)):
-            row, field = dataset[index]
-            prediction = generate_answer(
-                llm, sidecar, tokenizer, row, field, device, dtype,
-                max_prompt_tokens=int(config["training"]["max_prompt_tokens"]),
-                max_new_tokens=int(config["evaluation"]["max_new_tokens"]),
-                use_cache=bool(config["evaluation"].get("use_cache", True)))
-            score = score_answer(row, prediction["prediction"], terminated=prediction["terminated"])
-            entry = {"qa_id": row["qa_id"], "task_type": row["task_type"],
-                     "shape": "x".join(map(str, row["grid_shape"])),
-                     "field_tokens": math.prod((n + p - 1) // p for n, p in
-                                               zip(row["grid_shape"], sidecar.memory.block_shape)),
-                     "field": dataset.states[row["state_ref"]]["field"], **prediction, "score": score}
-            scored.append(entry)
-            handle.write(json.dumps(entry, allow_nan=False) + "\n")
-            if verbose and (index + 1) % 100 == 0:
-                print(f"evaluation questions={index + 1}/{len(dataset)}", flush=True)
+    active_state = None
+    field_encodes = 0
+    reuse_memory = bool(config["evaluation"].get("reuse_field_memory", True))
+    # Only one field is retained, and only during this evaluation invocation.
+    # Text KV is always initialized afresh for every question. Dataset order is
+    # unchanged, including when one state appears in disjoint runs of records.
+    sidecar.clear()
+    try:
+        with output_path.open("w", encoding="utf-8", newline="\n") as handle:
+            for index in range(len(dataset)):
+                row, field = dataset[index]
+                prompt = encode_prompt(row, tokenizer, int(config["training"]["max_prompt_tokens"]))
+                if not reuse_memory or active_state != row["state_ref"]:
+                    sidecar.clear()
+                    with core.autocast_context(device, dtype):
+                        sidecar.bind(field.unsqueeze(0).to(device), mode="correct")
+                    active_state = row["state_ref"]
+                    field_encodes += 1
+                prediction = generate_from_prompt(
+                    llm, tokenizer, prompt, device, dtype,
+                    max_new_tokens=int(config["evaluation"]["max_new_tokens"]),
+                    use_cache=bool(config["evaluation"].get("use_cache", True)))
+                score = score_answer(row, prediction["prediction"], terminated=prediction["terminated"])
+                state = dataset.states[row["state_ref"]]
+                entry = {"qa_id": row["qa_id"], "task_type": row["task_type"],
+                         "shape": "x".join(map(str, row["grid_shape"])),
+                         "field_tokens": math.prod((n + p - 1) // p for n, p in
+                                                   zip(row["grid_shape"], sidecar.memory.block_shape)),
+                         "field": state["field"], **prediction, "score": score}
+                entry.update({key: state[key] for key in ("source_id", "family", "is_static", "is_constant") if key in state})
+                scored.append(entry)
+                handle.write(json.dumps(entry, allow_nan=False) + "\n")
+                if verbose and (index + 1) % 100 == 0:
+                    print(f"evaluation questions={index + 1}/{len(dataset)}", flush=True)
+    finally:
+        sidecar.clear()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     metrics = summarize_evaluation(scored, dataset.metadata["train_shapes"])
     metrics.update(elapsed_seconds=time.perf_counter() - start,
                    peak_allocated_gib=torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None,
-                   generated_tokens=sum(row["generated_tokens"] for row in scored))
+                   generated_tokens=sum(row["generated_tokens"] for row in scored),
+                   field_memory_encodes=field_encodes,
+                   field_memory_reuses=len(scored) - field_encodes)
     return metrics
 
 
@@ -515,9 +593,17 @@ def main():
         core.apply_runtime_environment(args)
         core.seed_everything(args.seed)
         tokenizer = core.load_tokenizer(args)
-        for d in datasets.values():
-            for row in d.records:
-                training_tensors([row], tokenizer, config["training"])
+        token_cache = TrainingTokenCache(tokenizer, config["training"],
+            max_bytes=int(config["runtime"].get("token_cache_bytes", 256 * 2**20)),
+            max_entries=int(config["runtime"].get("token_cache_entries", 262144)))
+        for split, d in datasets.items():
+            print(f"token_preflight split={split} questions={len(d.records)}", flush=True)
+            for index, row in enumerate(d.records):
+                # Validate native template boundaries and all token budgets once,
+                # without allocating padded tensors for every preflight record.
+                token_cache.get(row, tokenizer, config["training"])
+                if (index + 1) % 100000 == 0:
+                    print(f"token_preflight split={split} checked={index + 1}/{len(d.records)}", flush=True)
         llm, dtype = core.load_llm_with_bounded_host_memory(args, device)
         core.seed_everything(args.seed)
         encoder, spatial, _, _ = core.build_scratch_memory_components(args, (1, args.patch_size, args.patch_size))
@@ -635,7 +721,8 @@ def main():
                 examples = [train_data[i] for i in indices]
                 records, fields = zip(*examples)
                 try:
-                    loss, _ = training_loss(llm, sidecar, tokenizer, records, torch.stack(fields), device, dtype, training)
+                    loss, _ = training_loss(llm, sidecar, tokenizer, records, torch.stack(fields), device, dtype,
+                                            training, token_cache=token_cache)
                     weight = len(indices) / total_records
                     (loss * weight).backward()
                     loss_value += float(loss.detach()) * weight
@@ -677,7 +764,8 @@ def main():
         save(output / "last.pt")
         write_json(output / "run_summary.json", {"status": "completed" if step == maximum else "stopped",
             "step": step, "planned_updates": maximum, "best_score": best if best >= 0 else None,
-            "elapsed_this_invocation_seconds": time.perf_counter() - start, "last_checkpoint": str(output / "last.pt")})
+            "elapsed_this_invocation_seconds": time.perf_counter() - start, "last_checkpoint": str(output / "last.pt"),
+            "token_cache_this_invocation": token_cache.statistics()})
         if stop_requested:
             raise SystemExit(130)  # Let a shell loop using set -e stop after Ctrl+C.
     finally:

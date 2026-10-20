@@ -862,15 +862,25 @@ class GatedTensorCrossAttention(nn.Module):
         self.out_proj = nn.Linear(self.bridge_dim, int(llm_dim))
         self.gate = nn.Parameter(torch.tensor(float(gate_init), dtype=torch.float32))
         self._memory: DenseMemoryState | None = None
+        # Ephemeral inference-only projections. They are not model parameters or
+        # checkpoint state and must never retain a training autograd graph.
+        self._projected_memory = None
+        self._projection_signature = None
         self.enabled = True
 
     def bind_memory(self, memory: DenseMemoryState | None, enabled: bool = True) -> None:
         self._memory = memory
+        self._projected_memory = self._projection_signature = None
         self.enabled = bool(enabled)
 
     def clear_memory(self) -> None:
         self._memory = None
+        self._projected_memory = self._projection_signature = None
         self.enabled = True
+
+    def train(self, mode: bool = True):
+        self._projected_memory = self._projection_signature = None
+        return super().train(mode)
 
     def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
         batch, tokens, _dim = tensor.shape
@@ -880,12 +890,27 @@ class GatedTensorCrossAttention(nn.Module):
         memory = self._memory
         if not self.enabled or memory is None:
             return hidden_states
-        normalized_memory = self.memory_norm(memory.content)
         query = self._split_heads(self.q_proj(self.query_norm(hidden_states)))
-        key = self._split_heads(self.k_proj(normalized_memory))
-        value = self._split_heads(
-            self.v_content_proj(normalized_memory) + self.v_value_proj(memory.value)
-        )
+        cacheable = not self.training and not torch.is_grad_enabled()
+        signature = None
+        if cacheable:
+            # A different autocast context or in-place parameter update cannot
+            # reuse projections produced for the previous numerical context.
+            signature = (query.dtype, query.device, tuple(parameter._version for module in
+                (self.memory_norm, self.k_proj, self.v_content_proj, self.v_value_proj)
+                for parameter in module.parameters()))
+        if cacheable and signature == self._projection_signature:
+            key, value = self._projected_memory
+        else:
+            normalized_memory = self.memory_norm(memory.content)
+            key = self._split_heads(self.k_proj(normalized_memory))
+            value = self._split_heads(
+                self.v_content_proj(normalized_memory) + self.v_value_proj(memory.value)
+            )
+            if cacheable:
+                self._projected_memory, self._projection_signature = (key, value), signature
+            else:
+                self._projected_memory = self._projection_signature = None
         attended = F.scaled_dot_product_attention(
             query,
             key,

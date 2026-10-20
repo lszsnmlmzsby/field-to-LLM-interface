@@ -43,6 +43,10 @@ def resolve_path(value) -> Path:
 
 
 def source_path(config, explicit=None):
+    if config["data"].get("sources"):
+        if explicit:
+            raise ValueError("Multi-source experiments use data.sources; --hdf5-path is for single-source runs")
+        return None
     # New experiments opt out of the legacy PDEBENCH_HDF5 override explicitly.
     variable = config["data"].get("hdf5_env", "PDEBENCH_HDF5")
     return resolve_path(explicit or os.environ.get(variable) or config["data"]["hdf5_path"])
@@ -64,6 +68,11 @@ def write_jsonl(path, rows):
 
 
 def build_dataset(config, hdf5_path, output_dir):
+    if config["data"].get("sources"):
+        if hdf5_path is not None:
+            raise ValueError("Multi-source experiments must not override one HDF5 path")
+        from tensor_compression.downstream.multisource_readout_data import build_multisource_dataset
+        return build_multisource_dataset(config, output_dir)
     config = copy.deepcopy(config)
     data, generation = config["data"], config["generation"]
     tasks = list(generation["tasks"])
@@ -231,6 +240,15 @@ def build_dataset(config, hdf5_path, output_dir):
 
 class PointReadoutDataset:
     """Lazy raw-patch replay; metadata/oracles never become neural routing inputs."""
+
+    def __new__(cls, qa_dir, hdf5_path, split, cache_size=8):
+        metadata_path = Path(qa_dir) / "metadata.json"
+        if cls is PointReadoutDataset and metadata_path.is_file():
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata.get("source", {}).get("kind") == "multisource":
+                from tensor_compression.downstream.multisource_readout_data import MultiSourcePointReadoutDataset
+                return MultiSourcePointReadoutDataset(qa_dir, split, cache_size=cache_size)
+        return super().__new__(cls)
 
     def __init__(self, qa_dir, hdf5_path, split, cache_size=8):
         if split not in ("train", "val", "test") or cache_size < 0:

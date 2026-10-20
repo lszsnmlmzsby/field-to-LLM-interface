@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from tensor_compression.downstream.point_readout import score_answer, summarize_scores
+from tensor_compression.downstream.point_readout import score_answer, summarize_evaluation
 from tensor_compression.downstream.point_readout_data import PointReadoutDataset, read_jsonl, write_json
 
 
@@ -29,10 +29,12 @@ def score_predictions(dataset, predictions):
         score = score_answer(row, prediction["prediction"], terminated=prediction.get("terminated", True))
         if row["qa_id"] not in by_id:
             score["error"] = "missing_prediction"
+        state = dataset.states[row["state_ref"]]
         scored.append({"qa_id": row["qa_id"], "task_type": row["task_type"],
                        "shape": "x".join(map(str, row["grid_shape"])),
-                       "field": dataset.states[row["state_ref"]]["field"], "score": score})
-    return summarize_scores(scored)
+                       "field": state["field"], "score": score,
+                       **{key: state[key] for key in ("source_id", "family", "is_static", "is_constant") if key in state}})
+    return summarize_evaluation(scored, dataset.metadata["train_shapes"])
 
 
 def main():

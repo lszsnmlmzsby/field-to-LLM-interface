@@ -36,6 +36,17 @@ generative questions with complete serialized field values and can compare saved
 interface predictions under the same scoring protocol. Console logs are compact
 by default; detailed JSONL records remain available.
 
+The [multi-source readout runbook](MULTISOURCE_READOUT_RUNBOOK.md) extends this
+experiment with complete INS-Tracer and three pinned The Well sources (acoustic
+inclusions, Euler openBC and Gray–Scott), 131,072
+sampled training states, shared random integer shapes from 1 through 128, and
+two training epochs. It includes source verification, exact QA field caches,
+inference field-memory reuse, strict resume and independent test commands.
+See [the source inventory](THE_WELL_DATASETS.md) for sizes, actual HDF5 layouts,
+download providers and checksum limitations. Euler periodicBC remains an optional
+download supported by the tools but is excluded from this experiment. This
+experiment adds no IID fields.
+
 ## Method
 
 The paper pipeline has two training stages:

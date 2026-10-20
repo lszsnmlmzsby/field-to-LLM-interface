@@ -1,0 +1,1036 @@
+{
+  "schema": "the_well_manifest_v1",
+  "provider": "huggingface",
+  "dataset": "euler_multi_quadrants_openBC",
+  "repo_id": "polymathic-ai/euler_multi_quadrants_openBC",
+  "revision": "84e3eb65faf286533714295515caf9b99b4717a7",
+  "metadata_endpoint": "https://huggingface.co",
+  "scope": "all_current_data_split_hdf5_and_text_metadata",
+  "files": [
+    {
+      "path": ".gitattributes",
+      "split": null,
+      "size_bytes": 17993,
+      "sha256": null,
+      "git_blob_sha1": "c0c342c68654ca0492ea3276b3900b927835da33"
+    },
+    {
+      "path": "README.md",
+      "split": null,
+      "size_bytes": 4405,
+      "sha256": null,
+      "git_blob_sha1": "aab89e5b6c9f202f92cda610fafabbbc0e97ef1e"
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_0.hdf5",
+      "split": "test",
+      "size_bytes": 21181261748,
+      "sha256": "8ac64f547b3fe722a159a4ac5e8b5d119508666a589ca3dfe13f20453a99c383",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_40.hdf5",
+      "split": "test",
+      "size_bytes": 5295335348,
+      "sha256": "d7faf79d1d752d9e5cabca1295c88b3eb1c4154f11e2e1aeac19d472b43cc437",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_0.hdf5",
+      "split": "test",
+      "size_bytes": 21181261748,
+      "sha256": "4990dc6aa9514dc765b09a9bb5418076ac2d9de13845c1caf9303107de8dfef8",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_40.hdf5",
+      "split": "test",
+      "size_bytes": 5295335348,
+      "sha256": "90f541ed62a7f1e9e379b8b7311692b14613c79b4fff29c8607a0049661783b7",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_0.hdf5",
+      "split": "test",
+      "size_bytes": 21181261748,
+      "sha256": "2f8a304d74b90d3cb8d4d4d896eaef40a67a1eafdd55583ced4e4168e0fab485",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_40.hdf5",
+      "split": "test",
+      "size_bytes": 5295335348,
+      "sha256": "fbe596ac3b3ab2ccb4d7e0fc95c6a887a3c38eba7a9fe2a5a6ac8af3f5cb2558",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_0.hdf5",
+      "split": "test",
+      "size_bytes": 21181261748,
+      "sha256": "36030718ff14ca51f1ffb3d72366a4584efac4d68ee465ec111b30ea91712f37",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_40.hdf5",
+      "split": "test",
+      "size_bytes": 5295335348,
+      "sha256": "92ebf50eba8db85ee8f498f888eaa58e8c88c31f5a0ca7d16e378b2c804b6924",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_0.hdf5",
+      "split": "test",
+      "size_bytes": 21181261748,
+      "sha256": "5d447cf1c59378068e84033d6f8fb6ce48a383ad4803ced6072e8e26eb28392d",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_40.hdf5",
+      "split": "test",
+      "size_bytes": 5295335348,
+      "sha256": "27760a8c9a48f4cb944faee6e8e2b4bfe01548ec144dd7f7c3744d78d05772f8",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_0.hdf5",
+      "split": "test",
+      "size_bytes": 21181261748,
+      "sha256": "d66be3d54688bb6b1b038c4ec8db85821e9e98060c8f742605b6c3151159980a",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_40.hdf5",
+      "split": "test",
+      "size_bytes": 5295335348,
+      "sha256": "6d391c1d5bced71a7153f7ea5d273d082eb711ab630fa138e7c918a110b2f2a2",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_0.hdf5",
+      "split": "test",
+      "size_bytes": 21181261748,
+      "sha256": "0470c1fe8144b144f927577b4a09c4d1ea6b25dd2614542706903944df4857b8",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_40.hdf5",
+      "split": "test",
+      "size_bytes": 5295335348,
+      "sha256": "92baa9d30e3832b2329b6ad51682a7b1600408f7486bb27e3a08e3f7deafcf97",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_0.hdf5",
+      "split": "test",
+      "size_bytes": 21181261748,
+      "sha256": "85bb147c4cf73d84b16c7c170b2e5a5e05a2d53e6083c1d99c4e8c5fa5efc796",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_40.hdf5",
+      "split": "test",
+      "size_bytes": 5295335348,
+      "sha256": "80ccb5d31d0a4d58750b9e63b97edbcbfe04c8d7391961bf0a24e66ecb926736",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_0.hdf5",
+      "split": "test",
+      "size_bytes": 21181261748,
+      "sha256": "175f31fe6e3a413b8e7fb47cee1ed4e77822038ff0ea74539b019dd39e051017",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_40.hdf5",
+      "split": "test",
+      "size_bytes": 5295335348,
+      "sha256": "8eb3edcbcfd7ded7b9ed4e19b5a0a25d7ab0fbaca26d9de18767302215deab0f",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_0.hdf5",
+      "split": "test",
+      "size_bytes": 21181261748,
+      "sha256": "fcb218ef20b96f2adce56c928db8dc245d704e8310dbd055429a9413daa033fe",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_40.hdf5",
+      "split": "test",
+      "size_bytes": 5295335348,
+      "sha256": "ba2a180007a76f3e8617465f75f3b202ca01d303ed4d7f3fb4618e0b7104eb0e",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_0.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "a28e6f815c1ea1fbecf2dd1ca21c875717c91c55603f9aa1ecef907fb5bc4696",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_120.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "0e9ffe25e5c18a0b740cd36bc079d67552d7497bbb1da7bb6f5cb6b38bc65bd7",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_160.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "c27473542bddba1a7888a53810b5df1b9c24d46edbc7744f8defc2848ff3ff22",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_200.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "4f466b460064eafe41dbb358c246362863c784dae91611041d2e0a3bb05e134a",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_240.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "a1746ed46bd23d05e6ef148051eae703da8b1fad20c437972313679dd2fcca69",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_280.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "a91f32dfc0481e91afe3b3143b975454dd3a9a8fc8aa6171714f28ed9c9a745a",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_320.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "7c7eb53d8105a03d1b0125de525e5eb987459f6f35aed62957ceb9a672375ae3",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_360.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "bfebc7db4fa3c7f8bfccf386d5c7536fe4bd3f76ba66b89a49f095e07a79f78c",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_40.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "97b68533d1090f9a3d4fcd2a789dbeef9c9f69913d79a0dc476ef89d04b5c29d",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_80.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "3a66328201e66a67800b026fef0c7e7be77688ebed51f35ce43a4d3dbbfbc7ed",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_0.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "ad5b1670c968ac92c573ac1daaa09666ed95db40f9322d4cf59f38fd240d4a9c",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_120.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "4e44bb9b6220ce0371a95407ee681c14dd2eeb48112741910ebe25f887fa5a6d",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_160.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "777b9ad6e4d73975cce2cdc88f5b1e3832f017862ca99fd4147c57296e8898f5",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_200.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "a6112febe685088acd1f6397b8fa514c58791199fdbf640c8cb41affe8dfc0d4",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_240.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "b033a1f858cb7af4d24dd84b2cf1db8d52071e7c77178bd01e1db27deb8de55f",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_280.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "667e44b32bf3481420c1bcb6144572d03fe13daada75c2303b31c2bb8b43d261",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_320.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "a7f885cefe3a58e0cfea423a8d2912cf40aaf1a1b8e33c19aa386ab4fb66e8b5",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_360.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "f6fed2e90cffe3705ab70b2603428ee61a8090ce424bbd6f8e43f4fff39889d2",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_40.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "0a63357c16cb35f9aaaedd79f5d807204ce28a4ce4710d58f5fd4b949d218b13",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_80.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "81fe770ff44b3a7a5bfc4ff2de2f041c8b32ef6fe99f6270bdbf3d62e2391b85",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_0.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "76a89f58de85818e786ece4739d833d108ac6e4bcac12acdba03babfef23743b",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_120.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "b6f78586e83fe0c7415fa2d363ed0682f66000f2c40556a1cec376f74ae86001",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_160.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "2b21842e59a0554e9a41fc578434ad40f6506f5f8ed2b6007278145874d9530c",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_200.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "b16b018b0f6ba7300b8ac17866d03e280129c41bb06725541769501eb7f6cd3e",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_240.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "7ec0326ec8f6fd1b32fe377500076a77ec5588a14b19c72329410ef580e1c8c1",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_280.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "130ef922e4dea8b28dfb29dc17272853faa51854e700aedb0839f6b1aaf09600",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_320.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "aabada94f730bd5ac9c0d2801e3ccdcbd0ca4a01d5ffc151146946c218d8faa3",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_360.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "75ac1ae4b72d8a9914703cfe69ebcf4137cdf9e4d34989bd98d53cea2771ba07",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_40.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "5f34650a62bbfc8fe3ba2d4cdab628567b4a98a92302adbb82fea30ae3489729",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_80.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "eae0afea051e092117da9b679b341a5110433809a4e2b6ee25f4533c0fe8fccb",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_0.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "5feb0a69b4cd3f5a798cfbbc7ae65d0965558b1e196a693667ba8b28e56b669c",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_120.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "b32c8f20770335e4f5d83f900bb8b2389115fdb8e0c08fcc920dec13a12b2d85",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_160.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "bc7d6df36bf9b511565931f4634c50a8715c4f14e3f011197a36ced5a3bb98c1",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_200.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "d6bec7026f5a7c70f9b964012dbe93c1192a1bf39927622862cb06fb4d935643",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_240.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "480bc24626ee39760d709e9f934ac019e5828dee90dd7b69d44deb3fca63f7d1",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_280.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "2544ab352c4bdc93e92fc8163b17c9be1b392abcbf3f6a41024df09ff4b8d453",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_320.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "dd15dc68d8ebf16b07bc58deca54f05818612e221f406a3c0110a2eb0f8d20f2",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_360.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "53b0f46ced2fe12ba652debb4e5a4bfcadd64db3591d232dec692a6f03494281",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_40.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "90ec36a3335042932b403ec290f8bdcb6d82f68fbc1f691a8bbbdb4420c1cd23",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_80.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "9876139b5860ce0c3b8c4d1aab1bc09cf2f1f9413482482ec505113775b6b8f1",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_0.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "cf41a70ea5cefaec53f8afc8ae9688fad07d18422f9b2a1770070c49f6bac523",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_120.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "820b5a3e5aa9d78c63daa522995b4cba46a89a7ae757a84a43a2c51974a67db4",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_160.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "523d484912925586150fc2000897ff655a940a23ceb6d917470e1fc232c79ea0",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_200.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "81cd92a2709d8c0515d8fdb4e0d9306e59a9a5d61c6547617d684116b6b75e9c",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_240.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "68d204890c2f9962a5cd68f2d00664cededba049b4502d2d4c35c01d008cde05",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_280.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "1e809e0351f4472b0bbe7ebc63a601c789529d95745913b1f0afdee2f50f2556",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_320.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "d5637462ea41481700403317b1599bbddfc668e71d7295cd54e3b43651109a1d",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_360.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "2a4648377afc3beea6ec18d0afd179b810fa03bf14e4e284542f542142dedef1",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_40.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "a3697e3ea92e68bde0d408a842b0acafe1c08c75f44f1fbd238c57833800b033",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_80.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "20d8b8fabf9fbc9b5af9d4b6f7f829971412b88658cb919247ef32518588a476",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_0.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "c3381c7cff5c8293d70e01d98966ef9848c146386d2b58d69737f3df8740822c",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_120.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "c263550b6ad45f81bc8bdc56a56b9d7dba69b2dd62e433d0a42fa5bb7ac8bbc0",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_160.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "1601be7043ec6ef56cf6d3d0c7855d0067ce55b90e3dd82d531717c5c661b508",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_200.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "8759946c4c6afb52cf4ba7d5cef70670d49c95e07ed7b973dea85362e774eca6",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_240.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "89a5850c3046322ca05ba401bc4d2a86c22281f8559f08aa5fefc05887b8c4f3",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_280.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "1ab9a917540690872084f6e4950cd48a58c7970acf5a45b5801a6b96fc01f824",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_320.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "5ecdc34dc693206d02dd1553ba6a659b8ab5f048888902dee67b8715996fcf71",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_360.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "a5b8d3644a73ca75bcfe8a7e21d64172ababcdbb4f776ba4e586374dd42ea0de",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_40.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "1a2673f3400761a8ecaa33d5dca34fcf21b99f74516d20529705f098b571e563",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_80.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "6360cddbfefb0ad05bdb4acf308420d577ac7e02dec7414dae2e1e907103da89",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_0.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "d9d8e119797c121d8a5848628166510707e34ff1c89bfdec0b966227da9328ea",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_120.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "88c557493982c24ebcf5daa68fd917891814485ecad5d34bab7ece5d25a234a9",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_160.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "fc95f6e237b4759c17be4e18f4e674fe10f9eae1d2e9687ea98583163e115ef0",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_200.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "0557cb38068755b6783d7accd391fe6419d4108c50dd5412b506ffcb0e1b729f",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_240.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "965238ea2609cfd336dc564b38b935471bab84a1a29cd72b99a368087fd63068",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_280.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "8cf70babb349666c4919a49a77bfa73fc7ae043d4fc011cda45088e14b821607",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_320.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "6d2950448bc24ecbeee653599223140dcd27386394e72c179fd09d377d99b9f4",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_360.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "7e5cd62d914988f88f126a4a29664952a1fabbdfb4e9c1dac68b62c770b07ba2",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_40.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "4f71b350770157ef83cd366416a1117001722da55438823c7441a56798ab1a6d",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_80.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "a30bd05a984cbfadd4cad03788722a9d75e80001323e3d7662588b87b5ef5b3b",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_0.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "a2c656c7bafdd402c2b4383b4713a3c7231e27d43c3b50ee83096fc233b0628b",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_120.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "659c2070b70327cc24f5fdb51e5163f45615e73f5a6f8f40bc0c52c9671acab1",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_160.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "ee54c60ba0c65d879099e1c0648a37e02172c708aa30015ce07e5195dc9e1ca6",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_200.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "b6cc04b5c53a7758cd8f4ca9419d50b9e8182b97e7604efcfdf6bb38652b9296",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_240.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "a960075cfec5f9f329e52e50c416b12cce22819208327b2a39a8ce4e5bd11efd",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_280.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "078def7b976ec5d0cf49e3d67a633a2acd60d16731515da3eeef79b42dfbe7c9",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_320.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "d95fd2ba76d50f105f474cf29cc302350f976310e9fd0e56e2e01222b1f6a733",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_360.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "053feccfd694360c4257847c92a792d240cf132428c5ac50e89b967314ec7e37",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_40.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "0519e2d5634bf82f754c82e498e8320c031f145eef77dcc2f99bf7ede027cee7",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_80.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "9644dda8328dccf11d9db84921897782a4b4fd9ee53ad3fd255aca65bd7de7f2",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_0.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "f93ee09aca0b6af81e7a6996a40f61c862e2859bc7b06d566e6803baea6ec787",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_120.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "58cacae0632d6bca9def71a893551d0f350850e0a8ce1b93f27a6997c0c9fbef",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_160.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "956aeaaefb0298f43448d30580c9f7973ca74416b1117f6e904e721b6deee170",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_200.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "af7e6273372a6383cdb9e830a7494053bf7d39a9760ed8264d37bbc182f9b1c5",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_240.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "cf5514c878f1ebea65efa78a970f74bbfb308999d408956aef9bb5cfb3d66fc9",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_280.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "de374b42e0c1a8253b21b45ad4b7ca8b6583b1420f2e4a8c919326e9beb75047",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_320.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "7e35bd8c383623d5d98a4a4f10bdd6c02268918634d80edb8665a4ef0238096b",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_360.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "b831c409a52ca513bfd9360d8171295aeb3796880ed6f58d845238ed512833d9",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_40.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "cfc96517878ac336e23058b8c84e1ab57b71dc35d4c22f7d76f6244c6f41879c",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_80.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "6cae381dced099abfcf9cd4b1feb7a4bb7ffb777aa75350ed1e503a418748ec2",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_0.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "b1ec334f38d63b04a4d1df7f2d2be45b36bf9e52948a29ecfccdb6e23b0d39f2",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_120.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "c5db8b355396ea91ab8e3b7c74262fe2852529ffd76923f4c162b9509a4d4346",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_160.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "9af9c25a82b350cbe44709aa1f72f9b7e87d483109235c7424be468729680072",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_200.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "27999d39cb47fbe0938bb3049e46a00d20e2694b1643db2d64a943968b046f56",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_240.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "dd2f402cce05f1d22fa78b835743e7aed654c41dc88cd59ed85b206ca109486b",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_280.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "f1db860fbf56cbd5d8e758d17725ed17e92a0b1c2aaf80453fcb30723af120de",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_320.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "6033d1a2b356e21fa0837bcd9e4a29049a2a071d8fb4f6c3a4c8a33ceba646c4",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_360.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "02e0f4ba374c4cdab915da66b9b1d9c1cfceee9a86735d445cb0650495e3a197",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_40.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "04458532791b1507fffcea171799a2751923bc2fa2acb8ef8f256de25ede50ff",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_80.hdf5",
+      "split": "train",
+      "size_bytes": 21181261748,
+      "sha256": "cf5c34cd2cf0815d33709fb7887e0f941d779565e3e4518fef55552fb5204963",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_0.hdf5",
+      "split": "valid",
+      "size_bytes": 21181261748,
+      "sha256": "055fa5b5764ebb1783a6f20fa039300479c375361438cf5f3fefacc192ac33b1",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.13_C3H8_16_chunk_40.hdf5",
+      "split": "valid",
+      "size_bytes": 5295335348,
+      "sha256": "826123fb8d4e6a093a36160a42a2c4846741c9d7a677e2d6aeb6cad26b72b896",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_0.hdf5",
+      "split": "valid",
+      "size_bytes": 21181261748,
+      "sha256": "79674d23de2476328d0b26183d6407e7d6568c9c177c262fbf02273cd8bc8c93",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.22_C2H6_15_chunk_40.hdf5",
+      "split": "valid",
+      "size_bytes": 5295335348,
+      "sha256": "4a86d02cf143a86c4e55bfc8314f7ef4dd1f448676ada6c8e835afca534d2198",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_0.hdf5",
+      "split": "valid",
+      "size_bytes": 21181261748,
+      "sha256": "cd31bb59ee0e41556e65ce1ef5c2dab3cf49b20eaae4eeb355d9ec231e5e5a5b",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.33_H2O_20_chunk_40.hdf5",
+      "split": "valid",
+      "size_bytes": 5295335348,
+      "sha256": "982bcac7fb6e1e3b90e6029498bdce80e85a8a14c6a0cb4aee3403683fb91e94",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_0.hdf5",
+      "split": "valid",
+      "size_bytes": 21181261748,
+      "sha256": "3c6d15b37d70c541f89216a79215420e9665ea6da595957ac35c231dd702a8a8",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.365_Dry_air_1000_chunk_40.hdf5",
+      "split": "valid",
+      "size_bytes": 5295335348,
+      "sha256": "2b71e4d52e342783237d0b85c9b475bf2f58c55ad92292fcaf20e09820f9bf2d",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_0.hdf5",
+      "split": "valid",
+      "size_bytes": 21181261748,
+      "sha256": "11a53bf6222e31ca5ea40e9a2906c03b03a8c24e64bce52da8457dbb645f48a1",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.3_CO2_20_chunk_40.hdf5",
+      "split": "valid",
+      "size_bytes": 5295335348,
+      "sha256": "e139f805c606bcf471d6c1eafa006d9df71967cc3b4677e8de0ca8b4274967ba",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_0.hdf5",
+      "split": "valid",
+      "size_bytes": 21181261748,
+      "sha256": "b9c806a8b95031dcd85ca64c6b01e262ca0eb981526fe46cb36827e7a60a9917",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.404_H2_100_Dry_air_-15_chunk_40.hdf5",
+      "split": "valid",
+      "size_bytes": 5295335348,
+      "sha256": "4f161569e87ec84e1ea2443eea492b30336afe08cdffe00d93da5a57ca0b5191",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_0.hdf5",
+      "split": "valid",
+      "size_bytes": 21181261748,
+      "sha256": "2881f05abfb7090cec0cf7ebd09555412eb9ca533d80a7564e507b60f1e35820",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.453_H2_-76_chunk_40.hdf5",
+      "split": "valid",
+      "size_bytes": 5295335348,
+      "sha256": "6e2033d04c5e4fc7a4a9f415cb86966dc2b716882036176c159dbb52450f99ef",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_0.hdf5",
+      "split": "valid",
+      "size_bytes": 21181261748,
+      "sha256": "d481364f6f46659871a3bcbcec45c3d32f4b0d1edd095b2e0b1198e695517cf0",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20_chunk_40.hdf5",
+      "split": "valid",
+      "size_bytes": 5295335348,
+      "sha256": "983ecbd42f38261dcbc638581275adfbbb9bb872b25ffe37f1adc1a2ae8137f5",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_0.hdf5",
+      "split": "valid",
+      "size_bytes": 21181261748,
+      "sha256": "560f0b9ea1fb0ac3bc874a4cdab3129f4717116d5806a77a06934845d89e2eb1",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.597_H2_-181_chunk_40.hdf5",
+      "split": "valid",
+      "size_bytes": 5295335348,
+      "sha256": "5fb6964bcd3fa292a18bb176bcc9adde41c7d347d3bd0df8fafd533a4fea2dfd",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_0.hdf5",
+      "split": "valid",
+      "size_bytes": 21181261748,
+      "sha256": "6a54e18ae8a1821dc42158236f9074157d7ebc82a65e6977a2e30a6bbdad3cfb",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/euler_multi_quadrants_openBC_gamma_1.76_Ar_-180_chunk_40.hdf5",
+      "split": "valid",
+      "size_bytes": 5295335348,
+      "sha256": "dfa5d33d73794e949e44cc32c1bc0f7c271f33d830b76fc7adee6ec51572a08d",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "euler_multi_quadrants_openBC.yaml",
+      "split": null,
+      "size_bytes": 509,
+      "sha256": null,
+      "git_blob_sha1": "af875b44177edeb34c878be6cdd1b6277a7b9806"
+    },
+    {
+      "path": "full_stats.yaml",
+      "split": null,
+      "size_bytes": 974,
+      "sha256": null,
+      "git_blob_sha1": "84c10b272ea1659275d8fd89406de6602444b954"
+    },
+    {
+      "path": "stats.yaml",
+      "split": null,
+      "size_bytes": 576,
+      "sha256": null,
+      "git_blob_sha1": "9703d1763321350d085dbdd53c7dfce7f2ae645e"
+    }
+  ],
+  "excluded_files": [
+    {
+      "path": "gif/density_normalized.gif",
+      "reason": "auxiliary_visualization_or_non_source_asset"
+    },
+    {
+      "path": "visualization_euler_multi_quadrants_openBC.ipynb",
+      "reason": "auxiliary_visualization_or_non_source_asset"
+    }
+  ]
+}
