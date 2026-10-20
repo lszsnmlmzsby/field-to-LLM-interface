@@ -298,7 +298,31 @@ def _blocks(dataset, prefix=(), max_bytes=64 * 1024**2):
             yield from _blocks(dataset, prefix + (index,), max_bytes)
 
 
-def inspect_hdf5(path, dataset_name=None):
+def _euler_trajectory_count(handle):
+    """Resolve the published openBC negative-count defect from all stored fields.
+
+    Caller must first verify the publisher's full-file SHA256. This only resolves
+    the root count; normal coordinate, shape and full-value checks still follow.
+    """
+    counts = {}
+    for rank in range(3):
+        group = handle.get(f"t{rank}_fields")
+        if group is None:
+            continue
+        for ds in group.values():
+            if not isinstance(ds, h5py.Dataset):
+                raise ValueError(f"Non-dataset field: {ds.name}")
+            if _boolean(ds.attrs, "sample_varying"):
+                if not ds.shape or ds.shape[0] < 1:
+                    raise ValueError(f"Empty sample axis: {ds.name}")
+                counts[ds.name.lstrip("/")] = int(ds.shape[0])
+    required = {"t0_fields/density", "t0_fields/energy", "t0_fields/pressure", "t1_fields/momentum"}
+    if not required.issubset(counts) or len(set(counts.values())) != 1:
+        raise ValueError(f"Cannot resolve Euler trajectory count: inconsistent/missing field sample axes {counts}")
+    return next(iter(counts.values())), counts
+
+
+def inspect_hdf5(path, dataset_name=None, *, publisher_sha256_verified=False):
     """Scan every field value; retain actual axis/field layout, no fixed key guesses.
 
     Full-trajectory and first-state digests are for duplicate detection. They
@@ -313,10 +337,20 @@ def inspect_hdf5(path, dataset_name=None):
         if int(handle.attrs["n_spatial_dims"]) != 2 or _text(handle.attrs["grid_type"]) != "cartesian":
             raise ValueError("This experiment requires 2D Cartesian sources")
         n = int(handle.attrs["n_trajectories"])
+        corrections = []
+        if n < 0 and name == "euler_multi_quadrants_openBC" and publisher_sha256_verified:
+            actual_n, field_counts = _euler_trajectory_count(handle)
+            corrections.append({"attribute": "n_trajectories", "declared": n, "effective": actual_n,
+                                "policy": "publisher_sha256_verified_euler_negative_count_v1",
+                                "field_sample_counts": field_counts})
+            n = actual_n
         dims = handle["dimensions"]
         axes = [_text(value) for value in dims.attrs["spatial_dims"]]
         if n < 1 or len(axes) != 2 or len(set(axes)) != 2:
-            raise ValueError("Invalid trajectory/spatial axis metadata")
+            raise ValueError(
+                f"Invalid trajectory/spatial axis metadata in {path}: "
+                f"n_trajectories={handle.attrs['n_trajectories']!r}, "
+                f"spatial_dims={dims.attrs['spatial_dims']!r}")
         spatial_shape = [int(dims[axis].shape[-1]) for axis in axes]
         steps = int(dims["time"].shape[-1])
         if min(spatial_shape + [steps]) < 1:
@@ -384,11 +418,14 @@ def inspect_hdf5(path, dataset_name=None):
                 print(f"complete_field_scan={key} values={total}", flush=True)
         if not fields or not any(f["time_varying"] for f in fields):
             raise ValueError("No dynamic solution fields found")
+        if corrections:
+            print(json.dumps({"metadata_corrections": corrections, "file": str(path)}), flush=True)
         return {"dataset_name": name, "n_trajectories": n, "time_steps": steps,
                 "spatial_dims": axes, "spatial_shape": spatial_shape, "fields": fields,
                 "finite_values_scanned": counts,
                 "trajectory_sha256": [d.hexdigest() for d in trajectory_digests],
-                "initial_state_sha256": [d.hexdigest() for d in initial_digests]}
+                "initial_state_sha256": [d.hexdigest() for d in initial_digests],
+                **({"metadata_corrections": corrections} if corrections else {})}
 
 
 def hash_file(path, *, git_blob=False):
@@ -413,7 +450,13 @@ def verify_file(path, entry, dataset_name):
         raise ValueError(f"Publisher SHA256 mismatch: {path}; preserve/quarantine this file before retry")
     if entry.get("git_blob_sha1") and blob != entry["git_blob_sha1"]:
         raise ValueError(f"Publisher Git blob checksum mismatch: {path}")
-    layout = inspect_hdf5(path, dataset_name) if entry["split"] else None
+    try:
+        layout = inspect_hdf5(path, dataset_name, publisher_sha256_verified=bool(entry.get("sha256"))) if entry["split"] else None
+    except (ValueError, KeyError, OSError, TypeError) as exc:
+        checksum_status = ("publisher checksum passed" if entry.get("sha256") or entry.get("git_blob_sha1")
+                           else "byte count checked; no publisher checksum available")
+        raise ValueError(f"HDF5 verification failed for {path} ({checksum_status}): {exc}. "
+                         "Existing file preserved; do not delete or bypass validation.") from exc
     after = path.stat()
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         raise ValueError(f"Source changed during verification: {path}")

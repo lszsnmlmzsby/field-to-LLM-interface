@@ -88,6 +88,14 @@ python -u scripts/download_the_well.py \
 
 三个 HF 源按发布者 LFS SHA256 校验，每个完整来源最终生成 `source_verified.json`。
 
+若 Euler openBC 报 `n_trajectories=-1550`，而数组轨迹轴一致为 10，这是已观察到的
+发布文件元数据错误。将支持 `publisher_sha256_verified_euler_negative_count_v1` 的
+本次代码同步到服务器后，重跑上面的下载命令即可。已完整下载的 `.part` 会重新核对
+发布者 SHA256、实际布局并全量扫描，通过后自动改为正式文件名；不重新传输完整文件，
+也不修改 HDF5 属性。已验证文件继续复用收据。日志及每文件/最终验证记录的
+`metadata_corrections` 保存声明与有效轨迹数。若字段间轨迹数不一致或其他校验失败，
+仍保留文件并报错；不要手工改属性或跳过该分片。此兼容不改变完整源范围或 QA 预算。
+
 需要重新逐字节检查这三份已下载来源时：
 
 ```bash

@@ -126,6 +126,138 @@ def test_layout_rejects_false_time_metadata(tmp_path):
         source.inspect_hdf5(path)
 
 
+@pytest.mark.parametrize("bad_count,bad_axes", [(0, False), (2, True)])
+def test_verified_bytes_with_invalid_metadata_report_file_and_preserve_source(tmp_path, bad_count, bad_axes):
+    path = tmp_path / "tail.hdf5.part"
+    make_hdf5(path)
+    with h5py.File(path, "r+") as f:
+        f.attrs["n_trajectories"] = bad_count
+        if bad_axes:
+            f["dimensions"].attrs["spatial_dims"] = ["x", "x"]
+    original = path.read_bytes()
+    entry = {"path": "data/test/tail.hdf5", "split": "test", "size_bytes": len(original),
+             "sha256": hashlib.sha256(original).hexdigest(), "git_blob_sha1": None}
+    with pytest.raises(ValueError) as error:
+        source.verify_file(path, entry, DATASET)
+    message = str(error.value)
+    assert str(path) in message and "publisher checksum passed" in message
+    assert "n_trajectories=" in message and "spatial_dims=" in message
+    assert path.read_bytes() == original
+    assert not path.with_suffix("").exists()
+
+
+EULER = "euler_multi_quadrants_openBC"
+
+
+def make_euler_tail(path, *, offset=0, declared=-1550, momentum_count=10):
+    """Tiny spatial/time axes, but the observed ten-trajectory tail and bad attr."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "w") as f:
+        f.attrs.update(dataset_name=EULER, n_spatial_dims=2, grid_type="cartesian",
+                       n_trajectories=declared)
+        dims = f.create_group("dimensions")
+        dims.attrs["spatial_dims"] = ["x", "y"]
+        for name, size in (("x", 3), ("y", 4), ("time", 5)):
+            dims.create_dataset(name, data=np.arange(size, dtype="float32"))
+        for rank, names in ((0, ["density", "energy", "pressure"]), (1, ["momentum"])):
+            group = f.create_group(f"t{rank}_fields")
+            group.attrs["field_names"] = names
+            for name in names:
+                shape = (momentum_count if rank else 10, 5, 3, 4) + ((2,) if rank else ())
+                ds = group.create_dataset(name, data=np.arange(np.prod(shape), dtype="float32").reshape(shape) + offset)
+                ds.attrs.update(sample_varying=True, time_varying=True, dim_varying=[True, True])
+
+
+def euler_entry(path, split="test"):
+    return {"path": f"data/{split}/tail.hdf5", "split": split, "size_bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "git_blob_sha1": None}
+
+
+def test_euler_tail_resume_records_actual_count_without_changing_source(tmp_path, monkeypatch):
+    siblings = []
+    for index, split in enumerate(source.SPLITS):
+        partial = tmp_path / f"data/{split}/tail.hdf5.part"
+        make_euler_tail(partial, offset=index * 10000)
+        siblings.append(metadata(f"data/{split}/tail.hdf5", path=partial))
+    manifest = source.manifest_from_info(EULER, {"sha": "b" * 40, "siblings": siblings})
+    source.atomic_json(tmp_path / source.MANIFEST_NAME, manifest)
+    monkeypatch.setattr(source.subprocess, "run", lambda *a, **k: pytest.fail("complete partial must not transfer"))
+    records = []
+    for entry in manifest["files"]:
+        target = tmp_path / entry["path"]
+        partial = target.with_name(target.name + ".part")
+        original = partial.read_bytes()
+        record = source.materialize_file(tmp_path, manifest, entry, "https://hf-mirror.com")
+        assert target.read_bytes() == original and not partial.exists()
+        assert record["sha256"] == entry["sha256"]
+        layout = record["layout"]
+        assert layout["n_trajectories"] == 10
+        assert len(layout["trajectory_sha256"]) == len(layout["initial_state_sha256"]) == 10
+        assert layout["finite_values_scanned"] == {
+            "t0_fields/density": 600, "t0_fields/energy": 600,
+            "t0_fields/pressure": 600, "t1_fields/momentum": 1200}
+        correction, = layout["metadata_corrections"]
+        assert correction["declared"] == -1550 and correction["effective"] == 10
+        assert set(correction["field_sample_counts"].values()) == {10}
+        with h5py.File(target, "r") as f:
+            assert f.attrs["n_trajectories"] == -1550
+        records.append(record)
+    receipt = source.finalize_receipt(tmp_path, manifest, records)
+    assert receipt["split_trajectory_counts"] == {split: 10 for split in source.SPLITS}
+    assert source.verify_dataset_receipt(tmp_path, rehash=True) == receipt
+    monkeypatch.setattr(source, "verify_file", lambda *a, **k: pytest.fail("unchanged verified file must reuse receipt"))
+    for entry, record in zip(manifest["files"], records):
+        assert source.materialize_file(tmp_path, manifest, entry, "https://hf-mirror.com") == record
+
+
+@pytest.mark.parametrize("defect,match", [
+    ("inconsistent_count", "inconsistent/missing"),
+    ("zero_count", "trajectory/spatial"),
+    ("positive_wrong_count", "shape/attribute"),
+    ("missing_field", "inconsistent/missing"),
+    ("nonfinite_last_value", "Nonfinite"),
+    ("bad_axes", "trajectory/spatial"),
+    ("wrong_publisher_checksum", "Publisher SHA256 mismatch"),
+    ("no_publisher_checksum", "trajectory/spatial"),
+    ("other_dataset", "trajectory/spatial"),
+])
+def test_euler_negative_count_exception_keeps_integrity_checks(tmp_path, defect, match):
+    path = tmp_path / "tail.hdf5.part"
+    make_euler_tail(path, momentum_count=9 if defect == "inconsistent_count" else 10)
+    name = EULER
+    with h5py.File(path, "r+") as f:
+        if defect == "zero_count":
+            f.attrs["n_trajectories"] = 0
+        elif defect == "positive_wrong_count":
+            f.attrs["n_trajectories"] = 11
+        elif defect == "missing_field":
+            del f["t0_fields/energy"]
+        elif defect == "nonfinite_last_value":
+            f["t1_fields/momentum"][-1, -1, -1, -1, -1] = np.nan
+        elif defect == "bad_axes":
+            f["dimensions"].attrs["spatial_dims"] = ["x", "x"]
+        elif defect == "other_dataset":
+            name = DATASET
+            f.attrs["dataset_name"] = name
+    entry = euler_entry(path)
+    if defect == "wrong_publisher_checksum":
+        entry["sha256"] = "0" * 64
+    elif defect == "no_publisher_checksum":
+        entry["sha256"] = None
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match=match):
+        source.verify_file(path, entry, name)
+    assert path.read_bytes() == original
+    assert not path.with_suffix("").exists()
+
+
+def test_unverified_euler_inspection_does_not_override_negative_attribute(tmp_path):
+    path = tmp_path / "tail.hdf5"
+    make_euler_tail(path)
+    with pytest.raises(ValueError, match="trajectory/spatial"):
+        source.inspect_hdf5(path, EULER)
+
+
 def test_complete_receipt_rejects_missing_modified_files_and_rehashes(tmp_path):
     manifest, records = complete_source(tmp_path)
     with pytest.raises(ValueError, match="partial"):

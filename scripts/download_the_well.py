@@ -91,7 +91,16 @@ def main():
                        for entry in manifest["files"]}
             try:
                 for future in concurrent.futures.as_completed(futures):
-                    record = future.result()
+                    try:
+                        record = future.result()
+                    except Exception as exc:
+                        # Print before the executor waits for other active files,
+                        # so their progress cannot hide which file actually failed.
+                        print(json.dumps({"dataset": dataset,
+                                          "failed_file": futures[future]["path"],
+                                          "error": str(exc), "existing_files_preserved": True}),
+                              file=sys.stderr, flush=True)
+                        raise
                     records.append(record)
                     print(json.dumps({"verified_file": record["path"],
                                       "completed": len(records), "total": len(futures)}), flush=True)
