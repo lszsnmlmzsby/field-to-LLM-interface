@@ -47,6 +47,13 @@ download providers and checksum limitations. Euler periodicBC remains an optiona
 download supported by the tools but is excluded from this experiment. This
 experiment adds no IID fields.
 
+The [multi-source capability v2 runbook](MULTISOURCE_V2_RUNBOOK.md) keeps these
+complete sources and two epochs while increasing the crop budget to 425,984,
+with an explicit 262,144-crop Euler allocation. Its 14 executable query types,
+held-out language families, and separate paired-language / changed-field /
+disabled-field diagnostics use a new configuration and independent QA/run paths.
+The original multi-source configuration remains available for reproduction.
+
 ## Method
 
 The paper pipeline has two training stages:

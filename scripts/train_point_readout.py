@@ -24,10 +24,13 @@ for path in (ROOT, ROOT / "src"):
 
 from scripts import train_tensor_qwen_cross_attention as core
 from tensor_compression.downstream.point_readout import (
-    FORMAT, PROMPT_VERSION, build_prompt, json_hash, score_answer, summarize_evaluation,
+    FORMAT, PROMPT_VERSION, build_prompt, json_hash, score_answer,
 )
 from tensor_compression.downstream.point_readout_data import (
     PointReadoutDataset, load_config, resolve_path, source_path, write_json,
+)
+from tensor_compression.downstream.readout_evaluation import (
+    FieldPairDataset, evaluation_annotations, summarize_readout_evaluation, zero_baseline_metrics,
 )
 
 CHECKPOINT_TYPE = "qwen_standardized_field_qa_v2"
@@ -150,6 +153,22 @@ class TrainingTokenCache:
             self.entries[key] = packed, cost
             self.bytes += cost
         return packed
+
+
+def preflight_token_budgets(records, tokenizer, training, *, token_cache=None, split="unknown"):
+    """Check every prompt and answer without loading language-model weights."""
+    report = {"questions": 0, "max_prompt_tokens_observed": 0, "max_target_tokens_observed": 0,
+              "prompt_limit": int(training["max_prompt_tokens"]),
+              "target_limit_including_eos": int(training["max_target_tokens"])}
+    for index, row in enumerate(records):
+        prompt, answer = (token_cache.get(row, tokenizer, training) if token_cache is not None else
+                          encode_training_record(row, tokenizer, training))
+        report["questions"] += 1
+        report["max_prompt_tokens_observed"] = max(report["max_prompt_tokens_observed"], len(prompt))
+        report["max_target_tokens_observed"] = max(report["max_target_tokens_observed"], len(answer))
+        if (index + 1) % 100000 == 0:
+            print(f"token_preflight split={split} checked={index + 1}/{len(records)}", flush=True)
+    return report
 
 
 def training_tensors(records, tokenizer, training, *, token_cache=None):
@@ -303,7 +322,10 @@ def prepare_output_directory(path, *, resume=False, overwrite=False):
 
 
 @torch.inference_mode()
-def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_path, *, verbose=False):
+def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_path, *,
+             verbose=False, input_mode="correct"):
+    if input_mode not in ("correct", "disabled"):
+        raise ValueError("Evaluation input_mode must be correct or disabled")
     core.set_frozen_llm_execution_mode(llm, checkpoint_training=False)
     sidecar.eval()
     if device.type == "cuda":
@@ -320,11 +342,18 @@ def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_pat
     # unchanged, including when one state appears in disjoint runs of records.
     sidecar.clear()
     try:
+        if input_mode == "disabled":
+            # no_tensor disables each bridge entirely; zero-valued field inputs
+            # would still pass through learned encoders and are a different test.
+            sidecar.bind(None, mode="no_tensor")
         with output_path.open("w", encoding="utf-8", newline="\n") as handle:
             for index in range(len(dataset)):
-                row, field = dataset[index]
+                if input_mode == "disabled":
+                    row, field = dataset.records[index], None
+                else:
+                    row, field = dataset[index]
                 prompt = encode_prompt(row, tokenizer, int(config["training"]["max_prompt_tokens"]))
-                if not reuse_memory or active_state != row["state_ref"]:
+                if input_mode == "correct" and (not reuse_memory or active_state != row["state_ref"]):
                     sidecar.clear()
                     with core.autocast_context(device, dtype):
                         sidecar.bind(field.unsqueeze(0).to(device), mode="correct")
@@ -340,8 +369,11 @@ def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_pat
                          "shape": "x".join(map(str, row["grid_shape"])),
                          "field_tokens": math.prod((n + p - 1) // p for n, p in
                                                    zip(row["grid_shape"], sidecar.memory.block_shape)),
-                         "field": state["field"], **prediction, "score": score}
-                entry.update({key: state[key] for key in ("source_id", "family", "is_static", "is_constant") if key in state})
+                         "block_shape": list(sidecar.memory.block_shape),
+                         "input_mode": input_mode,
+                         "field": state["field"], **prediction, "score": score,
+                         **evaluation_annotations(row, sidecar.memory.block_shape)}
+                entry.update({key: state[key] for key in ("source_id", "family", "is_static", "is_constant", "roughness_bin") if key in state})
                 scored.append(entry)
                 handle.write(json.dumps(entry, allow_nan=False) + "\n")
                 if verbose and (index + 1) % 100 == 0:
@@ -350,12 +382,18 @@ def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_pat
         sidecar.clear()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-    metrics = summarize_evaluation(scored, dataset.metadata["train_shapes"])
+    metrics = summarize_readout_evaluation(scored, dataset.metadata["train_shapes"])
+    metrics["zero_value_baseline"] = zero_baseline_metrics(dataset.records, dataset.states)
+    suite = getattr(dataset, "suite", "main")
+    metrics.update(input_mode=input_mode, diagnostic_only=input_mode != "correct" or suite != "main",
+                   evaluation_suite=suite)
+    if hasattr(dataset, "selection"):
+        metrics["field_pair_selection"] = dataset.selection
     metrics.update(elapsed_seconds=time.perf_counter() - start,
                    peak_allocated_gib=torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None,
                    generated_tokens=sum(row["generated_tokens"] for row in scored),
                    field_memory_encodes=field_encodes,
-                   field_memory_reuses=len(scored) - field_encodes)
+                   field_memory_reuses=len(scored) - field_encodes if input_mode == "correct" else 0)
     return metrics
 
 
@@ -456,14 +494,20 @@ def planned_updates(records, training, seed):
     return math.ceil(count * training["epochs"] / training["gradient_accumulation_steps"])
 
 
-def check_geometry(llm, sidecar, tokenizer, dataset, device, dtype, config):
-    """Stress each boundary at the requested batch size, without optimizer updates."""
-    rows = dataset.records
+def geometry_probe_indices(rows):
+    """One deterministic example for each of the existing four geometry extrema."""
+    if not rows:
+        raise ValueError("Geometry checks require nonempty training records")
     criteria = [lambda r: math.prod(r["grid_shape"]),
                 lambda r: (-r["grid_shape"][0], r["grid_shape"][1]),
                 lambda r: (-r["grid_shape"][1], r["grid_shape"][0]),
                 lambda r: -math.prod(r["grid_shape"])]
-    indices = list(dict.fromkeys(max(range(len(rows)), key=lambda i: key(rows[i])) for key in criteria))
+    return list(dict.fromkeys(max(range(len(rows)), key=lambda i: key(rows[i])) for key in criteria))
+
+
+def check_geometry(llm, sidecar, tokenizer, dataset, device, dtype, config):
+    """Stress each boundary at the requested batch size, without optimizer updates."""
+    indices = geometry_probe_indices(dataset.records)
     report = []
     batch_size = config["training"]["batch_size"]
     sidecar.train()
@@ -520,8 +564,18 @@ def main():
     parser.add_argument("--device", default="auto")
     parser.add_argument("--resume", help="Strict resume from this numerical-generation experiment")
     parser.add_argument("--evaluate-only", action="store_true")
+    parser.add_argument("--eval-suite", choices=("main", "language", "field-pairs"), default="main",
+                        help="Diagnostic pairs are explicit evaluations, never periodic training validation")
+    parser.add_argument("--diagnostic-pairs", type=int, default=128,
+                        help="Maximum accepted matched-query field pairs (default: 128)")
+    parser.add_argument("--diagnostic-max-candidates", type=int, default=4096,
+                        help="Maximum alternative-field candidates read for field pairs (default: 4096)")
+    parser.add_argument("--input-mode", choices=("correct", "disabled"), default="correct",
+                        help="disabled is an evaluation-only diagnostic that disables field cross-attention")
     parser.add_argument("--split", choices=("val", "test"), default="val")
     parser.add_argument("--audit-only", action="store_true", help="Replay data without loading Qwen")
+    parser.add_argument("--token-check-only", action="store_true",
+                        help="Audit and tokenize every main train/val/test row, then exit before loading Qwen weights")
     parser.add_argument("--geometry-check-only", action="store_true",
                         help="Load real Qwen and check boundary-shape forward/backward; no training updates")
     parser.add_argument("--stop-after-updates", type=int, help="Save and stop after N additional updates; preserves the full resume schedule")
@@ -529,19 +583,28 @@ def main():
     parser.add_argument("--console-every-updates", type=int, default=200,
                         help="Console cadence only; detailed train.jsonl stays unchanged (default: 200)")
     cli = parser.parse_args()
-    if cli.overwrite_output_dir and (cli.resume or cli.evaluate_only or cli.audit_only or cli.geometry_check_only):
+    if cli.overwrite_output_dir and (cli.resume or cli.evaluate_only or cli.audit_only or cli.geometry_check_only or cli.token_check_only):
         parser.error("--overwrite-output-dir is only for fresh training")
+    if cli.token_check_only and (cli.resume or cli.evaluate_only or cli.audit_only or cli.geometry_check_only
+                                or cli.eval_suite != "main" or cli.input_mode != "correct" or cli.stop_after_updates):
+        parser.error("--token-check-only checks all main splits and cannot combine with another action or diagnostic suite")
     if cli.geometry_check_only and (cli.audit_only or cli.evaluate_only or cli.resume):
         parser.error("--geometry-check-only requires a fresh run and cannot be combined with audit/evaluation/resume")
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("This workstation entry point is single-device; use python, not multi-rank torchrun")
     if cli.evaluate_only and not cli.resume:
         parser.error("--evaluate-only requires --resume")
+    if (cli.eval_suite != "main" or cli.input_mode != "correct") and not cli.evaluate_only:
+        parser.error("Diagnostic --eval-suite and --input-mode disabled require --evaluate-only")
+    if cli.diagnostic_pairs <= 0 or cli.diagnostic_max_candidates <= 0:
+        parser.error("Diagnostic pair and candidate limits must be positive")
+    if cli.eval_suite != "field-pairs" and (cli.diagnostic_pairs != 128 or cli.diagnostic_max_candidates != 4096):
+        parser.error("Diagnostic pair limits apply only to --eval-suite field-pairs")
     if cli.stop_after_updates is not None and cli.stop_after_updates <= 0:
         parser.error("--stop-after-updates must be positive")
     if cli.console_every_updates <= 0:
         parser.error("--console-every-updates must be positive")
-    if cli.split == "test" and not (cli.evaluate_only or cli.audit_only):
+    if cli.split == "test" and not (cli.evaluate_only or cli.audit_only or cli.token_check_only):
         parser.error("The test split is accessible only through explicit evaluation/audit")
     config = load_config(cli.config, cli.profile)
     for key in ("batch_size", "gradient_accumulation_steps", "epochs", "save_every_updates", "eval_every_updates"):
@@ -561,6 +624,7 @@ def main():
                                       resume=bool(cli.resume and not cli.evaluate_only),
                                       overwrite=cli.overwrite_output_dir)
     datasets = {}
+    geometry_original_records = {}
     stop_requested = False
     def request_stop(signum, frame):
         nonlocal stop_requested
@@ -569,12 +633,46 @@ def main():
     previous_handlers = {}
     try:
         splits = [cli.split] if cli.evaluate_only else ["train", "val"]
-        if cli.audit_only:
+        if cli.geometry_check_only:
+            splits = ["train"]
+        if cli.audit_only or cli.token_check_only:
             splits = ["train", "val", "test"]
         for split in splits:
-            dataset = PointReadoutDataset(qa_dir, hdf5_path, split, cache_size=int(config["data"].get("input_cache_size", 8)))
+            suite_options = {"suite": cli.eval_suite} if cli.eval_suite == "language" else {}
+            dataset = PointReadoutDataset(qa_dir, hdf5_path, split,
+                cache_size=int(config["data"].get("input_cache_size", 8)), **suite_options)
             datasets[split] = dataset
-            print(f"data_audit split={split} {dataset.audit()}", flush=True)
+            if cli.geometry_check_only:
+                original_records = dataset.records
+                probe_indices = geometry_probe_indices(original_records)
+                geometry_original_records[split] = original_records
+                dataset.records = [original_records[index] for index in probe_indices]
+                write_json(output / "geometry_preflight_scope.json", {
+                    "scope": "geometry_boundary_probes_only", "full_dataset_audited": False,
+                    "optimizer_updates": 0, "dataset_identity": dataset.identity,
+                    "loaded_splits": ["train"], "total_train_questions": len(original_records),
+                    "checked_questions": len(dataset.records), "selected_indices": probe_indices,
+                    "qa_ids": [row["qa_id"] for row in dataset.records],
+                    "grid_shapes": [row["grid_shape"] for row in dataset.records],
+                    "selection_criteria": ["maximum_area", "minimum_height_then_maximum_width",
+                                           "minimum_width_then_maximum_height", "minimum_area"],
+                    "limitation": "Only selected geometry probes are audited/tokenized; use token-check-only for all main splits"})
+            audit_name = "geometry_data_audit" if cli.geometry_check_only else "data_audit"
+            print(f"{audit_name} split={split} {dataset.audit()}", flush=True)
+            if cli.eval_suite == "field-pairs":
+                paired = FieldPairDataset(dataset, max_pairs=cli.diagnostic_pairs,
+                    max_candidates=cli.diagnostic_max_candidates, seed=int(config["runtime"]["seed"]))
+                datasets[split] = paired
+                write_json(output / "field_pair_selection.json", paired.selection)
+                with (output / "field_pair_queries.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
+                    for row in paired.records:
+                        handle.write(json.dumps(row, allow_nan=False) + "\n")
+                print("field_pair_selection=" + json.dumps(paired.selection), flush=True)
+                if not paired.records:
+                    write_json(output / f"{split}_metrics.json", {"status": "unavailable",
+                        "diagnostic_only": True, "evaluation_suite": "field-pairs",
+                        "field_pair_selection": paired.selection})
+                    return
         if cli.audit_only:
             write_json(output / "data_audit.json", {s: {"questions": len(d), "identity": d.identity}
                                                     for s, d in datasets.items()})
@@ -596,14 +694,15 @@ def main():
         token_cache = TrainingTokenCache(tokenizer, config["training"],
             max_bytes=int(config["runtime"].get("token_cache_bytes", 256 * 2**20)),
             max_entries=int(config["runtime"].get("token_cache_entries", 262144)))
+        token_reports = {}
         for split, d in datasets.items():
             print(f"token_preflight split={split} questions={len(d.records)}", flush=True)
-            for index, row in enumerate(d.records):
-                # Validate native template boundaries and all token budgets once,
-                # without allocating padded tensors for every preflight record.
-                token_cache.get(row, tokenizer, config["training"])
-                if (index + 1) % 100000 == 0:
-                    print(f"token_preflight split={split} checked={index + 1}/{len(d.records)}", flush=True)
+            token_reports[split] = preflight_token_budgets(d.records, tokenizer, config["training"],
+                                                          token_cache=token_cache, split=split)
+        write_json(output / "token_preflight.json", token_reports)
+        if cli.token_check_only:
+            print("token_check_complete=" + json.dumps(token_reports), flush=True)
+            return
         llm, dtype = core.load_llm_with_bounded_host_memory(args, device)
         core.seed_everything(args.seed)
         encoder, spatial, _, _ = core.build_scratch_memory_components(args, (1, args.patch_size, args.patch_size))
@@ -626,8 +725,12 @@ def main():
             return
         if cli.evaluate_only:
             metrics = evaluate(llm, sidecar, tokenizer, datasets[cli.split], device, dtype, config,
-                               output / f"{cli.split}_predictions.jsonl", verbose=cli.verbose)
+                               output / f"{cli.split}_predictions.jsonl", verbose=cli.verbose,
+                               input_mode=cli.input_mode)
             write_json(output / f"{cli.split}_metrics.json", metrics)
+            write_json(output / "evaluation_contract.json", {"checkpoint": str(Path(cli.resume).resolve()),
+                "split": cli.split, "suite": cli.eval_suite, "input_mode": cli.input_mode,
+                "diagnostic_only": cli.eval_suite != "main" or cli.input_mode != "correct"})
             print_metric_summary(cli.split, metrics)
             return
         optimizer, _ = core.build_optimizer(sidecar, args)
@@ -717,15 +820,18 @@ def main():
             core.set_frozen_llm_execution_mode(llm, checkpoint_training=True)
             sidecar.train()
             loss_value = 0.0
+            component_values = {"answer_ce": 0.0, "reconstruction": 0.0}
             for indices in micro_batches:
                 examples = [train_data[i] for i in indices]
                 records, fields = zip(*examples)
                 try:
-                    loss, _ = training_loss(llm, sidecar, tokenizer, records, torch.stack(fields), device, dtype,
-                                            training, token_cache=token_cache)
+                    loss, components = training_loss(llm, sidecar, tokenizer, records, torch.stack(fields), device, dtype,
+                                                     training, token_cache=token_cache)
                     weight = len(indices) / total_records
                     (loss * weight).backward()
                     loss_value += float(loss.detach()) * weight
+                    for key in component_values:
+                        component_values[key] += components[key] * weight
                 finally:
                     # Non-reentrant checkpointing can revisit bridges during backward.
                     sidecar.clear()
@@ -737,6 +843,10 @@ def main():
             log_to_console = log_to_file if cli.verbose else step == 1 or step % cli.console_every_updates == 0 or step == maximum
             if log_to_file or log_to_console:
                 entry = {"step": step, "loss": loss_value, "grad_norm": float(grad_norm),
+                         "answer_ce": component_values["answer_ce"],
+                         "value_reconstruction": component_values["reconstruction"],
+                         "value_reconstruction_weight": float(training.get("value_reconstruction_weight", .01)),
+                         "gate_values": sidecar.gate_values(),
                          "questions_in_update": total_records,
                          "micro_batch_sizes": [len(indices) for indices in micro_batches],
                          "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30
@@ -771,7 +881,9 @@ def main():
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
-        for d in datasets.values():
+        for split, d in datasets.items():
+            if split in geometry_original_records:
+                d.records = geometry_original_records[split]
             d.close()
 
 

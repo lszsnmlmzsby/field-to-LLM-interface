@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from tensor_compression.downstream.point_readout import TASKS
+from tensor_compression.downstream.field_query_program import PROGRAM_TASKS
 from tensor_compression.downstream.point_readout_data import build_dataset, load_config, resolve_path, source_path
 
 
@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--hdf5-path")
     parser.add_argument("--output-dir")
     parser.add_argument("--fields", nargs="+", help="HDF5 dataset keys sharing the same trajectory/time axes")
-    parser.add_argument("--tasks", nargs="+", choices=TASKS)
+    parser.add_argument("--tasks", nargs="+", choices=PROGRAM_TASKS)
     cli = parser.parse_args()
     config = load_config(cli.config, cli.profile)
     if cli.fields:

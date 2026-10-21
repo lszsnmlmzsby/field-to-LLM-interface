@@ -213,6 +213,10 @@ def make_record(state_ref: str, z: torch.Tensor, task: str, spec: Mapping, *,
 
 
 def validate_record(record: Mapping, z: torch.Tensor | None = None) -> None:
+    if "query_protocol" in record:
+        from .field_query_program import validate_program_record
+        validate_program_record(record, z)
+        return
     oracle = record["oracle"]
     if oracle["value_space"] != "stored_fp16_z":
         raise ValueError("Unexpected oracle value space")
@@ -283,7 +287,11 @@ def score_answer(record: Mapping, prediction: str, *, terminated: bool = True) -
     errors = [abs(a - b) for a, b in zip(values, expected)] if valid else []
     # A coordinate is one indivisible answer, never two approximately correct numbers.
     if coordinate_task:
-        hits = int(valid and values in record["oracle"]["valid_coordinates"])
+        if "query_protocol" in record:
+            from .field_query_program import coordinate_is_accepted
+            hits = int(valid and coordinate_is_accepted(record, values))
+        else:
+            hits = int(valid and values in record["oracle"]["valid_coordinates"])
         units = 1
         errors = []
     else:

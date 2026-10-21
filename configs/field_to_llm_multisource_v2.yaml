@@ -1,0 +1,176 @@
+# Complete sources; one immutable QA dataset shared by fresh 1x1 and 2x2 runs.
+# Expanded capability experiment: H,W=1..128; 425984 training crops; two epochs; no IID.
+# Current source budget: INS + acoustic + Euler openBC + Gray-Scott; no periodicBC.
+model:
+  name_or_path: Qwen/Qwen2.5-14B-Instruct
+  torch_dtype: bfloat16
+  trust_remote_code: false
+  gradient_checkpointing: true
+data:
+  patch_size: 16
+  input_cache_size: 256
+  sources:
+    - id: ins_tracer
+      family: ins_tracer
+      kind: ins_tracer
+      path: ${FIELD_TO_LLM_ROOT}/raw/ins_tracer/dedalus_v5.1_Baseline2D_INSTracer_icA_noP_db1_nu0.001D0.01_seed0.hdf5
+      fields: [sol/u, sol/v, sol/b]
+    - id: acoustic_scattering_inclusions
+      family: acoustic
+      kind: the_well
+      dataset: acoustic_scattering_inclusions
+      path: ${FIELD_TO_LLM_ROOT}/raw/the_well/acoustic_scattering_inclusions
+      fields: [t0_fields/pressure, t0_fields/density, t0_fields/speed_of_sound, t1_fields/velocity]
+    - id: euler_multi_quadrants_openBC
+      family: euler
+      kind: the_well
+      dataset: euler_multi_quadrants_openBC
+      path: ${FIELD_TO_LLM_ROOT}/raw/the_well/euler_multi_quadrants_openBC
+      fields: [t0_fields/density, t0_fields/pressure, t0_fields/energy, t1_fields/momentum]
+    - id: gray_scott_reaction_diffusion
+      family: gray_scott
+      kind: the_well
+      dataset: gray_scott_reaction_diffusion
+      path: ${FIELD_TO_LLM_ROOT}/raw/the_well/gray_scott_reaction_diffusion
+      fields: [t0_fields/A, t0_fields/B]
+  shape_sampling:
+    height: [1, 128]
+    width: [1, 128]
+    seed: 20261020
+    heldout_fraction: 0.2
+generation:
+  seed: 20261020
+  split_seed: 20260905
+  tasks: [single_point, multi_point, line_profile, region_values, region_mean, region_std, region_min, region_max, region_argmin, region_argmax, nearest_value_location, point_difference, region_mean_difference, threshold_fraction]
+  multi_counts: [2, 3, 4]
+  line_counts: [2, 3, 4, 5]
+  region_shapes: [[1, 1], [1, 2], [2, 1], [2, 2]]
+  statistic_region_shapes: [[1, 1], [1, 2], [2, 1], [2, 2], [4, 4]]
+  template_variants: [0, 1]  # Retained for the legacy protocol; program renderer uses named families.
+  query_program:
+    enabled: true
+    tasks_per_state: 11
+    read_count_max: 32
+    line_count_max: 32
+    region_value_max_cells: 32
+    statistic_max_cells: 4096
+    capability_weights:
+      readout: 4
+      localization: 3
+      aggregation: 2
+      composition: 1
+    diagnostic_states_per_source: 16
+  answer_decimals: 1
+  absolute_tolerance: 0.2
+  max_attempts_per_state: 200
+field_encoder:
+  normalization:
+    mode: zscore
+    scope: channel
+    stats_path: null
+    clip_min: null
+    clip_max: null
+  model:
+    name: conv_token_autoencoder_2d
+    input_size: [16, 16]
+    base_channels: 32
+    channel_multipliers: []
+    num_res_blocks: 1
+    latent_dim: 8
+    latent_grid: [16, 16]
+    preserve_input_channels: true
+    dropout: 0.0
+    norm: group
+    activation: gelu
+    output_activation: identity
+spatial_adapter:
+  type: full_grid_transformer
+  adapter_dim: 512
+  adapter_layers: 2
+  adapter_heads: 8
+  dropout: 0.0
+memory:
+  block_shape: [1, 1]
+  value_fourier_bands: 4
+  value_hidden_dim: 128
+cross_attention:
+  layers_1based: [8, 20, 32]
+  bridge_dim: 512
+  heads: 8
+  dropout: 0.0
+  gate_init: 0.0
+training:
+  epochs: 2
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  lr: 5.0e-5
+  gate_lr: 5.0e-4
+  weight_decay: 1.0e-4
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.2
+  grad_clip_norm: 1.0
+  value_reconstruction_weight: 0.01
+  max_prompt_tokens: 768
+  max_target_tokens: 256
+  log_interval: 20
+  save_every_updates: 2048
+  eval_every_updates: 8192
+evaluation:
+  max_new_tokens: 256
+  use_cache: true
+runtime:
+  seed: 42
+  # Compact token arrays plus conservative per-entry accounting. No model graphs.
+  token_cache_bytes: 2147483648
+  token_cache_entries: 2000000
+profiles:
+  smoke:
+    data:
+      qa_dir: ${FIELD_TO_LLM_ROOT}/data/multisource_openbc_v2/smoke
+      shape_sampling:
+        height: [1, 8]
+        width: [1, 8]
+    generation:
+      train_states: 160
+      eval_states: 320
+      # Small integration check, including the new program and task paths.
+      query_program:
+        tasks_per_state: 4
+        read_count_max: 8
+        line_count_max: 8
+        region_value_max_cells: 8
+        statistic_max_cells: 32
+        diagnostic_states_per_source: 2
+    training:
+      batch_size: 4
+      max_updates: 20
+      eval_every_updates: 20
+      save_every_updates: 10
+  pilot:
+    data:
+      qa_dir: ${FIELD_TO_LLM_ROOT}/data/multisource_openbc_v2/pilot
+    generation:
+      train_states: 6656
+      train_states_by_source:
+        ins_tracer: 512
+        acoustic_scattering_inclusions: 1024
+        euler_multi_quadrants_openBC: 4096
+        gray_scott_reaction_diffusion: 1024
+      eval_states: 1024
+    training:
+      max_updates: null
+      eval_every_updates: 2048
+      save_every_updates: 512
+  full:
+    data:
+      qa_dir: ${FIELD_TO_LLM_ROOT}/data/multisource_openbc_v2/full
+    generation:
+      train_states: 425984
+      train_states_by_source:
+        ins_tracer: 32768
+        acoustic_scattering_inclusions: 65536
+        euler_multi_quadrants_openBC: 262144
+        gray_scott_reaction_diffusion: 65536
+      eval_states: 2048
+    training:
+      max_updates: null

@@ -241,16 +241,18 @@ def build_dataset(config, hdf5_path, output_dir):
 class PointReadoutDataset:
     """Lazy raw-patch replay; metadata/oracles never become neural routing inputs."""
 
-    def __new__(cls, qa_dir, hdf5_path, split, cache_size=8):
+    def __new__(cls, qa_dir, hdf5_path, split, cache_size=8, *, suite="main"):
         metadata_path = Path(qa_dir) / "metadata.json"
         if cls is PointReadoutDataset and metadata_path.is_file():
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             if metadata.get("source", {}).get("kind") == "multisource":
                 from tensor_compression.downstream.multisource_readout_data import MultiSourcePointReadoutDataset
-                return MultiSourcePointReadoutDataset(qa_dir, split, cache_size=cache_size)
+                return MultiSourcePointReadoutDataset(qa_dir, split, cache_size=cache_size, suite=suite)
         return super().__new__(cls)
 
-    def __init__(self, qa_dir, hdf5_path, split, cache_size=8):
+    def __init__(self, qa_dir, hdf5_path, split, cache_size=8, *, suite="main"):
+        if suite != "main":
+            raise ValueError("Language diagnostics require a versioned multi-source dataset")
         if split not in ("train", "val", "test") or cache_size < 0:
             raise ValueError("Invalid split/cache size")
         self.qa_dir, self.hdf5_path = Path(qa_dir), Path(hdf5_path)

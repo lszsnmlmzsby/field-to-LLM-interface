@@ -1,5 +1,9 @@
 # 多来源二维场读数实验
 
+2026-10-21 的扩量、语言与任务能力实验使用独立 v2 配置，最新步骤见
+[MULTISOURCE_V2_RUNBOOK.md](MULTISOURCE_V2_RUNBOOK.md)。下文保留 v1 配额和命令，
+用于复现已有实验；不要将两版 QA 或 checkpoint 混用。
+
 本轮配置是 `configs/field_to_llm_multisource.yaml`。先把本次代码、配置及
 `configs/source_manifests/` 同步到服务器，再执行下面的命令。本文命令面向服务器的
 Bash；本地测试通过不代表已经在 A800 / Qwen 14B 上完成验证。
