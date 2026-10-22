@@ -1,9 +1,10 @@
-"""Single-device open numerical generation using the existing frozen-Qwen sidecar."""
+"""Single/multi-device numerical generation using the existing frozen-Qwen sidecar."""
 from __future__ import annotations
 
 import argparse
 from array import array
 import copy
+import gc
 import json
 import math
 import os
@@ -23,6 +24,10 @@ for path in (ROOT, ROOT / "src"):
     sys.path.insert(0, str(path))
 
 from scripts import train_tensor_qwen_cross_attention as core
+from scripts.readout_distributed import (
+    ParallelContext, RecordView, capture_rng, restore_rng, partition_batch,
+    evaluation_indices, merge_token_reports,
+)
 from tensor_compression.downstream.point_readout import (
     FORMAT, PROMPT_VERSION, build_prompt, json_hash, score_answer,
 )
@@ -273,6 +278,87 @@ def training_loss(llm, sidecar, tokenizer, records, fields, device, dtype, train
         raise
 
 
+def _backward_chunks(llm, sidecar, tokenizer, dataset, local_batches, device, dtype,
+                     training, token_cache, micro_batch_size, global_count):
+    values, sizes = [0.0, 0.0, 0.0], []
+    for indices in local_batches:
+        for start in range(0, len(indices), micro_batch_size):
+            chunk = indices[start:start + micro_batch_size]
+            records, fields = zip(*(dataset[index] for index in chunk))
+            try:
+                loss, components = training_loss(llm, sidecar, tokenizer, records, torch.stack(fields),
+                    device, dtype, training, token_cache=token_cache)
+                weight = len(chunk) / global_count
+                (loss * weight).backward()
+                values[0] += float(loss.detach()) * weight
+                values[1] += components["answer_ce"] * weight
+                values[2] += components["reconstruction"] * weight
+                sizes.append(len(chunk))
+                del loss
+            finally:
+                # Hooks must remain bound throughout checkpoint recomputation.
+                sidecar.clear()
+    return values, sizes
+
+
+def backward_update(llm, sidecar, tokenizer, dataset, batches, device, dtype, training,
+                    parallel, micro_batch_size, *, token_cache=None, auto_micro_batch=True):
+    """One complete global update; retry local OOMs BEFORE any gradient collective.
+
+    Retry all local contributions, not only the failed chunk: backward may have
+    partially accumulated gradients. Preserve sample membership and global loss
+    normalization. The optimizer/scheduler advance only after success on all ranks.
+    """
+    global_count = sum(map(len, batches))
+    if global_count <= 0:
+        raise ValueError("An optimizer update must contain questions")
+    local_batches = [partition_batch(batch, parallel.rank, parallel.world_size) for batch in batches]
+    initial_rng = capture_rng(device)
+    initial_buffers = {name: buffer.detach().clone() for name, buffer in sidecar.named_buffers()}
+    attempts, error, values, sizes = 0, None, [0.0] * 3, []
+    while True:
+        sidecar.zero_grad(set_to_none=True)
+        failed_size = None
+        try:
+            values, sizes = _backward_chunks(llm, sidecar, tokenizer, dataset, local_batches,
+                device, dtype, training, token_cache, micro_batch_size, global_count)
+            break
+        except torch.cuda.OutOfMemoryError as exc:
+            attempted = min(micro_batch_size, max(map(len, local_batches), default=0))
+            if not auto_micro_batch or attempted <= 1:
+                error = f"CUDA OOM even at micro batch {attempted}; update not applied: {exc}"
+            else:
+                failed_size = attempted
+        except Exception as exc:
+            if parallel.world_size == 1:
+                raise
+            error = f"{type(exc).__name__}: {exc}"
+        # Outside except: release traceback-held activations before empty_cache.
+        sidecar.clear()
+        sidecar.zero_grad(set_to_none=True)
+        if error:
+            break
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        restore_rng(initial_rng, device)
+        with torch.no_grad():
+            for name, buffer in sidecar.named_buffers():
+                buffer.copy_(initial_buffers[name])
+        micro_batch_size = max(1, failed_size // 2)
+        attempts += 1
+        print(f"oom_retry rank={parallel.rank} micro_batch={micro_batch_size} "
+              f"global_questions={global_count} retry_entire_local_update=true", flush=True)
+    parallel.check_errors(error)
+    parallel.sum_gradients(sidecar)
+    values = parallel.sums(values)
+    execution = parallel.gather({"rank": parallel.rank, "questions": sum(map(len, local_batches)),
+        "micro_batch_sizes": sizes, "micro_batch_limit": micro_batch_size, "oom_retries": attempts})
+    if sum(item["questions"] for item in execution) != global_count:
+        raise RuntimeError("Global question accounting differs across ranks")
+    return values, micro_batch_size, execution
+
+
 def generation_stop_ids(llm, tokenizer):
     ids = {int(tokenizer.eos_token_id)} if tokenizer.eos_token_id is not None else set()
     for source in (getattr(llm, "generation_config", None), getattr(llm, "config", None)):
@@ -385,7 +471,10 @@ def prepare_output_directory(path, *, resume=False, overwrite=False):
 
 @torch.inference_mode()
 def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_path, *,
-             verbose=False, input_mode="correct"):
+             verbose=False, input_mode="correct", parallel=None):
+    if parallel is not None and parallel.world_size > 1:
+        return evaluate_parallel(llm, sidecar, tokenizer, dataset, device, dtype, config,
+                                 output_path, parallel, verbose=verbose, input_mode=input_mode)
     if input_mode not in ("correct", "disabled"):
         raise ValueError("Evaluation input_mode must be correct or disabled")
     core.set_frozen_llm_execution_mode(llm, checkpoint_training=False)
@@ -459,6 +548,85 @@ def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_pat
     return metrics
 
 
+class EvaluationView:
+    def __init__(self, dataset, indices):
+        self.dataset, self.indices = dataset, indices
+        self.records = RecordView(dataset.records, indices)
+        self.states, self.metadata = dataset.states, dataset.metadata
+        self.suite = getattr(dataset, "suite", "main")
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        return self.dataset[self.indices[index]]
+
+
+def merge_evaluation_shards(dataset, paths, output_path):
+    predictions = {}
+    for path in paths:
+        with Path(path).open(encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                if row["qa_id"] in predictions:
+                    raise ValueError("Duplicate QA in distributed evaluation")
+                predictions[row["qa_id"]] = row
+    expected = [row["qa_id"] for row in dataset.records]
+    if len(expected) != len(set(expected)) or set(expected) != predictions.keys():
+        raise ValueError("Distributed evaluation has missing or unexpected QA IDs")
+    ordered = [predictions[key] for key in expected]
+    temporary = Path(str(output_path) + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in ordered:
+            handle.write(json.dumps(row, allow_nan=False) + "\n")
+    temporary.replace(output_path)
+    return ordered
+
+
+@torch.inference_mode(False)
+def evaluate_parallel(llm, sidecar, tokenizer, dataset, device, dtype, config,
+                      output_path, parallel, *, verbose=False, input_mode="correct"):
+    # Local generation re-enters inference_mode, but distributed object
+    # collectives must allocate ordinary tensors: backend threads mutate their
+    # receive buffers outside Python's thread-local inference_mode context.
+    start = time.perf_counter()
+    output_path = Path(output_path)
+    paths = [output_path.with_name(f"{output_path.stem}.rank{rank}.jsonl")
+             for rank in range(parallel.world_size)]
+    indices = evaluation_indices(dataset.records, parallel.world_size)[parallel.rank]
+    error, local_metrics = None, None
+    try:
+        if indices:
+            local_metrics = evaluate(llm, sidecar, tokenizer, EvaluationView(dataset, indices),
+                device, dtype, config, paths[parallel.rank], verbose=verbose, input_mode=input_mode)
+        else:
+            paths[parallel.rank].write_text("", encoding="utf-8")
+            local_metrics = {"field_memory_encodes": 0, "field_memory_reuses": 0,
+                             "peak_allocated_gib": None, "questions": 0}
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    parallel.check_errors(error)
+    summaries = parallel.gather({key: local_metrics[key] for key in (
+        "field_memory_encodes", "field_memory_reuses", "peak_allocated_gib", "questions")})
+    def merge():
+        scored = merge_evaluation_shards(dataset, paths, output_path)
+        metrics = summarize_readout_evaluation(scored, dataset.metadata["train_shapes"])
+        metrics["zero_value_baseline"] = zero_baseline_metrics(dataset.records, dataset.states)
+        suite = getattr(dataset, "suite", "main")
+        peaks = [m["peak_allocated_gib"] for m in summaries if m["peak_allocated_gib"] is not None]
+        metrics.update(input_mode=input_mode, diagnostic_only=input_mode != "correct" or suite != "main",
+            evaluation_suite=suite, elapsed_seconds=time.perf_counter() - start,
+            generated_tokens=sum(row["generated_tokens"] for row in scored),
+            field_memory_encodes=sum(m["field_memory_encodes"] for m in summaries),
+            field_memory_reuses=sum(m["field_memory_reuses"] for m in summaries),
+            peak_allocated_gib=max(peaks) if peaks else None,
+            distributed_world_size=parallel.world_size, per_rank=summaries)
+        if hasattr(dataset, "selection"):
+            metrics["field_pair_selection"] = dataset.selection
+        return metrics
+    return parallel.main(merge)
+
+
 def print_metric_summary(name, metrics):
     seen, heldout = metrics["seen_shapes"], metrics["heldout_shapes"]
     seen_text = f"{seen['macro_task_answer_accuracy']:.4f}" if seen else "n/a"
@@ -472,6 +640,11 @@ def validate_config(config):
     from tensor_compression.downstream.block_tokens import block_shape
     block_shape(config["memory"].get("block_shape", (1, 1)))
     t, e = config["training"], config["evaluation"]
+    micro = config["runtime"].get("max_micro_batch_size", t["batch_size"])
+    if type(micro) is not int or micro <= 0:
+        raise ValueError("runtime.max_micro_batch_size must be a positive integer")
+    if type(config["runtime"].get("auto_micro_batch", True)) is not bool:
+        raise ValueError("runtime.auto_micro_batch must be boolean")
     for key in ("batch_size", "gradient_accumulation_steps", "epochs", "max_prompt_tokens",
                 "max_target_tokens", "log_interval", "save_every_updates", "eval_every_updates"):
         if type(t[key]) is not int or t[key] <= 0:
@@ -500,6 +673,10 @@ def run_identity(config, dataset, llm, tokenizer):
     recipe = {key: copy.deepcopy(config[key]) for key in (
         "model", "field_encoder", "spatial_adapter", "memory", "cross_attention", "training", "evaluation", "runtime")}
     recipe["model"].pop("name_or_path", None)
+    # Execution chunking can be reduced to fit memory without changing the
+    # global batch/optimizer recipe. Floating-point rounding need not be bitwise identical.
+    for key in ("max_micro_batch_size", "auto_micro_batch"):
+        recipe["runtime"].pop(key, None)
     identity = {"protocol": FORMAT, "prompt_version": PROMPT_VERSION, "dataset": dataset.identity,
             "text_encoding": {"version": TEXT_ENCODING_VERSION, "system_message": SYSTEM_MESSAGE,
                               "chat_template_sha256": json_hash(tokenizer.get_chat_template()),
@@ -567,11 +744,13 @@ def geometry_probe_indices(rows):
     return list(dict.fromkeys(max(range(len(rows)), key=lambda i: key(rows[i])) for key in criteria))
 
 
-def check_geometry(llm, sidecar, tokenizer, dataset, device, dtype, config):
+def check_geometry(llm, sidecar, tokenizer, dataset, device, dtype, config, *, parallel=None):
     """Stress each boundary at the requested batch size, without optimizer updates."""
     indices = geometry_probe_indices(dataset.records)
     report = []
+    parallel = parallel or ParallelContext(device)
     batch_size = config["training"]["batch_size"]
+    micro_limit = config["runtime"].get("max_micro_batch_size", batch_size)
     sidecar.train()
     for index in indices:
         row, field = dataset[index]
@@ -582,20 +761,19 @@ def check_geometry(llm, sidecar, tokenizer, dataset, device, dtype, config):
             torch.cuda.synchronize(device)
         started = time.perf_counter()
         try:
-            loss, values = training_loss(llm, sidecar, tokenizer, [row] * batch_size,
-                                         field[None].repeat(batch_size, 1, 1, 1), device, dtype,
-                                         config["training"])
-            loss.backward()
+            values, micro_limit, execution = backward_update(llm, sidecar, tokenizer, dataset,
+                [[index] * batch_size], device, dtype, config["training"], parallel, micro_limit,
+                auto_micro_batch=config["runtime"].get("auto_micro_batch", True))
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             entry = {"shape": row["grid_shape"], "batch_size": batch_size,
-                     "repeated_example_for_memory_check": True, **values,
+                     "repeated_example_for_memory_check": True, "answer_ce": values[1],
+                     "reconstruction": values[2], "per_rank_execution": execution,
                      "seconds": time.perf_counter() - started,
                      "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30
                      if device.type == "cuda" else None}
             report.append(entry)
             print("geometry_check=" + json.dumps(entry), flush=True)
-            del loss
         finally:
             sidecar.clear()
             sidecar.zero_grad(set_to_none=True)
@@ -616,14 +794,20 @@ def main():
     parser.add_argument("--overwrite-output-dir", action="store_true",
                         help="Archive an existing training output to a sibling backup, then start fresh; stop its process first")
     for option, help_text in (
-        ("batch-size", "Maximum questions per real forward/backward batch; batches contain equal grid shapes"),
-        ("gradient-accumulation-steps", "Forward/backward batches accumulated per optimizer update"),
+        ("batch-size", "GLOBAL question batch upper bound across all ranks, grouped by grid shape"),
+        ("gradient-accumulation-steps", "Global shape batches accumulated per optimizer update"),
         ("epochs", "Training epochs when config max_updates is null"),
         ("save-every-updates", "Checkpoint cadence in optimizer updates"),
         ("eval-every-updates", "Validation cadence in optimizer updates"),
     ):
         parser.add_argument("--" + option, type=int, help=help_text + "; overrides the selected profile")
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--micro-batch-size", type=int,
+                        help="Maximum per-device forward/backward batch; splitting preserves the global batch")
+    parser.add_argument("--no-auto-micro-batch", action="store_true",
+                        help="Fail on CUDA OOM instead of retrying the complete local update with smaller chunks")
+    parser.add_argument("--distributed-timeout-minutes", type=int, default=360,
+                        help="Collective timeout, including complete data audit/preflight (default: 360)")
     parser.add_argument("--resume", help="Strict resume from this numerical-generation experiment")
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument("--eval-suite", choices=("main", "language", "field-pairs"), default="main",
@@ -652,8 +836,6 @@ def main():
         parser.error("--token-check-only checks all main splits and cannot combine with another action or diagnostic suite")
     if cli.geometry_check_only and (cli.audit_only or cli.evaluate_only or cli.resume):
         parser.error("--geometry-check-only requires a fresh run and cannot be combined with audit/evaluation/resume")
-    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
-        raise ValueError("This workstation entry point is single-device; use python, not multi-rank torchrun")
     if cli.evaluate_only and not cli.resume:
         parser.error("--evaluate-only requires --resume")
     if (cli.eval_suite != "main" or cli.input_mode != "correct") and not cli.evaluate_only:
@@ -666,6 +848,8 @@ def main():
         parser.error("--stop-after-updates must be positive")
     if cli.console_every_updates <= 0:
         parser.error("--console-every-updates must be positive")
+    if cli.micro_batch_size is not None and cli.micro_batch_size <= 0:
+        parser.error("--micro-batch-size must be positive")
     if cli.split == "test" and not (cli.evaluate_only or cli.audit_only or cli.token_check_only):
         parser.error("The test split is accessible only through explicit evaluation/audit")
     config = load_config(cli.config, cli.profile)
@@ -679,12 +863,27 @@ def main():
         parser.error("--epochs requires a profile with max_updates: null")
     if cli.block_shape is not None:
         config["memory"]["block_shape"] = cli.block_shape
+    if cli.micro_batch_size is not None:
+        config["runtime"]["max_micro_batch_size"] = cli.micro_batch_size
+    if cli.no_auto_micro_batch:
+        config["runtime"]["auto_micro_batch"] = False
     validate_config(config)
     qa_dir = resolve_path(cli.qa_dir or config["data"]["qa_dir"])
     hdf5_path = source_path(config, cli.hdf5_path)
-    output = prepare_output_directory(os.path.expandvars(cli.output_dir),
-                                      resume=bool(cli.resume and not cli.evaluate_only),
-                                      overwrite=cli.overwrite_output_dir)
+    parallel = ParallelContext.initialize(cli.device, cli.distributed_timeout_minutes)
+    device = parallel.device
+    # Directory mutation and all shared artifacts have exactly one writer.
+    try:
+        output = Path(parallel.main(lambda: str(prepare_output_directory(os.path.expandvars(cli.output_dir),
+            resume=bool(cli.resume and not cli.evaluate_only), overwrite=cli.overwrite_output_dir))))
+    except BaseException:
+        parallel.close()
+        raise
+    def write_shared(path, value):
+        return parallel.main(lambda: write_json(path, value))
+    def say(message):
+        if parallel.primary:
+            print(message, flush=True)
     datasets = {}
     geometry_original_records = {}
     stop_requested = False
@@ -699,7 +898,11 @@ def main():
             splits = ["train"]
         if cli.audit_only or cli.token_check_only:
             splits = ["train", "val", "test"]
+        say(f"parallel_setup world_size={parallel.world_size} device_type={device.type} "
+            f"global_batch_limit={config['training']['batch_size']} "
+            f"micro_batch_limit={config['runtime'].get('max_micro_batch_size', config['training']['batch_size'])}")
         for split in splits:
+            say(f"dataset_load split={split} validating_manifest_and_loading_records=true")
             suite_options = {"suite": cli.eval_suite} if cli.eval_suite == "language" else {}
             dataset = PointReadoutDataset(qa_dir, hdf5_path, split,
                 cache_size=int(config["data"].get("input_cache_size", 8)), **suite_options)
@@ -709,7 +912,7 @@ def main():
                 probe_indices = geometry_probe_indices(original_records)
                 geometry_original_records[split] = original_records
                 dataset.records = [original_records[index] for index in probe_indices]
-                write_json(output / "geometry_preflight_scope.json", {
+                write_shared(output / "geometry_preflight_scope.json", {
                     "scope": "geometry_boundary_probes_only", "full_dataset_audited": False,
                     "optimizer_updates": 0, "dataset_identity": dataset.identity,
                     "loaded_splits": ["train"], "total_train_questions": len(original_records),
@@ -720,23 +923,27 @@ def main():
                                            "minimum_width_then_maximum_height", "minimum_area"],
                     "limitation": "Only selected geometry probes are audited/tokenized; use token-check-only for all main splits"})
             audit_name = "geometry_data_audit" if cli.geometry_check_only else "data_audit"
-            print(f"{audit_name} split={split} {dataset.audit()}", flush=True)
+            say(f"{audit_name}_start split={split} questions={len(dataset)} audit_rank=0")
+            audit = parallel.main(dataset.audit)
+            say(f"{audit_name} split={split} {audit}")
             if cli.eval_suite == "field-pairs":
                 paired = FieldPairDataset(dataset, max_pairs=cli.diagnostic_pairs,
                     max_candidates=cli.diagnostic_max_candidates, seed=int(config["runtime"]["seed"]))
                 datasets[split] = paired
-                write_json(output / "field_pair_selection.json", paired.selection)
-                with (output / "field_pair_queries.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
-                    for row in paired.records:
-                        handle.write(json.dumps(row, allow_nan=False) + "\n")
-                print("field_pair_selection=" + json.dumps(paired.selection), flush=True)
+                write_shared(output / "field_pair_selection.json", paired.selection)
+                def write_pairs():
+                    with (output / "field_pair_queries.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
+                        for row in paired.records:
+                            handle.write(json.dumps(row, allow_nan=False) + "\n")
+                parallel.main(write_pairs)
+                say("field_pair_selection=" + json.dumps(paired.selection))
                 if not paired.records:
-                    write_json(output / f"{split}_metrics.json", {"status": "unavailable",
+                    write_shared(output / f"{split}_metrics.json", {"status": "unavailable",
                         "diagnostic_only": True, "evaluation_suite": "field-pairs",
                         "field_pair_selection": paired.selection})
                     return
         if cli.audit_only:
-            write_json(output / "data_audit.json", {s: {"questions": len(d), "identity": d.identity}
+            write_shared(output / "data_audit.json", {s: {"questions": len(d), "identity": d.identity}
                                                     for s, d in datasets.items()})
             return
         dataset = next(iter(datasets.values()))
@@ -746,7 +953,6 @@ def main():
                 raise ValueError(f"Configured {key} differs from the frozen dataset scoring protocol")
         # The immutable dataset defines selected tasks, including builder --tasks
         # overrides. No task IDs or point counts are supplied to the neural model.
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if cli.device == "auto" else torch.device(cli.device)
         if device.type == "cuda" and config["model"]["torch_dtype"] == "bfloat16" and not torch.cuda.is_bf16_supported():
             raise ValueError("Selected CUDA device does not support BF16")
         args = model_args(config, cli.model_dir, checkpointing=not cli.evaluate_only)
@@ -758,11 +964,20 @@ def main():
             max_entries=int(config["runtime"].get("token_cache_entries", 262144)))
         token_reports = {}
         for split, d in datasets.items():
-            print(f"token_preflight split={split} questions={len(d.records)}", flush=True)
-            token_reports[split] = preflight_token_budgets(d.records, tokenizer, config["training"],
-                token_cache=token_cache, split=split, raise_on_overflow=False)
+            say(f"token_preflight split={split} questions={len(d.records)} world_size={parallel.world_size}")
+            rows = RecordView(d.records, range(parallel.rank, len(d.records), parallel.world_size))
+            local_report, error = None, None
+            try:
+                local_report = preflight_token_budgets(rows, tokenizer, config["training"],
+                    token_cache=token_cache, split=f"{split}/rank{parallel.rank}", raise_on_overflow=False)
+            except Exception as exc:
+                if parallel.world_size == 1:
+                    raise
+                error = f"{type(exc).__name__}: {exc}"
+            parallel.check_errors(error)
+            token_reports[split] = merge_token_reports(parallel.gather(local_report))
         token_report_path = output / "token_preflight.json"
-        write_json(token_report_path, token_reports)
+        write_shared(token_report_path, token_reports)
         overflow_splits = [split for split, report in token_reports.items() if report["overflow_questions"]]
         if overflow_splits:
             raise ValueError(f"Token budgets exceeded in {', '.join(overflow_splits)}; all requested splits "
@@ -770,14 +985,16 @@ def main():
                 "training.max_target_tokens and evaluation.max_new_tokens against the observed maxima; "
                 "no records were truncated and no language-model weights were loaded.")
         if cli.token_check_only:
-            print("token_check_complete=" + json.dumps(token_reports), flush=True)
+            say("token_check_complete=" + json.dumps(token_reports))
             return
         llm, dtype = core.load_llm_with_bounded_host_memory(args, device)
         core.seed_everything(args.seed)
         encoder, spatial, _, _ = core.build_scratch_memory_components(args, (1, args.patch_size, args.patch_size))
         sidecar, report = core.build_sidecar(llm, spatial, args, device, encoder)
         identity = run_identity(config, dataset, llm, tokenizer)
-        identity["model_asset"] = model_asset_identity(args.model_name_or_path, llm, verbose=cli.verbose)
+        identity["model_asset"] = parallel.main(lambda: model_asset_identity(args.model_name_or_path, llm, verbose=cli.verbose))
+        if len(set(parallel.gather(json_hash(identity)))) != 1:
+            raise ValueError("Ranks loaded different model/tokenizer/dataset/config identities")
         existing_contract = output / "contract.json"
         if existing_contract.exists() and json.loads(existing_contract.read_text(encoding="utf-8")) != identity:
             raise ValueError("Output directory belongs to another experiment")
@@ -785,22 +1002,26 @@ def main():
         if checkpoint:
             validate_resume(checkpoint, identity)
             sidecar.load_state_dict(checkpoint["sidecar"], strict=True)
-        write_json(output / "contract.json", identity)
-        write_json(output / "resolved_config.json", config)
-        write_json(output / "architecture.json", report)
+        parallel.synchronize_parameters(sidecar)
+        write_shared(output / "contract.json", identity)
+        write_shared(output / "resolved_config.json", config)
+        write_shared(output / "architecture.json", report)
         if cli.geometry_check_only:
-            write_json(output / "geometry_check.json", check_geometry(
-                llm, sidecar, tokenizer, datasets["train"], device, dtype, config))
+            geometry = check_geometry(llm, sidecar, tokenizer, datasets["train"], device, dtype, config, parallel=parallel)
+            reports = parallel.gather(geometry)
+            write_shared(output / "geometry_check.json", geometry if parallel.world_size == 1 else
+                         {"world_size": parallel.world_size, "per_rank": reports})
             return
         if cli.evaluate_only:
             metrics = evaluate(llm, sidecar, tokenizer, datasets[cli.split], device, dtype, config,
                                output / f"{cli.split}_predictions.jsonl", verbose=cli.verbose,
-                               input_mode=cli.input_mode)
-            write_json(output / f"{cli.split}_metrics.json", metrics)
-            write_json(output / "evaluation_contract.json", {"checkpoint": str(Path(cli.resume).resolve()),
+                               input_mode=cli.input_mode, parallel=parallel)
+            write_shared(output / f"{cli.split}_metrics.json", metrics)
+            write_shared(output / "evaluation_contract.json", {"checkpoint": str(Path(cli.resume).resolve()),
                 "split": cli.split, "suite": cli.eval_suite, "input_mode": cli.input_mode,
                 "diagnostic_only": cli.eval_suite != "main" or cli.input_mode != "correct"})
-            print_metric_summary(cli.split, metrics)
+            if parallel.primary:
+                print_metric_summary(cli.split, metrics)
             return
         optimizer, _ = core.build_optimizer(sidecar, args)
         training = config["training"]
@@ -809,16 +1030,19 @@ def main():
                                                    float(training.get("warmup_ratio", .03)),
                                                    float(training.get("min_lr_ratio", .2)))
         step, epoch, cursor, best = 0, 0, 0, -1.0
+        micro_batch_size = int(config["runtime"].get("max_micro_batch_size", training["batch_size"]))
         validation_pending = False
         if checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
             scheduler.load_state_dict(checkpoint["scheduler"])
             step, epoch, cursor, best = (checkpoint[k] for k in ("step", "epoch", "cursor", "best"))
             validation_pending = checkpoint.get("validation_pending", False)
-            random.setstate(checkpoint["python_rng"])
-            torch.set_rng_state(checkpoint["torch_rng"])
-            if device.type == "cuda" and checkpoint["cuda_rng"] is not None:
-                torch.cuda.set_rng_state(checkpoint["cuda_rng"], device)
+            execution = checkpoint.get("parallel_execution", {"world_size": 1})
+            if execution["world_size"] != parallel.world_size:
+                raise ValueError("Strict training resume requires the same GPU/process count; evaluation may use another count")
+            rank_states = checkpoint.get("rank_states", [checkpoint])
+            restore_rng(rank_states[parallel.rank], device)
+            micro_batch_size = min(micro_batch_size, rank_states[parallel.rank].get("micro_batch_limit", micro_batch_size))
         if step > maximum:
             raise ValueError("Checkpoint step exceeds configured training budget")
         train_data = datasets["train"]
@@ -829,19 +1053,21 @@ def main():
             previous_handlers[signum] = signal.signal(signum, request_stop)
 
         def save(path):
-            core.atomic_torch_save(path, {"checkpoint_type": CHECKPOINT_TYPE, "identity": identity,
+            states = parallel.gather({**capture_rng(device), "micro_batch_limit": micro_batch_size})
+            parallel.main(lambda: core.atomic_torch_save(path, {
+                "checkpoint_type": CHECKPOINT_TYPE, "identity": identity,
                 "sidecar": {k: v.detach().cpu().clone() for k, v in sidecar.state_dict().items()},
                 "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                 "step": step, "epoch": epoch, "cursor": cursor, "best": best,
-                "validation_pending": validation_pending,
-                "python_rng": random.getstate(), "torch_rng": torch.get_rng_state(),
-                "cuda_rng": torch.cuda.get_rng_state(device) if device.type == "cuda" else None})
+                "validation_pending": validation_pending, **states[0],
+                "rank_states": states, "parallel_execution": {"world_size": parallel.world_size,
+                    "global_batch_size": training["batch_size"], "gradient_reduction": "global_question_mean"}}))
 
         def validate_and_save():
             nonlocal best, validation_pending
             metrics = evaluate(llm, sidecar, tokenizer, datasets["val"], device, dtype, config,
-                               output / f"val_predictions_{step}.jsonl", verbose=cli.verbose)
-            core.append_jsonl(output / "validation.jsonl", {"step": step, **metrics})
+                               output / f"val_predictions_{step}.jsonl", verbose=cli.verbose, parallel=parallel)
+            parallel.main(lambda: core.append_jsonl(output / "validation.jsonl", {"step": step, **metrics}))
             score = metrics["seen_shapes"]["macro_task_answer_accuracy"]
             validation_pending = False
             if score > best:
@@ -849,31 +1075,37 @@ def main():
                 save(output / "best.pt")
             heldout = metrics["heldout_shapes"]
             heldout_text = f"{heldout['macro_task_answer_accuracy']:.4f}" if heldout else "n/a"
-            print(f"validation step={step} macro_task_answer_accuracy={score:.4f} "
+            say(f"validation step={step} macro_task_answer_accuracy={score:.4f} "
                   f"heldout={heldout_text} "
                   f"valid_rate={metrics['valid_rate']:.4f} "
-                  f"truncated={metrics['errors'].get('generation_truncated', 0)}/{metrics['questions']}", flush=True)
+                  f"truncated={metrics['errors'].get('generation_truncated', 0)}/{metrics['questions']}")
             save(output / "last.pt")
 
-        print(f"startup=point_readout tasks={dataset.metadata['tasks']} updates={maximum} "
+        say(f"startup=point_readout tasks={dataset.metadata['tasks']} updates={maximum} "
               f"block_shape={args.memory_block_shape} "
-              f"batch={training['batch_size']} accumulation={training['gradient_accumulation_steps']} "
-              f"text_encoding={TEXT_ENCODING_VERSION} stop_token_ids={generation_stop_ids(llm, tokenizer)}", flush=True)
+              f"global_batch={training['batch_size']} world_size={parallel.world_size} "
+              f"per_device_micro_batch_limit={micro_batch_size} accumulation={training['gradient_accumulation_steps']} "
+              f"text_encoding={TEXT_ENCODING_VERSION} stop_token_ids={generation_stop_ids(llm, tokenizer)}")
         start = time.perf_counter()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
-        print("batch_statistics=" + json.dumps(batch_stats), flush=True)
-        write_json(output / "training_plan.json", {"planned_updates": maximum, "train_questions": len(train_data),
+        say("batch_statistics=" + json.dumps(batch_stats))
+        write_shared(output / "training_plan.json", {"planned_updates": maximum, "train_questions": len(train_data),
             "tasks": dataset.metadata["tasks"], "batch_size": training["batch_size"],
             "gradient_accumulation_steps": training["gradient_accumulation_steps"],
             "effective_batch_upper_bound": training["batch_size"] * training["gradient_accumulation_steps"],
+            "world_size": parallel.world_size, "per_device_micro_batch_limit": micro_batch_size,
+            "auto_micro_batch": config["runtime"].get("auto_micro_batch", True),
             **batch_stats,
             "selection_metric": "seen_shapes.macro_task_answer_accuracy"})
         # A stop or decoder failure immediately before validation must not skip it,
         # including a checkpoint already at the final optimizer update.
         if validation_pending:
             validate_and_save()
-        while step < maximum and not stop_requested:
+        while step < maximum:
+            stop_requested = parallel.any(stop_requested)
+            if stop_requested:
+                break
             micro_batches = []
             for _ in range(training["gradient_accumulation_steps"]):
                 if cursor >= len(batches):
@@ -888,22 +1120,11 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             core.set_frozen_llm_execution_mode(llm, checkpoint_training=True)
             sidecar.train()
-            loss_value = 0.0
-            component_values = {"answer_ce": 0.0, "reconstruction": 0.0}
-            for indices in micro_batches:
-                examples = [train_data[i] for i in indices]
-                records, fields = zip(*examples)
-                try:
-                    loss, components = training_loss(llm, sidecar, tokenizer, records, torch.stack(fields), device, dtype,
-                                                     training, token_cache=token_cache)
-                    weight = len(indices) / total_records
-                    (loss * weight).backward()
-                    loss_value += float(loss.detach()) * weight
-                    for key in component_values:
-                        component_values[key] += components[key] * weight
-                finally:
-                    # Non-reentrant checkpointing can revisit bridges during backward.
-                    sidecar.clear()
+            values, micro_batch_size, execution = backward_update(
+                llm, sidecar, tokenizer, train_data, micro_batches, device, dtype, training,
+                parallel, micro_batch_size, token_cache=token_cache,
+                auto_micro_batch=config["runtime"].get("auto_micro_batch", True))
+            loss_value, answer_ce, reconstruction = values
             grad_norm = torch.nn.utils.clip_grad_norm_(sidecar.parameters(), training["grad_clip_norm"], error_if_nonfinite=True)
             optimizer.step()
             scheduler.step()
@@ -911,22 +1132,28 @@ def main():
             log_to_file = step % training["log_interval"] == 0 or step == 1
             log_to_console = log_to_file if cli.verbose else step == 1 or step % cli.console_every_updates == 0 or step == maximum
             if log_to_file or log_to_console:
+                memory_by_rank = parallel.gather({"rank": parallel.rank,
+                    "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None,
+                    "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else None})
                 entry = {"step": step, "loss": loss_value, "grad_norm": float(grad_norm),
-                         "answer_ce": component_values["answer_ce"],
-                         "value_reconstruction": component_values["reconstruction"],
+                         "answer_ce": answer_ce,
+                         "value_reconstruction": reconstruction,
                          "value_reconstruction_weight": float(training.get("value_reconstruction_weight", .01)),
                          "gate_values": sidecar.gate_values(),
                          "questions_in_update": total_records,
                          "micro_batch_sizes": [len(indices) for indices in micro_batches],
-                         "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30
+                         "per_rank_execution": execution,
+                         "per_rank_memory": memory_by_rank,
+                         "peak_allocated_gib": max(m["peak_allocated_gib"] for m in memory_by_rank)
                          if device.type == "cuda" else None,
-                         "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30
+                         "peak_reserved_gib": max(m["peak_reserved_gib"] for m in memory_by_rank)
                          if device.type == "cuda" else None,
                          "elapsed_seconds": time.perf_counter() - start}
-                if log_to_file:
+                if log_to_file and parallel.primary:
                     core.append_jsonl(output / "train.jsonl", entry)
-                if log_to_console:
+                if log_to_console and parallel.primary:
                     print(json.dumps(entry), flush=True)
+            stop_requested = parallel.any(stop_requested)
             should_stop = stop_requested or (cli.stop_after_updates is not None and step - invocation_start_step >= cli.stop_after_updates)
             validation_pending = step % training["eval_every_updates"] == 0 or step == maximum
             # Save before potentially long validation, so termination loses no completed update.
@@ -936,15 +1163,18 @@ def main():
                 break
             if validation_pending:
                 validate_and_save()
+            stop_requested = parallel.any(stop_requested)
             if stop_requested:
                 break
         # Also covers a signal arriving between the last periodic-save check and
         # the loop condition, and resuming a finished checkpoint into a new directory.
         save(output / "last.pt")
-        write_json(output / "run_summary.json", {"status": "completed" if step == maximum else "stopped",
+        stop_requested = parallel.any(stop_requested)
+        write_shared(output / "run_summary.json", {"status": "completed" if step == maximum else "stopped",
             "step": step, "planned_updates": maximum, "best_score": best if best >= 0 else None,
             "elapsed_this_invocation_seconds": time.perf_counter() - start, "last_checkpoint": str(output / "last.pt"),
-            "token_cache_this_invocation": token_cache.statistics()})
+            "world_size": parallel.world_size,
+            "token_cache_this_invocation": parallel.gather(token_cache.statistics())})
         if stop_requested:
             raise SystemExit(130)  # Let a shell loop using set -e stop after Ctrl+C.
     finally:
@@ -954,6 +1184,7 @@ def main():
             if split in geometry_original_records:
                 d.records = geometry_original_records[split]
             d.close()
+        parallel.close()
 
 
 if __name__ == "__main__":

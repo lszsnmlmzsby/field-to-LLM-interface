@@ -297,7 +297,8 @@ def test_geometry_only_preflights_shared_boundary_probes_without_loading_val_or_
         def close(self):
             closed.append(self.records is all_rows)
 
-    def geometry_check(*args):
+    def geometry_check(*args, **kwargs):
+        assert kwargs["parallel"].world_size == 1
         dataset = args[3]
         checked.extend(row["qa_id"] for row in dataset.records)
         assert dataset.identity == Dataset.identity

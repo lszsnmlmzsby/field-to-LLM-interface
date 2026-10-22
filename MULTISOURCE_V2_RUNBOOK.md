@@ -113,7 +113,8 @@ python -u scripts/train_point_readout.py \
 `token_preflight.json` 记录各划分的实际最大prompt/answer长度与超限统计。预算超限时
 完成扫描并写报告后退出失败，不加载模型；模板或EOS格式错误仍立即失败。
 预检通过后继续下面的几何检查、smoke、正式训练，使用同一份修正后的配置。
-本次只调整文本长度上限；字段、问题、划分、batch和训练轮数均不变。
+当时的修复只调整文本长度上限；字段、问题、划分和训练轮数不变。
+随后按三张 A800 的分配和用户要求，将本配置的全局 batch 上限改为48，见下文。
 若已有checkpoint，它的原训练上限属于严格续训身份，应使用其保存配置续训，
 不要直接换成本次配置。本次报错发生在训练开始前，没有这个续训冲突。
 
@@ -123,19 +124,58 @@ Qwen分词器资产缺失；尚未测出服务器这份完整QA的最大token长
 
 ## 3. 真实 Qwen 检查与正式训练
 
+2026-10-22 三卡更新：`--batch-size` 始终表示所有 GPU 合计的 batch 上限。
+full/pilot 默认48、累积1、两轮；`--micro-batch-size` 是每卡一次前后向的上限，默认16。
+每个同形状全局批次均匀分到各卡，正常为16+16+16；尾批如17则为6+6+5，
+不足3题允许某卡不处理样本，不补重复题也不丢尾批。每次更新使用实际全局题数归一化。
+同一全局批次可在每卡拆成若干小批次累积；发生前后向 CUDA OOM 时，清除本卡这次
+更新的全部梯度、恢复随机/缓冲状态，然后减小小批次重算，其他卡等待后统一同步梯度。
+重试上限按16→8→4→2→1降低（尾批可能更小）；降到1仍OOM会明确失败。
+该恢复只针对前后向显存不足，不能修复模型加载、优化器状态、通信阶段或其他异常。
+成功降低的每卡上限会保存到 checkpoint 并在续训时恢复。
+
+长文本会增加实际显存占用；2048是允许上限，仍按各小批次的实际最长文本padding。
+自动拆分保留全部问题、完整文本和全局平均损失，但浮点运算顺序变化不保证位级一致。
+全局48相比原16减少每轮更新次数；精确次数以 `training_plan.json` 为准，不保证恰好1/3。
+学习率仍为5e-5/gate 5e-4，warmup比例和两轮不变，不自动将学习率乘3。
+保存/验证仍按原2048/8192次更新触发；因此两次检查之间通常会覆盖更多问题。
+验证、测试按场分给三卡生成，汇总完整预测检查QA ID无遗漏、无重复，再计算总指标。
+
+源裁剪审计只由rank0完整执行一次；分词预检按问题分片，全体合起来仍覆盖所有要求的题。
+模型文件哈希只在rank0读取一次，各rank模型/分词器/配置/数据身份还会相互核对。
+目前每个进程仍加载完整QA元数据和独立的有界token缓存，因此CPU内存需求会增加。
+三张卡分别保留一份模型，不会将显存合成一块240GB。
+
+已完成的完整源下载和v2 QA可以直接复用，不要因batch调整重新构建。
+同步新增的 `scripts/readout_distributed.py`、训练脚本和配置后，在远端 Bash 设置：
+
+```bash
+source /workspace/wyx/f2llm/enter_f2llm.sh
+cd /workspace/wyx/f2llm/tensor-compression
+export MULTI_CONFIG=configs/field_to_llm_multisource_v2.yaml
+export CUDA_VISIBLE_DEVICES=0,1,2
+export OMP_NUM_THREADS=1
+```
+
+先执行三卡几何检查和smoke；smoke覆盖小场流水线，不能证明完整长文本一定能用每卡16。
+三个进程各持有一张卡，`--device` 保持auto，不要为每个进程指定同一个cuda:0。
+
 ```bash
 (
   set -e
   for block in 1 2; do
-    python -u scripts/train_point_readout.py \
+    python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
+      scripts/train_point_readout.py \
       --config "$MULTI_CONFIG" --profile full \
       --block-shape "$block" "$block" --geometry-check-only \
-      --output-dir "$FIELD_TO_LLM_RUNS_DIR/multisource_v2_geometry_${block}x${block}"
+      --output-dir "$FIELD_TO_LLM_RUNS_DIR/multisource_v2_3gpu_b48_geometry_${block}x${block}"
 
-    python -u scripts/train_point_readout.py \
+    python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
+      scripts/train_point_readout.py \
       --config "$MULTI_CONFIG" --profile smoke \
+      --batch-size 48 --micro-batch-size 16 \
       --block-shape "$block" "$block" --console-every-updates 10 \
-      --output-dir "$FIELD_TO_LLM_RUNS_DIR/multisource_v2_smoke_${block}x${block}"
+      --output-dir "$FIELD_TO_LLM_RUNS_DIR/multisource_v2_3gpu_b48_smoke_${block}x${block}"
   done
 )
 ```
@@ -149,26 +189,36 @@ smoke 仅20次更新，不能称为正式训练。通过后，在持久终端中
 (
   set -e
   for block in 1 2; do
-    python -u scripts/train_point_readout.py \
+    python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
+      scripts/train_point_readout.py \
       --config "$MULTI_CONFIG" --profile full \
+      --batch-size 48 --micro-batch-size 16 \
       --block-shape "$block" "$block" --console-every-updates 200 \
-      --output-dir "$FIELD_TO_LLM_RUNS_DIR/multisource_v2_full_${block}x${block}"
+      --output-dir "$FIELD_TO_LLM_RUNS_DIR/multisource_v2_3gpu_b48_full_${block}x${block}"
   done
 )
 ```
 
-两次训练各从头开始、顺序执行，同样的裁剪/查询/两轮。batch上限16，累积1；
-同形状尾批仍可能不足16。每2048次更新保存，每8192次更新全量验证；
+两次训练各从头开始、顺序执行，每次用三张卡，同样的裁剪/查询/两轮。全局batch上限48，累积1；
+同形状尾批仍可能不足48。每2048次更新保存，每8192次更新全量验证；
 best仍根据已见尺寸上的宏平均任务答案准确率选择，输入关闭诊断不参与。
 训练时间需根据实际 training_plan、稳定 step 时间和一次完整验证时间估算，
 不能保证24小时完成。验证场编码与分词缓存继续启用。
+启动日志应含 `global_batch=48 world_size=3 per_device_micro_batch_limit=16`。
+`questions_in_update`是三卡实际总题数；`per_rank_execution`记录每卡处理题数、小批次拆分
+和OOM重试次数，`per_rank_memory`记录各卡显存峰值，顶层峰值为各卡的最大值而非相加。
+若希望先观察正式数据上的显存和速度，可在full命令加 `--stop-after-updates 20`：
+它保留完整两轮调度，只提前保存停止；之后按下一节继续，不应把20步称为完整训练。
 
 ## 4. 中断后续训
 
 ```bash
 source /workspace/wyx/f2llm/enter_f2llm.sh
-RUN="$FIELD_TO_LLM_RUNS_DIR/multisource_v2_full_1x1"
-python -u scripts/train_point_readout.py \
+export CUDA_VISIBLE_DEVICES=0,1,2
+export OMP_NUM_THREADS=1
+RUN="$FIELD_TO_LLM_RUNS_DIR/multisource_v2_3gpu_b48_full_1x1"
+python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
+  scripts/train_point_readout.py \
   --config "$RUN/resolved_config.json" --profile full \
   --resume "$RUN/last.pt" --output-dir "$RUN" \
   --console-every-updates 200
@@ -176,6 +226,13 @@ python -u scripts/train_point_readout.py \
 
 正在训练2×2时改为它的目录。不要添加覆盖参数，不要拿旧数据实验的 checkpoint
 续训新版。正常终止会请求在完整更新处保存；强制断电/SIGKILL只能恢复最近 checkpoint。
+严格续训要求进程数相同，三卡checkpoint请继续用三卡；旧全局16的checkpoint不能直接
+改变为48续训，本次48实验使用新目录从头开始。评估允许使用不同进程数。
+可以在续训命令追加 `--micro-batch-size 8` 降低每卡计算块，仍保持全局48；
+它属于执行设置，不更改训练身份。checkpoint包含每个rank的随机状态、小批次上限，
+以及统一的优化器、调度器、epoch/cursor和待完成验证标记，由rank0原子写入。
+torchrun启动器被终止时可能强制结束worker，不能保证信号处理有足够时间保存；
+计划内短跑优先用 `--stop-after-updates`，强制收回资源后使用最后一次完整的 `last.pt`。
 
 ## 5. 正式测试、语言测试和输入依赖诊断
 
@@ -185,23 +242,27 @@ python -u scripts/train_point_readout.py \
 (
   set -e
   for block in 1 2; do
-    RUN="$FIELD_TO_LLM_RUNS_DIR/multisource_v2_full_${block}x${block}"
-    python -u scripts/train_point_readout.py \
+    RUN="$FIELD_TO_LLM_RUNS_DIR/multisource_v2_3gpu_b48_full_${block}x${block}"
+    python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
+      scripts/train_point_readout.py \
       --config "$RUN/resolved_config.json" --profile full \
       --resume "$RUN/best.pt" --evaluate-only --split test \
       --output-dir "$RUN/test_best"
 
-    python -u scripts/train_point_readout.py \
+    python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
+      scripts/train_point_readout.py \
       --config "$RUN/resolved_config.json" --profile full \
       --resume "$RUN/best.pt" --evaluate-only --split test --eval-suite language \
       --output-dir "$RUN/test_language"
 
-    python -u scripts/train_point_readout.py \
+    python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
+      scripts/train_point_readout.py \
       --config "$RUN/resolved_config.json" --profile full \
       --resume "$RUN/best.pt" --evaluate-only --split test --eval-suite language \
       --input-mode disabled --output-dir "$RUN/test_language_no_field"
 
-    python -u scripts/train_point_readout.py \
+    python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
+      scripts/train_point_readout.py \
       --config "$RUN/resolved_config.json" --profile full \
       --resume "$RUN/best.pt" --evaluate-only --split test --eval-suite field-pairs \
       --diagnostic-pairs 128 --diagnostic-max-candidates 4096 \
@@ -225,7 +286,7 @@ python -u scripts/train_point_readout.py \
 离线复评分不需要 GPU：
 
 ```bash
-RUN="$FIELD_TO_LLM_RUNS_DIR/multisource_v2_full_2x2"
+RUN="$FIELD_TO_LLM_RUNS_DIR/multisource_v2_3gpu_b48_full_2x2"
 python scripts/score_point_readout.py \
   --qa-dir "$FIELD_TO_LLM_ROOT/data/multisource_openbc_v2/full" --split test \
   --predictions "$RUN/test_best/test_predictions.jsonl" \
@@ -233,6 +294,21 @@ python scripts/score_point_readout.py \
 ```
 
 ## 验证记录
+
+2026-10-22 三卡改造的本地回归：**164 passed、2 skipped，125.44秒**。
+随后验证通信边界修正的相关检查 **38 passed、1 skipped**；最后补充单rank显存不足
+和协调失败传播后的分布式专项 **11 passed、1 skipped，26.80秒**。
+覆盖真实小型Qwen的全局加权梯度、尾批/空rank、三个进程的模型一致性、完整预测合并、
+分词超限汇总、模拟部分反传后OOM重算、单rank重试、单写入者失败传播，及训练中断
+续训后的逐参数和各rank随机状态一致性。GPU OOM由测试注入，没有实测A800 OOM。
+
+两类跳过是实际Qwen分词器资产缺失，以及本机Windows PyTorch的Gloo transport不可用。
+实际尝试原生Gloo初始化报 `makeDeviceForHostname(): unsupported gloo device`；
+三个CPU进程的集成测试使用文件交换/同步屏障作为**测试通信替身**，真实执行小型Qwen
+前后向和训练/评估/保存/续训逻辑。这不证明NCCL或GPU驱动/互联可用。
+生产三卡CUDA入口使用NCCL；必须在服务器完成三卡smoke，再评估速度、显存和效果。
+本地测试使用 `MKL_THREADING_LAYER=SEQUENTIAL`、`OMP_NUM_THREADS=1`、`PYTHONUTF8=1`，
+避免Windows重复OpenMP库及中文路径读取问题。CLI帮助与 `git diff --check` 通过。
 
 2026-10-21 本地 Windows 回归：**253 passed，1 skipped，136.33 秒**。
 覆盖新查询、构建/划分/配额/完整源清单、语言与换场诊断、旧 INS/多来源协议、

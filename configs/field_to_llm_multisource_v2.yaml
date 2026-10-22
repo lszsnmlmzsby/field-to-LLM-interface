@@ -101,7 +101,8 @@ cross_attention:
   gate_init: 0.0
 training:
   epochs: 2
-  batch_size: 16
+  # Global upper bound, NOT per GPU. Three ranks normally receive 16 each.
+  batch_size: 48
   gradient_accumulation_steps: 1
   lr: 5.0e-5
   gate_lr: 5.0e-4
@@ -122,6 +123,10 @@ evaluation:
   use_cache: true
 runtime:
   seed: 42
+  # Actual local batches use dynamic text padding. OOM retries split the same
+  # global update into smaller chunks without dropping/truncating any question.
+  max_micro_batch_size: 16
+  auto_micro_batch: true
   # Compact token arrays plus conservative per-entry accounting. No model graphs.
   token_cache_bytes: 2147483648
   token_cache_entries: 2000000

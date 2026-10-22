@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
+.pytest_tmp_*/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -57,6 +58,7 @@ Thumbs.db
 !/scripts/build_variable_shape_qa.py
 !/scripts/build_point_readout_qa.py
 !/scripts/train_point_readout.py
+!/scripts/readout_distributed.py
 !/scripts/score_point_readout.py
 !/scripts/benchmark_point_readout.py
 !/scripts/compare_block_readout.py
@@ -88,6 +90,7 @@ Thumbs.db
 !/tests/test_tensor_qwen_cross_attention.py
 !/tests/test_variable_shape_fields.py
 !/tests/test_point_readout.py
+!/tests/test_readout_distributed.py
 !/tests/test_block_readout.py
 !/tests/test_ins_tracer_readout.py
 !/tests/test_the_well_source.py
