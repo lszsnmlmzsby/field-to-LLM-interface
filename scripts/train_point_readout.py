@@ -80,15 +80,40 @@ def native_chat_ids(tokenizer, messages, *, generation_prompt):
                                          return_dict=False)
 
 
+class TokenBudgetError(ValueError):
+    """A validated native chat exceeds a length budget, never a tokenizer error."""
+
+    def __init__(self, *, qa_id, prompt_tokens, target_tokens, prompt_limit, target_limit,
+                 report=None, message=None):
+        self.qa_id = qa_id
+        self.prompt_tokens, self.target_tokens = prompt_tokens, target_tokens
+        self.prompt_limit, self.target_limit = prompt_limit, target_limit
+        self.report = report
+        if message is None:
+            message = (f"QA {qa_id}: Prompt has {prompt_tokens} tokens (max_prompt_tokens={prompt_limit}); "
+                       f"Answer has {target_tokens} tokens including EOS (max_target_tokens={target_limit}); "
+                       "truncation is forbidden")
+        super().__init__(message)
+
+
 def encode_prompt(record, tokenizer, max_prompt_tokens):
     ids = native_chat_ids(tokenizer, chat_messages(record), generation_prompt=True)
-    if not ids or len(ids) > max_prompt_tokens:
-        raise ValueError(f"Prompt {record['qa_id']} has {len(ids)} tokens; truncation is forbidden")
+    if not ids:
+        raise ValueError(f"Native chat prompt {record['qa_id']} is empty")
+    if len(ids) > max_prompt_tokens:
+        raise TokenBudgetError(qa_id=record["qa_id"], prompt_tokens=len(ids), target_tokens=None,
+            prompt_limit=max_prompt_tokens, target_limit=None,
+            message=(f"Prompt {record['qa_id']} has {len(ids)} tokens "
+                     f"(max_prompt_tokens={max_prompt_tokens}); truncation is forbidden"))
     return ids
 
 
 def encode_training_record(row, tokenizer, training):
-    prompt = encode_prompt(row, tokenizer, int(training["max_prompt_tokens"]))
+    # Check both complete lengths only after validating the native conversation.
+    # A prompt overflow must not hide a second target overflow or a broken template.
+    prompt = native_chat_ids(tokenizer, chat_messages(row), generation_prompt=True)
+    if not prompt:
+        raise ValueError(f"Native chat prompt {row['qa_id']} is empty")
     # Tokenize the complete conversation to preserve native assistant boundaries
     # and context-sensitive BPE, rather than joining separately tokenized strings.
     complete = native_chat_ids(tokenizer, chat_messages(row) +
@@ -99,8 +124,10 @@ def encode_training_record(row, tokenizer, training):
     if tokenizer.eos_token_id not in answer:
         raise ValueError("Native assistant template must terminate with tokenizer.eos_token_id")
     answer = answer[:answer.index(tokenizer.eos_token_id) + 1]
-    if len(answer) > int(training["max_target_tokens"]):
-        raise ValueError(f"Answer {row['qa_id']} exceeds max_target_tokens; truncation is forbidden")
+    prompt_limit, target_limit = int(training["max_prompt_tokens"]), int(training["max_target_tokens"])
+    if len(prompt) > prompt_limit or len(answer) > target_limit:
+        raise TokenBudgetError(qa_id=row["qa_id"], prompt_tokens=len(prompt), target_tokens=len(answer),
+                               prompt_limit=prompt_limit, target_limit=target_limit)
     return prompt, answer
 
 
@@ -155,19 +182,54 @@ class TrainingTokenCache:
         return packed
 
 
-def preflight_token_budgets(records, tokenizer, training, *, token_cache=None, split="unknown"):
-    """Check every prompt and answer without loading language-model weights."""
+def preflight_token_budgets(records, tokenizer, training, *, token_cache=None, split="unknown",
+                            raise_on_overflow=True):
+    """Scan every record and collect budget failures; semantic errors still stop immediately."""
     report = {"questions": 0, "max_prompt_tokens_observed": 0, "max_target_tokens_observed": 0,
               "prompt_limit": int(training["max_prompt_tokens"]),
-              "target_limit_including_eos": int(training["max_target_tokens"])}
+              "target_limit_including_eos": int(training["max_target_tokens"]),
+              "prompt_overflow_count": 0, "target_overflow_count": 0,
+              "overflow_questions": 0, "overflow_examples": [],
+              "max_prompt_record": None, "max_target_record": None}
     for index, row in enumerate(records):
-        prompt, answer = (token_cache.get(row, tokenizer, training) if token_cache is not None else
-                          encode_training_record(row, tokenizer, training))
+        try:
+            prompt, answer = (token_cache.get(row, tokenizer, training) if token_cache is not None else
+                              encode_training_record(row, tokenizer, training))
+            prompt_length, target_length = len(prompt), len(answer)
+        except TokenBudgetError as exc:
+            prompt_length, target_length = exc.prompt_tokens, exc.target_tokens
+        # This is bounded diagnostic metadata, not a second cache of all records.
+        detail = {"qa_id": row["qa_id"], "task_type": row.get("task_type"),
+                  "template_family": row.get("template_family"),
+                  "prompt_tokens": prompt_length, "target_tokens_including_eos": target_length}
         report["questions"] += 1
-        report["max_prompt_tokens_observed"] = max(report["max_prompt_tokens_observed"], len(prompt))
-        report["max_target_tokens_observed"] = max(report["max_target_tokens_observed"], len(answer))
+        if prompt_length > report["max_prompt_tokens_observed"]:
+            report["max_prompt_tokens_observed"], report["max_prompt_record"] = prompt_length, detail
+        if target_length > report["max_target_tokens_observed"]:
+            report["max_target_tokens_observed"], report["max_target_record"] = target_length, detail
+        prompt_overflow = prompt_length > report["prompt_limit"]
+        target_overflow = target_length > report["target_limit_including_eos"]
+        report["prompt_overflow_count"] += int(prompt_overflow)
+        report["target_overflow_count"] += int(target_overflow)
+        if prompt_overflow or target_overflow:
+            report["overflow_questions"] += 1
+            if len(report["overflow_examples"]) < 8:
+                report["overflow_examples"].append(detail)
         if (index + 1) % 100000 == 0:
-            print(f"token_preflight split={split} checked={index + 1}/{len(records)}", flush=True)
+            print(f"token_preflight split={split} checked={index + 1}/{len(records)} "
+                  f"max_prompt={report['max_prompt_tokens_observed']} "
+                  f"max_target={report['max_target_tokens_observed']} "
+                  f"prompt_overflow={report['prompt_overflow_count']} "
+                  f"target_overflow={report['target_overflow_count']}", flush=True)
+    report["status"] = "overflow" if report["overflow_questions"] else "ok"
+    if raise_on_overflow and report["overflow_questions"]:
+        raise TokenBudgetError(qa_id=None, prompt_tokens=report["max_prompt_tokens_observed"],
+            target_tokens=report["max_target_tokens_observed"], prompt_limit=report["prompt_limit"],
+            target_limit=report["target_limit_including_eos"], report=report,
+            message=(f"Token preflight split={split}: {report['overflow_questions']}/{report['questions']} "
+                     "questions exceed max_prompt_tokens or max_target_tokens; "
+                     f"observed maxima are {report['max_prompt_tokens_observed']} / "
+                     f"{report['max_target_tokens_observed']}; truncation is forbidden"))
     return report
 
 
@@ -698,8 +760,15 @@ def main():
         for split, d in datasets.items():
             print(f"token_preflight split={split} questions={len(d.records)}", flush=True)
             token_reports[split] = preflight_token_budgets(d.records, tokenizer, config["training"],
-                                                          token_cache=token_cache, split=split)
-        write_json(output / "token_preflight.json", token_reports)
+                token_cache=token_cache, split=split, raise_on_overflow=False)
+        token_report_path = output / "token_preflight.json"
+        write_json(token_report_path, token_reports)
+        overflow_splits = [split for split, report in token_reports.items() if report["overflow_questions"]]
+        if overflow_splits:
+            raise ValueError(f"Token budgets exceeded in {', '.join(overflow_splits)}; all requested splits "
+                f"were scanned. See {token_report_path.resolve()}. Review training.max_prompt_tokens, "
+                "training.max_target_tokens and evaluation.max_new_tokens against the observed maxima; "
+                "no records were truncated and no language-model weights were loaded.")
         if cli.token_check_only:
             print("token_check_complete=" + json.dumps(token_reports), flush=True)
             return

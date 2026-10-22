@@ -43,8 +43,11 @@
 能力权重 `readout:4/localization:3/aggregation:2/composition:1` 用于抽题，
 不是保证最终题目严格按该比例分配；受无放回选择和小场可用任务影响，实际比例
 记录在 metadata。默认最多11题而非把14类题的所有语言版本都重复加入训练。
-prompt/answer token 预算增加为 768/256，完整分词预检会在加载 Qwen 权重前检查
-所用题目，超限报错而不截断。
+prompt/answer token 上限为 2048/256。2026-10-22 的服务器日志确认存在 788-token
+题目，原来的 768 上限不足，现已提高。2048 是允许上限，不是已测出的全集最大值；
+实际最大长度以服务器真实分词器的完整预检报告为准。
+批次只填充到该批次实际最长序列，不会把每道题都填充到2048。
+完整预检统计各划分全部超限题及最大长度，保存报告后仍拒绝超限训练，不截断或删题。
 
 ## 1. 同步代码并完成源下载（无需 GPU）
 
@@ -89,6 +92,34 @@ token 检查已包含源裁剪/真值审计，使用服务器上的真实分词�
 额外的 `diagnostics_val.jsonl` / `diagnostics_test.jsonl` 使用对应 split 的场，
 每个来源默认选16个场，每条语义查询配一条已见表达和一条保留表达；不进入训练。
 smoke 对应每个来源2个诊断场，仅用于流水线检查。
+
+### 已构建完成，但遇到 788 > 768 报错后的恢复
+
+日志中训练4,685,677题、val/test各22,483题已完成构建和数据审计。错误发生在加载
+Qwen权重之前；这些数据可以原样复用，无需重新下载、构建或修改metadata。
+同步修正后的训练脚本和v2配置，然后只重跑分词预检，使用新的输出目录：
+
+```bash
+source /workspace/wyx/f2llm/enter_f2llm.sh
+cd /workspace/wyx/f2llm/tensor-compression
+export MULTI_CONFIG=configs/field_to_llm_multisource_v2.yaml
+TOKEN_CHECK_DIR="$FIELD_TO_LLM_RUNS_DIR/multisource_v2_tokens_$(date +%Y%m%d_%H%M%S)"
+
+python -u scripts/train_point_readout.py \
+  --config "$MULTI_CONFIG" --profile full --token-check-only --device cpu \
+  --output-dir "$TOKEN_CHECK_DIR"
+```
+
+`token_preflight.json` 记录各划分的实际最大prompt/answer长度与超限统计。预算超限时
+完成扫描并写报告后退出失败，不加载模型；模板或EOS格式错误仍立即失败。
+预检通过后继续下面的几何检查、smoke、正式训练，使用同一份修正后的配置。
+本次只调整文本长度上限；字段、问题、划分、batch和训练轮数均不变。
+若已有checkpoint，它的原训练上限属于严格续训身份，应使用其保存配置续训，
+不要直接换成本次配置。本次报错发生在训练开始前，没有这个续训冲突。
+
+本次修复的本地验证：预检/旧训练/性能回归106通过、1跳过；错误提示最后调整后
+定向检查11通过；新版训练/续训及长问句动态padding检查3通过。跳过项仍是实际
+Qwen分词器资产缺失；尚未测出服务器这份完整QA的最大token长度。
 
 ## 3. 真实 Qwen 检查与正式训练
 

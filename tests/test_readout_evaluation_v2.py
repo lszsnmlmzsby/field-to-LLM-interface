@@ -143,11 +143,70 @@ def test_preflight_checks_every_answer_and_preserves_bounded_token_reuse():
     cache = trainer.TrainingTokenCache(tokenizer, training, max_bytes=100000, max_entries=1)
     report = trainer.preflight_token_budgets(rows, tokenizer, training, token_cache=cache)
     assert report["questions"] == len(rows)
+    assert report["status"] == "ok" and report["overflow_questions"] == 0
     assert report["max_target_tokens_observed"] > 1
     assert len(cache.entries) == 1 and cache.bytes <= cache.max_bytes
     malformed = {**rows[-1], "answer": json.dumps([1.2345] * 100)}
-    with pytest.raises(ValueError, match="max_target_tokens"):
+    with pytest.raises(trainer.TokenBudgetError, match="max_target_tokens") as exc:
         trainer.preflight_token_budgets([*rows, malformed], tokenizer, training, token_cache=cache)
+    assert exc.value.report["questions"] == 3
+    assert exc.value.report["target_overflow_count"] == 1
+    assert exc.value.report["prompt_overflow_count"] == 0
+
+
+def test_preflight_collects_all_overflows_and_extrema_without_caching_or_truncating_invalid_records():
+    _, rows, _ = rows_and_states()
+    tokenizer = CharacterTokenizer()
+    ample = {"max_prompt_tokens": 10000, "max_target_tokens": 1000}
+    base_prompt, base_answer = trainer.encode_training_record(rows[0], tokenizer, ample)
+    training = {"max_prompt_tokens": len(base_prompt), "max_target_tokens": len(base_answer)}
+    expanded = []
+    for index in range(12):
+        expanded.append({**rows[0], "qa_id": f"overflow-{index}", "template_family": "test-expression",
+                         "question": rows[0]["question"] + " extra" * (index + 1),
+                         "answer": json.dumps([1] * (index + 10))})
+    prompt, answer = trainer.encode_training_record(expanded[-1], tokenizer, ample)
+    cache = trainer.TrainingTokenCache(tokenizer, training, max_bytes=100000, max_entries=1)
+    report = trainer.preflight_token_budgets([*expanded, rows[0]], tokenizer, training,
+                                            token_cache=cache, raise_on_overflow=False)
+    assert report["questions"] == 13 and report["status"] == "overflow"
+    assert report["overflow_questions"] == report["prompt_overflow_count"] == report["target_overflow_count"] == 12
+    assert len(report["overflow_examples"]) == 8
+    assert report["max_prompt_tokens_observed"] == len(prompt)
+    assert report["max_target_tokens_observed"] == len(answer)
+    assert report["max_prompt_record"]["qa_id"] == report["max_target_record"]["qa_id"] == "overflow-11"
+    assert report["max_prompt_record"]["task_type"] == "single_point"
+    assert report["max_prompt_record"]["template_family"] == "test-expression"
+    assert len(cache.entries) == 1 and cache.bytes <= cache.max_bytes
+    for encode in (trainer.encode_training_record, lambda row, tok, settings: cache.get(row, tok, settings),
+                   lambda row, tok, settings: trainer.training_tensors([row], tok, settings)):
+        with pytest.raises(trainer.TokenBudgetError, match="truncation is forbidden") as exc:
+            encode(expanded[-1], tokenizer, training)
+        assert exc.value.qa_id == "overflow-11"
+        assert (exc.value.prompt_tokens, exc.value.target_tokens) == (len(prompt), len(answer))
+        assert (exc.value.prompt_limit, exc.value.target_limit) == tuple(training.values())
+
+
+@pytest.mark.parametrize("fault", ["prefix", "eos", "tokenizer"])
+def test_preflight_never_hides_tokenizer_or_template_errors_behind_budget_overflow(fault):
+    _, rows, _ = rows_and_states()
+
+    class InvalidTokenizer(CharacterTokenizer):
+        def apply_chat_template(self, *args, **kwargs):
+            result = super().apply_chat_template(*args, **kwargs)
+            if not kwargs["add_generation_prompt"]:
+                if fault == "prefix":
+                    result[0] = 99
+                elif fault == "eos":
+                    result = result[:-2]
+                else:
+                    raise RuntimeError("tokenizer failed")
+            return result
+
+    with pytest.raises((ValueError, RuntimeError), match={"prefix": "prefix", "eos": "terminate", "tokenizer": "tokenizer failed"}[fault]) as exc:
+        trainer.preflight_token_budgets(rows, InvalidTokenizer(),
+            {"max_prompt_tokens": 1, "max_target_tokens": 1}, raise_on_overflow=False)
+    assert not isinstance(exc.value, trainer.TokenBudgetError)
 
 
 def test_token_check_only_audits_all_main_splits_and_never_loads_llm(tmp_path, monkeypatch):
@@ -155,7 +214,7 @@ def test_token_check_only_audits_all_main_splits_and_never_loads_llm(tmp_path, m
     config["data"].update(qa_dir=str(tmp_path / "qa"), hdf5_path=str(tmp_path / "source.hdf5"))
     _, rows, _ = rows_and_states()
     opened, closed = [], []
-    corrupt_test = False
+    corrupt_train = False
 
     class Dataset:
         identity = "fixture"
@@ -164,7 +223,8 @@ def test_token_check_only_audits_all_main_splits_and_never_loads_llm(tmp_path, m
         def __init__(self, qa, source, split, **kwargs):
             self.split = split
             self.records = copy.deepcopy(rows[:1])
-            if corrupt_test and split == "test":
+            if corrupt_train and split == "train":
+                self.records[0]["question"] += " extra" * 500
                 self.records[0]["answer"] = json.dumps([1.12345] * 100)
             opened.append(split)
 
@@ -190,11 +250,21 @@ def test_token_check_only_audits_all_main_splits_and_never_loads_llm(tmp_path, m
     report = json.loads((tmp_path / "checked" / "token_preflight.json").read_text())
     assert set(report) == {"train", "val", "test"}
     assert opened == closed == ["train", "val", "test"]
-    corrupt_test = True
-    monkeypatch.setattr("sys.argv", command + ["--output-dir", str(tmp_path / "rejected")])
-    with pytest.raises(ValueError, match="max_target_tokens"):
-        trainer.main()
-    assert not (tmp_path / "rejected" / "token_preflight.json").exists()
+    corrupt_train = True
+    for token_check_only in (True, False):
+        destination = tmp_path / f"rejected_{token_check_only}"
+        options = command if token_check_only else [arg for arg in command if arg != "--token-check-only"]
+        monkeypatch.setattr("sys.argv", options + ["--output-dir", str(destination)])
+        with pytest.raises(ValueError, match="max_target_tokens") as exc:
+            trainer.main()
+        assert "token_preflight.json" in str(exc.value)
+        report = json.loads((destination / "token_preflight.json").read_text())
+        expected_splits = ["train", "val", "test"] if token_check_only else ["train", "val"]
+        assert set(report) == set(expected_splits)
+        assert all(report[split]["questions"] == 1 for split in expected_splits)
+        assert report["train"]["prompt_overflow_count"] == report["train"]["target_overflow_count"] == 1
+        assert report["val"]["status"] == "ok"
+        assert opened[-len(expected_splits):] == closed[-len(expected_splits):] == expected_splits
 
 
 def test_geometry_only_preflights_shared_boundary_probes_without_loading_val_or_changing_manifest(tmp_path, monkeypatch):

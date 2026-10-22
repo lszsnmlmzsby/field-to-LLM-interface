@@ -110,7 +110,9 @@ training:
   min_lr_ratio: 0.2
   grad_clip_norm: 1.0
   value_reconstruction_weight: 0.01
-  max_prompt_tokens: 768
+  # 32-point region_first questions can exceed 768 native Qwen tokens.
+  # This is a rejection limit, not fixed padding; verify the complete QA corpus.
+  max_prompt_tokens: 2048
   max_target_tokens: 256
   log_interval: 20
   save_every_updates: 2048

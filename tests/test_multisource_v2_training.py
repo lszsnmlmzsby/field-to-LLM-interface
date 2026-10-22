@@ -7,11 +7,35 @@ from pathlib import Path
 import torch
 
 from test_multisource_readout import config as source_fixture
-from test_point_readout import tiny_components
+from test_point_readout import CharacterTokenizer, tiny_components
 from tensor_compression.downstream.point_readout_data import build_dataset, load_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_long_program_question_uses_actual_padding_and_preserves_qa():
+    import pytest
+    from scripts import train_point_readout as trainer
+    from tensor_compression.downstream.field_query_program import make_program_record
+
+    program = {"version": 1, "task": "multi_point", "expression": {"op": "read",
+        "selector": {"kind": "points", "points": [[i // 8 + 1, i % 8 + 1] for i in range(32)]}}}
+    row = make_program_record("long-fixture", torch.zeros(8, 8), "multi_point", program, "region_first")
+    original = copy.deepcopy(row)
+    training = load_config(ROOT / "configs/field_to_llm_multisource_v2.yaml", "full")["training"]
+    tokenizer = CharacterTokenizer()  # Local regression only; not the real Qwen tokenizer.
+    with pytest.raises(ValueError, match="Prompt"):
+        trainer.encode_training_record(row, tokenizer, {**training, "max_prompt_tokens": 768})
+    prompt, answer = trainer.encode_training_record(row, tokenizer, training)
+    assert len(prompt) > 768
+    ids, mask, labels = trainer.training_tensors([row], tokenizer, training)
+    assert ids.shape == (1, len(prompt) + len(answer))
+    assert bool(mask.all()) and labels.ne(-100).sum().item() == len(answer)
+    higher = {**training, "max_prompt_tokens": training["max_prompt_tokens"] * 2}
+    for actual, expected in zip(trainer.training_tensors([row], tokenizer, higher), (ids, mask, labels)):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert row == original
 
 
 def test_v2_recipe_preserves_complete_sources_and_expands_crop_budget():
