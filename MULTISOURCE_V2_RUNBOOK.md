@@ -131,6 +131,8 @@ full/pilot 默认48、累积1、两轮；`--micro-batch-size` 是每卡一次前
 同一全局批次可在每卡拆成若干小批次累积；发生前后向 CUDA OOM 时，清除本卡这次
 更新的全部梯度、恢复随机/缓冲状态，然后减小小批次重算，其他卡等待后统一同步梯度。
 重试上限按16→8→4→2→1降低（尾批可能更小）；降到1仍OOM会明确失败。
+2026-10-25 起，新配置默认按场面积和完整文本长度分别记忆小批次上限，
+不再让一次大输入的 OOM 永久限制后续所有小输入；每卡上限仍为16。
 该恢复只针对前后向显存不足，不能修复模型加载、优化器状态、通信阶段或其他异常。
 成功降低的每卡上限会保存到 checkpoint 并在续训时恢复。
 
@@ -139,7 +141,8 @@ full/pilot 默认48、累积1、两轮；`--micro-batch-size` 是每卡一次前
 全局48相比原16减少每轮更新次数；精确次数以 `training_plan.json` 为准，不保证恰好1/3。
 学习率仍为5e-5/gate 5e-4，warmup比例和两轮不变，不自动将学习率乘3。
 保存/验证仍按原2048/8192次更新触发；因此两次检查之间通常会覆盖更多问题。
-验证、测试按场分给三卡生成，汇总完整预测检查QA ID无遗漏、无重复，再计算总指标。
+验证、测试按场分给三卡生成；新配置每卡最多合批8个同场问题，独立维护文本上下文
+和结束符。汇总完整预测检查QA ID无遗漏、无重复，再计算总指标。
 
 源裁剪审计只由rank0完整执行一次；分词预检按问题分片，全体合起来仍覆盖所有要求的题。
 模型文件哈希只在rank0读取一次，各rank模型/分词器/配置/数据身份还会相互核对。
@@ -234,6 +237,67 @@ python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
 torchrun启动器被终止时可能强制结束worker，不能保证信号处理有足够时间保存；
 计划内短跑优先用 `--stop-after-updates`，强制收回资源后使用最后一次完整的 `last.pt`。
 
+### 4.1 已有三卡训练启用执行加速（2026-10-25）
+
+同步本次 `scripts/train_point_readout.py`、`scripts/train_tensor_qwen_cross_attention.py`
+和配置后，已有完整源数据、QA和checkpoint可继续使用。
+旧 `resolved_config.json` 没有新增开关，因此第一次续训显式启用：
+
+```bash
+source /workspace/wyx/f2llm/enter_f2llm.sh
+cd /workspace/wyx/f2llm/tensor-compression
+export CUDA_VISIBLE_DEVICES=0,1,2
+export OMP_NUM_THREADS=1
+RUN="$FIELD_TO_LLM_RUNS_DIR/multisource_v2_3gpu_b48_full_1x1"
+
+python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
+  scripts/train_point_readout.py \
+  --config "$RUN/resolved_config.json" --profile full \
+  --resume "$RUN/last.pt" --output-dir "$RUN" \
+  --micro-batch-size 16 --adaptive-micro-batch \
+  --eval-batch-size 8 --eval-parity-check-questions 32 \
+  --console-every-updates 200
+```
+
+不加覆盖参数，不重建数据，不修改全局 `--batch-size`。三卡数量仍须一致。
+原数据每轮4,685,677题、两轮9,371,354次呈现、208,570次更新保持不变。
+全局每批上限48，同形状尾批仍可不足48；此次变化的是每卡物理计算块，
+允许便宜输入恢复到8/16，不同卡也可使用不同计算块。梯度仍按全局实际题数归一化。
+学习率、优化器状态、下一批位置、验证/保存间隔继续从原checkpoint恢复。
+
+按成本分桶仅是显存适配启发式，不能保证每个新桶第一次就适配。
+初次遇到较贵输入可能打印 `oom_retry`，会清除未完成更新的所有本地梯度，
+恢复随机/缓冲状态后重算完整本地更新，不跳题、不额外执行优化器更新。
+学习到的分桶上限写入各rank的checkpoint；旧checkpoint的统一上限4不会锁死所有新桶。
+改变计算块可能改变浮点累加次序，不能保证逐位相同的参数轨迹。
+
+验证、测试保留全部问题、原生成长度上限、贪心策略和评分标准；同一场只编码一次，
+共享只读场记忆，问题之间不共享文本历史。解码OOM时减小合批重试同一组待答问题。
+每次验证、每张卡对最先进入合批的最多32题再做逐条生成对照；若有差异，
+当前组改用逐条结果，该卡本次剩余验证回退到逐条。输出 `batch_parity_checked`、
+`batch_parity_mismatches`，并记录各卡最终 `evaluation_batch_limit`。
+这是抽查，不保证未抽查问题在BF16下逐位相同，也不是科学任务准确率证明。
+若要求全量逐条生成基准，可将 `--eval-batch-size` 设为1。
+
+看性能时使用新增日志：
+
+- `training_window.questions_per_second`、`seconds_per_update`：最近日志窗口内纯训练，
+  含本次更新的重试、同步等待与优化器开销，排除验证、保存和日志写盘。
+- `per_rank_execution.micro_batch_sizes`：各卡实际拆分；`cost_bucket`为面积的二进制
+  数量级和文本长度的128-token分桶，不是裁剪形状限制。
+- `local_compute_seconds`含数据读取/分词/前后向/重试；
+  `synchronization_and_wait_seconds`含同步及等待其他卡，不能直接当作网络传输时间。
+- `validation ... elapsed_seconds`：完整验证实测用时，含生成对照、汇总与评分。
+
+旧日志稳定训练约2.1–2.2秒/更新、完整验证约2.1小时，只可作为粗略对照。
+需要相似输入成本和足够多更新的远端测量才能判断收益；未实测前不承诺加速倍数。
+若主动做短跑，在上面的完整续训命令追加 `--stop-after-updates 200`，它表示额外200步，
+不会改变两轮总预算；之后移除该参数再次续训。启动的全量审计和分词预检仍会执行。
+
+全局batch按成本变化并非天然有害，但会改变梯度噪声、每轮更新次数以及基于step的
+学习率调度；若简单对不同大小的batch等权，还会改变样本对每次更新的相对权重。
+因此这次对正在进行的实验先采用物理计算块自适应，保留既定优化过程。
+
 ## 5. 正式测试、语言测试和输入依赖诊断
 
 训练结束后对每个结构执行以下四种独立评测。后三种是补充诊断，不能替代正式test。
@@ -294,6 +358,26 @@ python scripts/score_point_readout.py \
 ```
 
 ## 验证记录
+
+2026-10-25 执行加速主回归：**163 passed、2 skipped，106.27秒**。
+随后加入共享场K/V零拷贝批维展开，相关专项回归：**42 passed、1 skipped，31.85秒**；
+两组存在重叠，不应相加作为独立用例数。覆盖不同长度提示的合批/逐条生成一致性，
+缓存开关、1×1/2×2结构、独立EOS与长度上限、完整QA顺序与评分、关闭场诊断、
+模拟解码OOM/舍入差异后的不丢题回退、按成本记录OOM上限、全局加权梯度、
+三个CPU进程由旧执行配置续训到新配置、参数与随机状态一致性。
+CUDA OOM仍由测试注入；三进程测试使用文件通信替身，原生Gloo在本机不可用。
+另一个跳过项是缺少实际Qwen分词器资产。
+
+主回归首次发现一处旧测试替身未返回新增的计时/合批诊断字段，已补齐后重跑通过。
+补充回归首次因Windows临时路径的8.3短名与长名字符串比较失败；指定项目内明确的
+临时目录后通过，未改变生产路径规则。CLI帮助与 `git diff --check` 通过。
+
+在本机RTX 5060 Laptop GPU / torch 2.9.1+cu128上，默认SDPA后端的小型BF16
+共享场注意力合批与逐条结果比较通过（本次最大绝对差0），K/V展开与原张量共享存储。
+强制Flash Attention检查失败，原因是本机Windows PyTorch未编译该内核；生产代码
+仍由PyTorch自行选择SDPA后端，不强制它。该局部检查不证明Linux torch 2.4.1的
+融合内核、Qwen14B生成逐题一致性、三张A800显存或整体加速倍数。
+未在远端执行本次改动，也未重新执行完整源下载、QA构建或正式训练。
 
 2026-10-22 三卡改造的本地回归：**164 passed、2 skipped，125.44秒**。
 随后验证通信边界修正的相关检查 **38 passed、1 skipped**；最后补充单rank显存不足

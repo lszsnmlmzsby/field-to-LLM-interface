@@ -177,6 +177,185 @@ def test_evaluation_failure_clears_memory_and_does_not_skip_question(tmp_path, m
     assert all(bridge._projected_memory is None for bridge in sidecar.bridges)
 
 
+@pytest.mark.parametrize("use_cache", [False, True])
+@pytest.mark.parametrize("block", [1, 2])
+def test_batched_greedy_matches_individual_variable_length_prompts(use_cache, block):
+    _, _, _, _, config = tiny_components()
+    config["memory"]["block_shape"] = [block, block]
+    _, llm, sidecar, tokenizer, _ = tiny_components(config)
+    trainer.core.set_frozen_llm_execution_mode(llm, checkpoint_training=False)
+    sidecar.eval()
+    prompts = [[50, 61, 72], [82], [50, 61, 72, 83, 94]]
+    with torch.inference_mode():
+        sidecar.bind(TinyDataset().fields["a"][None])
+        try:
+            expected = [trainer.generate_from_prompt(llm, tokenizer, p, torch.device("cpu"),
+                        torch.float32, max_new_tokens=8, use_cache=use_cache) for p in prompts]
+            actual = trainer.generate_from_prompts(llm, tokenizer, prompts, torch.device("cpu"),
+                        torch.float32, max_new_tokens=8, use_cache=use_cache)
+            assert actual == expected
+            # Projections retain batch ONE; shared field memory is not duplicated.
+            assert all(bridge._projected_memory[0].shape[0] == 1 for bridge in sidecar.bridges)
+        finally:
+            sidecar.clear()
+
+
+def test_batched_decoder_independent_eos_padding_positions_and_token_budget(monkeypatch):
+    from types import SimpleNamespace
+    calls = []
+    class ScriptedModel:
+        config = SimpleNamespace(eos_token_id=[2, 3])
+
+        def __call__(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(last_hidden_state=torch.zeros(3, 1, 4), past_key_values="cache")
+
+        def get_output_embeddings(self):
+            def project(hidden):
+                logits = torch.full((3, 256), -100.)
+                tokens = ([2, 81, 82], [99, 3, 83], [99, 99, 84])[len(calls) - 1]
+                logits[torch.arange(3), torch.tensor(tokens)] = 100
+                return logits
+            return project
+    model, tokenizer = ScriptedModel(), CharacterTokenizer()
+    monkeypatch.setattr(trainer.core, "decoder_backbone", lambda model: model)
+    predictions = trainer.generate_from_prompts(model, tokenizer, [[51], [61, 62, 63], [71, 72]],
+        torch.device("cpu"), torch.float32, max_new_tokens=3)
+    assert [p["generated_tokens"] for p in predictions] == [1, 2, 3]
+    assert [p["stop_token_id"] for p in predictions] == [2, 3, None]
+    assert [p["terminated"] for p in predictions] == [True, True, False]
+    assert predictions[0]["prediction"] == ""
+    assert predictions[1]["prediction"] == tokenizer.decode([81])
+    assert predictions[2]["prediction"] == tokenizer.decode([82, 83, 84])
+    assert calls[0]["attention_mask"].tolist() == [[0, 0, 1], [1, 1, 1], [0, 1, 1]]
+    assert calls[0]["position_ids"].tolist() == [[0, 0, 0], [0, 1, 2], [0, 0, 1]]
+    assert calls[1]["input_ids"].shape == (3, 1)
+    assert calls[1]["position_ids"][1:].tolist() == [[3], [2]]
+    assert calls[1]["attention_mask"][:, -1].tolist() == [0, 1, 1]
+    assert calls[2]["attention_mask"][:, -1].tolist() == [0, 0, 1]
+
+
+@pytest.mark.parametrize("input_mode", ["correct", "disabled"])
+def test_batched_evaluation_preserves_all_rows_order_metrics_and_field_boundaries(tmp_path, input_mode):
+    _, llm, sidecar, tokenizer, config = tiny_components()
+    config["evaluation"]["max_new_tokens"] = 8
+    dataset = TinyDataset()
+    serial = tmp_path / "serial.jsonl"
+    expected = trainer.evaluate(llm, sidecar, tokenizer, dataset, torch.device("cpu"), torch.float32,
+                                config, serial, input_mode=input_mode)
+    config["runtime"].update(eval_batch_size=8, eval_parity_check_questions=32)
+    batched = tmp_path / "batched.jsonl"
+    actual = trainer.evaluate(llm, sidecar, tokenizer, dataset, torch.device("cpu"), torch.float32,
+                              config, batched, input_mode=input_mode)
+    assert serial.read_bytes() == batched.read_bytes()
+    for key in ("questions", "macro_task_answer_accuracy", "valid_rate", "errors", "seen_shapes",
+                "heldout_shapes", "by_family", "generated_tokens", "zero_value_baseline"):
+        assert actual[key] == expected[key]
+    assert actual["generation_batches"] == 3 < expected["generation_batches"]
+    assert actual["batch_parity_checked"] == 2 and actual["batch_parity_mismatches"] == 0
+    assert actual["field_memory_encodes"] == (3 if input_mode == "correct" else 0)
+    assert sidecar._bound_state is None
+
+
+@pytest.mark.parametrize("failure", ["oom", "parity"])
+def test_batched_evaluation_fallback_never_drops_questions(tmp_path, monkeypatch, failure):
+    _, llm, sidecar, tokenizer, config = tiny_components()
+    config["evaluation"]["max_new_tokens"] = 4
+    dataset = TinyDataset()
+    reference = tmp_path / "reference.jsonl"
+    trainer.evaluate(llm, sidecar, tokenizer, dataset, torch.device("cpu"), torch.float32, config, reference)
+    config["runtime"].update(eval_batch_size=8, eval_parity_check_questions=32)
+    real_generate = trainer.generate_from_prompts
+    injected = []
+    def generate(*args, **kwargs):
+        if len(args[2]) > 1 and not injected:
+            injected.append(True)
+            if failure == "oom":
+                raise torch.cuda.OutOfMemoryError("injected, not actual GPU OOM")
+            result = real_generate(*args, **kwargs)
+            result[0]["prediction"] += "different"
+            return result
+        return real_generate(*args, **kwargs)
+    monkeypatch.setattr(trainer, "generate_from_prompts", generate)
+    output = tmp_path / "fallback.jsonl"
+    metrics = trainer.evaluate(llm, sidecar, tokenizer, dataset, torch.device("cpu"), torch.float32, config, output)
+    assert output.read_bytes() == reference.read_bytes()
+    assert metrics["questions"] == len(dataset) and metrics["evaluation_batch_limit"] == 1
+    assert metrics["evaluation_oom_retries"] == int(failure == "oom")
+    assert metrics["batch_parity_mismatches"] == int(failure == "parity")
+    assert sidecar._bound_state is None
+
+
+def test_adaptive_micro_batch_cost_limits_persist_without_penalizing_small_fields():
+    _, _, _, tokenizer, config = tiny_components()
+    dataset = TinyDataset()
+    dataset.records[0] = {**dataset.records[0], "grid_shape": [128, 128]}
+    controller = trainer.AdaptiveMicroBatch(16)
+    big, limit = controller.select(dataset, [[0]], tokenizer, config["training"], None)
+    assert limit == 16
+    controller.record_oom(big, 4)
+    assert controller.select(dataset, [[0]], tokenizer, config["training"], None)[1] == 4
+    assert controller.select(dataset, [[1]], tokenizer, config["training"], None)[1] == 16
+    restored = trainer.AdaptiveMicroBatch(8, controller.state_dict())
+    assert restored.select(dataset, [[0]], tokenizer, config["training"], None)[1] == 4
+    assert restored.select(dataset, [[1]], tokenizer, config["training"], None)[1] == 8
+
+
+def test_adaptive_chunks_preserve_global_weighted_gradients():
+    from scripts.readout_distributed import ParallelContext
+    _, llm, sidecar, tokenizer, config = tiny_components()
+    dataset, results = TinyDataset(), []
+    for controller in (None, trainer.AdaptiveMicroBatch(2)):
+        sidecar.train()
+        sidecar.zero_grad(set_to_none=True)
+        values, _, execution = trainer.backward_update(llm, sidecar, tokenizer, dataset, [[0, 1, 3], [2]],
+            torch.device("cpu"), torch.float32, config["training"], ParallelContext("cpu"), 1,
+            adaptive_micro_batch=controller)
+        results.append((values, {n: p.grad.clone() for n, p in sidecar.named_parameters() if p.grad is not None}))
+        assert execution[0]["questions"] == 4
+    assert results[0][0] == pytest.approx(results[1][0], rel=1e-5, abs=1e-6)
+    for name, gradient in results[0][1].items():
+        torch.testing.assert_close(gradient, results[1][1][name], rtol=1e-4, atol=1e-6)
+
+
+def test_adaptive_oom_learning_survives_restore_and_retries_whole_update(monkeypatch):
+    from scripts.readout_distributed import ParallelContext, capture_rng, restore_rng
+    from test_readout_distributed import ToySidecar
+    _, _, _, tokenizer, config = tiny_components()
+    dataset = TinyDataset()
+    dataset.records = [copy.deepcopy(dataset.records[0]) for _ in range(7)]
+    for row in dataset.records:
+        row["grid_shape"] = [128, 128]  # Cost metadata; the loss stub uses no encoder.
+    controller = trainer.AdaptiveMicroBatch(4)
+    injected = []
+    def loss_fn(llm, module, tokenizer, records, fields, *args, **kwargs):
+        module.calls.add_(1)
+        torch.rand(1)
+        if len(records) == 3 and not injected:
+            injected.append(True)
+            module.weight.grad.add_(123)
+            raise torch.cuda.OutOfMemoryError("injected after a successful chunk")
+        loss = (module.weight * fields).square().mean()
+        return loss, {"answer_ce": float(loss.detach()), "reconstruction": 0.}
+    monkeypatch.setattr(trainer, "training_loss", loss_fn)
+    device, context = torch.device("cpu"), ParallelContext("cpu")
+    initial_rng, actual = capture_rng(device), ToySidecar()
+    values, cap, reports = trainer.backward_update(None, actual, tokenizer, dataset, [list(range(7))],
+        device, torch.float32, config["training"], context, 4, adaptive_micro_batch=controller)
+    final_rng = capture_rng(device)
+    assert cap == 2 and reports[0]["oom_retries"] == 1
+    restored = trainer.AdaptiveMicroBatch(4, controller.state_dict())
+    assert restored.select(dataset, [list(range(7))], tokenizer, config["training"], None)[1] == 2
+    restore_rng(initial_rng, device)
+    reference = ToySidecar()
+    expected, _, _ = trainer.backward_update(None, reference, tokenizer, dataset, [list(range(7))],
+        device, torch.float32, config["training"], context, 2)
+    assert values == expected
+    torch.testing.assert_close(actual.weight.grad, reference.weight.grad, rtol=0, atol=0)
+    assert actual.calls == reference.calls == 4
+    assert torch.equal(final_rng["torch_rng"], torch.get_rng_state())
+
+
 def test_multisource_cli_training_resume_test_and_independent_provenance_scores(
         multisource_fixture, tmp_path, monkeypatch):
     """Real HDF5 factory/audit, tiny Qwen training, strict resume and held-out test.

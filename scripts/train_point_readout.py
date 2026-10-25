@@ -279,11 +279,12 @@ def training_loss(llm, sidecar, tokenizer, records, fields, device, dtype, train
 
 
 def _backward_chunks(llm, sidecar, tokenizer, dataset, local_batches, device, dtype,
-                     training, token_cache, micro_batch_size, global_count):
+                     training, token_cache, micro_batch_size, global_count, attempt_state):
     values, sizes = [0.0, 0.0, 0.0], []
     for indices in local_batches:
         for start in range(0, len(indices), micro_batch_size):
             chunk = indices[start:start + micro_batch_size]
+            attempt_state["size"] = len(chunk)
             records, fields = zip(*(dataset[index] for index in chunk))
             try:
                 loss, components = training_loss(llm, sidecar, tokenizer, records, torch.stack(fields),
@@ -301,8 +302,42 @@ def _backward_chunks(llm, sidecar, tokenizer, dataset, local_batches, device, dt
     return values, sizes
 
 
+class AdaptiveMicroBatch:
+    """Per-rank execution limits; never changes the global batch or its order.
+
+    Quantized field area and complete text length distinguish cheap inputs from
+    expensive ones. An OOM limit also applies to buckets at least as large in
+    BOTH dimensions. These are conservative hints, not a memory-fit guarantee.
+    """
+
+    def __init__(self, maximum, state=None):
+        self.maximum = int(maximum)
+        self.limits = {tuple(row[:2]): int(row[2]) for row in (state or [])}
+
+    def select(self, dataset, local_batches, tokenizer, training, token_cache):
+        area = length = 1
+        for indices in local_batches:
+            for index in indices:
+                row = dataset.records[index]
+                area = max(area, math.prod(row["grid_shape"]))
+                prompt, answer = (token_cache.get(row, tokenizer, training) if token_cache is not None
+                                  else encode_training_record(row, tokenizer, training))
+                length = max(length, len(prompt) + len(answer))
+        key = ((area - 1).bit_length(), (length + 127) // 128)
+        limit = min([self.maximum] + [cap for (a, t), cap in self.limits.items()
+                                     if a <= key[0] and t <= key[1]])
+        return key, limit
+
+    def record_oom(self, key, limit):
+        self.limits[key] = min(limit, self.limits.get(key, self.maximum))
+
+    def state_dict(self):
+        return [[*key, value] for key, value in sorted(self.limits.items())]
+
+
 def backward_update(llm, sidecar, tokenizer, dataset, batches, device, dtype, training,
-                    parallel, micro_batch_size, *, token_cache=None, auto_micro_batch=True):
+                    parallel, micro_batch_size, *, token_cache=None, auto_micro_batch=True,
+                    adaptive_micro_batch=None):
     """One complete global update; retry local OOMs BEFORE any gradient collective.
 
     Retry all local contributions, not only the failed chunk: backward may have
@@ -313,18 +348,27 @@ def backward_update(llm, sidecar, tokenizer, dataset, batches, device, dtype, tr
     if global_count <= 0:
         raise ValueError("An optimizer update must contain questions")
     local_batches = [partition_batch(batch, parallel.rank, parallel.world_size) for batch in batches]
+    compute_start = time.perf_counter()
+    cost_bucket = None
     initial_rng = capture_rng(device)
     initial_buffers = {name: buffer.detach().clone() for name, buffer in sidecar.named_buffers()}
     attempts, error, values, sizes = 0, None, [0.0] * 3, []
+    attempt_state = {"size": 0}
     while True:
         sidecar.zero_grad(set_to_none=True)
         failed_size = None
         try:
+            if adaptive_micro_batch is not None and attempts == 0:
+                # A preparation error participates in the same coordinated
+                # failure path as backward, rather than stranding other ranks.
+                # Old checkpoints' universal OOM cap does not cap new buckets.
+                cost_bucket, micro_batch_size = adaptive_micro_batch.select(
+                    dataset, local_batches, tokenizer, training, token_cache)
             values, sizes = _backward_chunks(llm, sidecar, tokenizer, dataset, local_batches,
-                device, dtype, training, token_cache, micro_batch_size, global_count)
+                device, dtype, training, token_cache, micro_batch_size, global_count, attempt_state)
             break
         except torch.cuda.OutOfMemoryError as exc:
-            attempted = min(micro_batch_size, max(map(len, local_batches), default=0))
+            attempted = attempt_state["size"]
             if not auto_micro_batch or attempted <= 1:
                 error = f"CUDA OOM even at micro batch {attempted}; update not applied: {exc}"
             else:
@@ -345,15 +389,22 @@ def backward_update(llm, sidecar, tokenizer, dataset, batches, device, dtype, tr
         with torch.no_grad():
             for name, buffer in sidecar.named_buffers():
                 buffer.copy_(initial_buffers[name])
-        micro_batch_size = max(1, failed_size // 2)
+        micro_batch_size = max(1, min(micro_batch_size // 2, failed_size - 1))
+        if adaptive_micro_batch is not None:
+            adaptive_micro_batch.record_oom(cost_bucket, micro_batch_size)
         attempts += 1
         print(f"oom_retry rank={parallel.rank} micro_batch={micro_batch_size} "
               f"global_questions={global_count} retry_entire_local_update=true", flush=True)
+    compute_seconds = time.perf_counter() - compute_start
+    sync_start = time.perf_counter()
     parallel.check_errors(error)
     parallel.sum_gradients(sidecar)
     values = parallel.sums(values)
+    sync_seconds = time.perf_counter() - sync_start
     execution = parallel.gather({"rank": parallel.rank, "questions": sum(map(len, local_batches)),
-        "micro_batch_sizes": sizes, "micro_batch_limit": micro_batch_size, "oom_retries": attempts})
+        "micro_batch_sizes": sizes, "micro_batch_limit": micro_batch_size, "oom_retries": attempts,
+        "cost_bucket": cost_bucket, "local_compute_seconds": compute_seconds,
+        "synchronization_and_wait_seconds": sync_seconds})
     if sum(item["questions"] for item in execution) != global_count:
         raise RuntimeError("Global question accounting differs across ranks")
     return values, micro_batch_size, execution
@@ -401,6 +452,61 @@ def generate_from_prompt(llm, tokenizer, prompt, device, dtype, *, max_new_token
     return {"prediction": tokenizer.decode(output_ids, skip_special_tokens=False),
             "terminated": terminated, "stop_token_id": stop_token_id,
             "generated_tokens": len(output_ids) + int(terminated)}
+
+
+@torch.inference_mode()
+def generate_from_prompts(llm, tokenizer, prompts, device, dtype, *, max_new_tokens=96, use_cache=True):
+    """Greedy, independently stopped answers with left padding and explicit RoPE positions.
+
+    The caller binds ONE shared field. Cross-attention broadcasts its read-only
+    K/V across questions; text KV remains separate for every batch row.
+    """
+    if not prompts or any(not prompt for prompt in prompts) or max_new_tokens <= 0:
+        raise ValueError("Generation requires nonempty prompts and a positive token budget")
+    if len(prompts) == 1:
+        return [generate_from_prompt(llm, tokenizer, prompts[0], device, dtype,
+                                     max_new_tokens=max_new_tokens, use_cache=use_cache)]
+    stop_ids = set(generation_stop_ids(llm, tokenizer))
+    width, count = max(map(len, prompts)), len(prompts)
+    ids = torch.full((count, width), tokenizer.pad_token_id, dtype=torch.long, device=device)
+    mask = torch.zeros_like(ids)
+    for i, prompt in enumerate(prompts):
+        ids[i, -len(prompt):] = torch.tensor(prompt, dtype=torch.long, device=device)
+        mask[i, -len(prompt):] = 1
+    output_ids, stops, past = [[] for _ in prompts], [None] * count, None
+    with core.autocast_context(device, dtype):
+        for _ in range(max_new_tokens):
+            cached = use_cache and past is not None
+            positions = (mask.cumsum(-1) - 1).clamp_min(0)
+            kwargs = {"input_ids": ids[:, -1:] if cached else ids,
+                      "attention_mask": mask,
+                      "position_ids": positions[:, -1:] if cached else positions,
+                      "use_cache": use_cache, "return_dict": True}
+            if cached:
+                kwargs["past_key_values"] = past
+            outputs = core.decoder_backbone(llm)(**kwargs)
+            logits = llm.get_output_embeddings()(outputs.last_hidden_state[:, -1])
+            next_ids = logits.argmax(dim=-1).tolist()
+            for i, token in enumerate(next_ids):
+                if stops[i] is not None:
+                    continue
+                if token in stop_ids:
+                    stops[i] = token
+                else:
+                    output_ids[i].append(token)
+            if all(stop is not None for stop in stops):
+                break
+            if use_cache:
+                past = outputs.past_key_values
+            ids = torch.cat((ids, ids.new_tensor([
+                token if stops[i] is None else tokenizer.pad_token_id
+                for i, token in enumerate(next_ids)])[:, None]), dim=1)
+            mask = torch.cat((mask, mask.new_tensor([int(stop is None) for stop in stops])[:, None]), dim=1)
+            del outputs, logits
+    return [{"prediction": tokenizer.decode(tokens, skip_special_tokens=False),
+             "terminated": stop is not None, "stop_token_id": stop,
+             "generated_tokens": len(tokens) + int(stop is not None)}
+            for tokens, stop in zip(output_ids, stops)]
 
 
 @torch.inference_mode()
@@ -487,10 +593,14 @@ def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_pat
     output_path.parent.mkdir(parents=True, exist_ok=True)
     active_state = None
     field_encodes = 0
+    batch_limit = int(config["runtime"].get("eval_batch_size", 1))
+    generation_batches = oom_retries = 0
+    parity_budget = int(config["runtime"].get("eval_parity_check_questions", 0))
+    parity_checked = parity_mismatches = 0
     reuse_memory = bool(config["evaluation"].get("reuse_field_memory", True))
     # Only one field is retained, and only during this evaluation invocation.
-    # Text KV is always initialized afresh for every question. Dataset order is
-    # unchanged, including when one state appears in disjoint runs of records.
+    # Text KV is independent per question. Only consecutive questions about the
+    # SAME field share a batch; both QA order and field-pair diagnostics survive.
     sidecar.clear()
     try:
         if input_mode == "disabled":
@@ -498,39 +608,88 @@ def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_pat
             # would still pass through learned encoders and are a different test.
             sidecar.bind(None, mode="no_tensor")
         with output_path.open("w", encoding="utf-8", newline="\n") as handle:
-            for index in range(len(dataset)):
+            index = 0
+            while index < len(dataset):
                 if input_mode == "disabled":
                     row, field = dataset.records[index], None
                 else:
                     row, field = dataset[index]
-                prompt = encode_prompt(row, tokenizer, int(config["training"]["max_prompt_tokens"]))
                 if input_mode == "correct" and (not reuse_memory or active_state != row["state_ref"]):
                     sidecar.clear()
                     with core.autocast_context(device, dtype):
                         sidecar.bind(field.unsqueeze(0).to(device), mode="correct")
                     active_state = row["state_ref"]
                     field_encodes += 1
-                prediction = generate_from_prompt(
-                    llm, tokenizer, prompt, device, dtype,
-                    max_new_tokens=int(config["evaluation"]["max_new_tokens"]),
-                    use_cache=bool(config["evaluation"].get("use_cache", True)))
-                score = score_answer(row, prediction["prediction"], terminated=prediction["terminated"])
-                state = dataset.states[row["state_ref"]]
-                entry = {"qa_id": row["qa_id"], "task_type": row["task_type"],
-                         "shape": "x".join(map(str, row["grid_shape"])),
-                         "field_tokens": math.prod((n + p - 1) // p for n, p in
-                                                   zip(row["grid_shape"], sidecar.memory.block_shape)),
-                         "block_shape": list(sidecar.memory.block_shape),
-                         "input_mode": input_mode,
-                         "field": state["field"], **prediction, "score": score,
-                         **evaluation_annotations(row, sidecar.memory.block_shape)}
-                entry.update({key: state[key] for key in ("source_id", "family", "is_static", "is_constant", "roughness_bin") if key in state})
-                scored.append(entry)
-                handle.write(json.dumps(entry, allow_nan=False) + "\n")
-                if verbose and (index + 1) % 100 == 0:
-                    print(f"evaluation questions={index + 1}/{len(dataset)}", flush=True)
+                end = index + 1
+                if reuse_memory:
+                    while (end < min(index + batch_limit, len(dataset)) and
+                           dataset.records[end]["state_ref"] == row["state_ref"]):
+                        end += 1
+                rows = [dataset.records[i] for i in range(index, end)]
+                prompts = [encode_prompt(r, tokenizer, int(config["training"]["max_prompt_tokens"])) for r in rows]
+                failed = False
+                try:
+                    predictions = generate_from_prompts(llm, tokenizer, prompts, device, dtype,
+                        max_new_tokens=int(config["evaluation"]["max_new_tokens"]),
+                        use_cache=bool(config["evaluation"].get("use_cache", True)))
+                except torch.cuda.OutOfMemoryError:
+                    if len(rows) <= 1:
+                        raise
+                    failed = True
+                if failed:
+                    # Leave the same questions pending. No partial predictions
+                    # are written. Failed decoder frames/text KV are now freed.
+                    batch_limit = max(1, len(rows) // 2)
+                    oom_retries += 1
+                    gc.collect()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    print(f"evaluation_oom_retry batch_limit={batch_limit} question_index={index}", flush=True)
+                    continue
+                generation_batches += 1
+                if len(predictions) != len(rows):
+                    raise RuntimeError("Batched generation returned the wrong number of answers")
+                if len(rows) > 1 and parity_checked < parity_budget:
+                    references = {}
+                    for i in range(min(len(rows), parity_budget - parity_checked)):
+                        references[i] = generate_from_prompt(llm, tokenizer, prompts[i], device, dtype,
+                            max_new_tokens=int(config["evaluation"]["max_new_tokens"]),
+                            use_cache=bool(config["evaluation"].get("use_cache", True)))
+                    mismatches = sum(predictions[i] != prediction for i, prediction in references.items())
+                    parity_checked += len(references)
+                    parity_mismatches += mismatches
+                    if mismatches:
+                        # Greedy decisions can change under batched BF16 rounding.
+                        # Keep the reference answers and use serial decoding for
+                        # the remainder of this evaluation on this rank.
+                        predictions = [references[i] if i in references else generate_from_prompt(
+                            llm, tokenizer, prompts[i], device, dtype,
+                            max_new_tokens=int(config["evaluation"]["max_new_tokens"]),
+                            use_cache=bool(config["evaluation"].get("use_cache", True))) for i in range(len(rows))]
+                        batch_limit = 1
+                        print(f"evaluation_batch_parity_fallback mismatches={mismatches} "
+                              f"checked={parity_checked} batch_limit=1", flush=True)
+                for row, prediction in zip(rows, predictions):
+                    score = score_answer(row, prediction["prediction"], terminated=prediction["terminated"])
+                    state = dataset.states[row["state_ref"]]
+                    entry = {"qa_id": row["qa_id"], "task_type": row["task_type"],
+                             "shape": "x".join(map(str, row["grid_shape"])),
+                             "field_tokens": math.prod((n + p - 1) // p for n, p in
+                                                       zip(row["grid_shape"], sidecar.memory.block_shape)),
+                             "block_shape": list(sidecar.memory.block_shape),
+                             "input_mode": input_mode,
+                             "field": state["field"], **prediction, "score": score,
+                             **evaluation_annotations(row, sidecar.memory.block_shape)}
+                    entry.update({key: state[key] for key in ("source_id", "family", "is_static", "is_constant", "roughness_bin") if key in state})
+                    scored.append(entry)
+                    handle.write(json.dumps(entry, allow_nan=False) + "\n")
+                if verbose and end // 100 > index // 100:
+                    print(f"evaluation questions={end}/{len(dataset)}", flush=True)
+                index = end
     finally:
         sidecar.clear()
+    if len(scored) != len(dataset):
+        raise RuntimeError("Evaluation must produce one prediction for every question")
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     metrics = summarize_readout_evaluation(scored, dataset.metadata["train_shapes"])
@@ -543,6 +702,9 @@ def evaluate(llm, sidecar, tokenizer, dataset, device, dtype, config, output_pat
     metrics.update(elapsed_seconds=time.perf_counter() - start,
                    peak_allocated_gib=torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None,
                    generated_tokens=sum(row["generated_tokens"] for row in scored),
+                   generation_batches=generation_batches, evaluation_batch_limit=batch_limit,
+                   evaluation_oom_retries=oom_retries,
+                   batch_parity_checked=parity_checked, batch_parity_mismatches=parity_mismatches,
                    field_memory_encodes=field_encodes,
                    field_memory_reuses=len(scored) - field_encodes if input_mode == "correct" else 0)
     return metrics
@@ -602,12 +764,17 @@ def evaluate_parallel(llm, sidecar, tokenizer, dataset, device, dtype, config,
         else:
             paths[parallel.rank].write_text("", encoding="utf-8")
             local_metrics = {"field_memory_encodes": 0, "field_memory_reuses": 0,
-                             "peak_allocated_gib": None, "questions": 0}
+                             "peak_allocated_gib": None, "questions": 0,
+                             "generation_batches": 0, "evaluation_oom_retries": 0,
+                             "batch_parity_checked": 0, "batch_parity_mismatches": 0,
+                             "evaluation_batch_limit": config["runtime"].get("eval_batch_size", 1)}
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     parallel.check_errors(error)
     summaries = parallel.gather({key: local_metrics[key] for key in (
-        "field_memory_encodes", "field_memory_reuses", "peak_allocated_gib", "questions")})
+        "field_memory_encodes", "field_memory_reuses", "peak_allocated_gib", "questions",
+        "generation_batches", "evaluation_batch_limit", "evaluation_oom_retries",
+        "batch_parity_checked", "batch_parity_mismatches")})
     def merge():
         scored = merge_evaluation_shards(dataset, paths, output_path)
         metrics = summarize_readout_evaluation(scored, dataset.metadata["train_shapes"])
@@ -619,6 +786,10 @@ def evaluate_parallel(llm, sidecar, tokenizer, dataset, device, dtype, config,
             generated_tokens=sum(row["generated_tokens"] for row in scored),
             field_memory_encodes=sum(m["field_memory_encodes"] for m in summaries),
             field_memory_reuses=sum(m["field_memory_reuses"] for m in summaries),
+            generation_batches=sum(m["generation_batches"] for m in summaries),
+            evaluation_oom_retries=sum(m["evaluation_oom_retries"] for m in summaries),
+            batch_parity_checked=sum(m["batch_parity_checked"] for m in summaries),
+            batch_parity_mismatches=sum(m["batch_parity_mismatches"] for m in summaries),
             peak_allocated_gib=max(peaks) if peaks else None,
             distributed_world_size=parallel.world_size, per_rank=summaries)
         if hasattr(dataset, "selection"):
@@ -645,6 +816,14 @@ def validate_config(config):
         raise ValueError("runtime.max_micro_batch_size must be a positive integer")
     if type(config["runtime"].get("auto_micro_batch", True)) is not bool:
         raise ValueError("runtime.auto_micro_batch must be boolean")
+    if type(config["runtime"].get("adaptive_micro_batch", False)) is not bool:
+        raise ValueError("runtime.adaptive_micro_batch must be boolean")
+    eval_batch = config["runtime"].get("eval_batch_size", 1)
+    if type(eval_batch) is not int or eval_batch <= 0:
+        raise ValueError("runtime.eval_batch_size must be a positive integer")
+    parity_questions = config["runtime"].get("eval_parity_check_questions", 0)
+    if type(parity_questions) is not int or parity_questions < 0:
+        raise ValueError("runtime.eval_parity_check_questions must be a nonnegative integer")
     for key in ("batch_size", "gradient_accumulation_steps", "epochs", "max_prompt_tokens",
                 "max_target_tokens", "log_interval", "save_every_updates", "eval_every_updates"):
         if type(t[key]) is not int or t[key] <= 0:
@@ -675,7 +854,8 @@ def run_identity(config, dataset, llm, tokenizer):
     recipe["model"].pop("name_or_path", None)
     # Execution chunking can be reduced to fit memory without changing the
     # global batch/optimizer recipe. Floating-point rounding need not be bitwise identical.
-    for key in ("max_micro_batch_size", "auto_micro_batch"):
+    for key in ("max_micro_batch_size", "auto_micro_batch", "adaptive_micro_batch", "eval_batch_size",
+                "eval_parity_check_questions"):
         recipe["runtime"].pop(key, None)
     identity = {"protocol": FORMAT, "prompt_version": PROMPT_VERSION, "dataset": dataset.identity,
             "text_encoding": {"version": TEXT_ENCODING_VERSION, "system_message": SYSTEM_MESSAGE,
@@ -806,6 +986,12 @@ def main():
                         help="Maximum per-device forward/backward batch; splitting preserves the global batch")
     parser.add_argument("--no-auto-micro-batch", action="store_true",
                         help="Fail on CUDA OOM instead of retrying the complete local update with smaller chunks")
+    parser.add_argument("--adaptive-micro-batch", action=argparse.BooleanOptionalAction, default=None,
+                        help="Remember OOM limits by field area/text length, allowing cheaper inputs larger batches")
+    parser.add_argument("--eval-batch-size", type=int,
+                        help="Per-device questions about one shared field decoded together; preserves every evaluation QA")
+    parser.add_argument("--eval-parity-check-questions", type=int,
+                        help="Compare the first N batched questions per rank/evaluation against serial greedy decoding")
     parser.add_argument("--distributed-timeout-minutes", type=int, default=360,
                         help="Collective timeout, including complete data audit/preflight (default: 360)")
     parser.add_argument("--resume", help="Strict resume from this numerical-generation experiment")
@@ -867,6 +1053,12 @@ def main():
         config["runtime"]["max_micro_batch_size"] = cli.micro_batch_size
     if cli.no_auto_micro_batch:
         config["runtime"]["auto_micro_batch"] = False
+    if cli.adaptive_micro_batch is not None:
+        config["runtime"]["adaptive_micro_batch"] = cli.adaptive_micro_batch
+    if cli.eval_batch_size is not None:
+        config["runtime"]["eval_batch_size"] = cli.eval_batch_size
+    if cli.eval_parity_check_questions is not None:
+        config["runtime"]["eval_parity_check_questions"] = cli.eval_parity_check_questions
     validate_config(config)
     qa_dir = resolve_path(cli.qa_dir or config["data"]["qa_dir"])
     hdf5_path = source_path(config, cli.hdf5_path)
@@ -1031,6 +1223,8 @@ def main():
                                                    float(training.get("min_lr_ratio", .2)))
         step, epoch, cursor, best = 0, 0, 0, -1.0
         micro_batch_size = int(config["runtime"].get("max_micro_batch_size", training["batch_size"]))
+        adaptive_micro_batch = (AdaptiveMicroBatch(micro_batch_size)
+            if config["runtime"].get("adaptive_micro_batch", False) else None)
         validation_pending = False
         if checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -1043,6 +1237,9 @@ def main():
             rank_states = checkpoint.get("rank_states", [checkpoint])
             restore_rng(rank_states[parallel.rank], device)
             micro_batch_size = min(micro_batch_size, rank_states[parallel.rank].get("micro_batch_limit", micro_batch_size))
+            if adaptive_micro_batch is not None:
+                adaptive_micro_batch = AdaptiveMicroBatch(adaptive_micro_batch.maximum,
+                    rank_states[parallel.rank].get("adaptive_micro_batch_limits"))
         if step > maximum:
             raise ValueError("Checkpoint step exceeds configured training budget")
         train_data = datasets["train"]
@@ -1053,7 +1250,8 @@ def main():
             previous_handlers[signum] = signal.signal(signum, request_stop)
 
         def save(path):
-            states = parallel.gather({**capture_rng(device), "micro_batch_limit": micro_batch_size})
+            states = parallel.gather({**capture_rng(device), "micro_batch_limit": micro_batch_size,
+                "adaptive_micro_batch_limits": adaptive_micro_batch.state_dict() if adaptive_micro_batch else None})
             parallel.main(lambda: core.atomic_torch_save(path, {
                 "checkpoint_type": CHECKPOINT_TYPE, "identity": identity,
                 "sidecar": {k: v.detach().cpu().clone() for k, v in sidecar.state_dict().items()},
@@ -1078,13 +1276,20 @@ def main():
             say(f"validation step={step} macro_task_answer_accuracy={score:.4f} "
                   f"heldout={heldout_text} "
                   f"valid_rate={metrics['valid_rate']:.4f} "
-                  f"truncated={metrics['errors'].get('generation_truncated', 0)}/{metrics['questions']}")
+                  f"truncated={metrics['errors'].get('generation_truncated', 0)}/{metrics['questions']} "
+                  f"elapsed_seconds={metrics['elapsed_seconds']:.1f} "
+                  f"generation_batches={metrics['generation_batches']} "
+                  f"batch_parity_checked={metrics['batch_parity_checked']} "
+                  f"batch_parity_mismatches={metrics['batch_parity_mismatches']}")
             save(output / "last.pt")
 
+        execution_limit = adaptive_micro_batch.maximum if adaptive_micro_batch else micro_batch_size
         say(f"startup=point_readout tasks={dataset.metadata['tasks']} updates={maximum} "
               f"block_shape={args.memory_block_shape} "
               f"global_batch={training['batch_size']} world_size={parallel.world_size} "
-              f"per_device_micro_batch_limit={micro_batch_size} accumulation={training['gradient_accumulation_steps']} "
+              f"per_device_micro_batch_limit={execution_limit} accumulation={training['gradient_accumulation_steps']} "
+              f"adaptive_micro_batch={adaptive_micro_batch is not None} "
+              f"eval_batch_size={config['runtime'].get('eval_batch_size', 1)} "
               f"text_encoding={TEXT_ENCODING_VERSION} stop_token_ids={generation_stop_ids(llm, tokenizer)}")
         start = time.perf_counter()
         if device.type == "cuda":
@@ -1094,18 +1299,22 @@ def main():
             "tasks": dataset.metadata["tasks"], "batch_size": training["batch_size"],
             "gradient_accumulation_steps": training["gradient_accumulation_steps"],
             "effective_batch_upper_bound": training["batch_size"] * training["gradient_accumulation_steps"],
-            "world_size": parallel.world_size, "per_device_micro_batch_limit": micro_batch_size,
+            "world_size": parallel.world_size, "per_device_micro_batch_limit": execution_limit,
             "auto_micro_batch": config["runtime"].get("auto_micro_batch", True),
+            "adaptive_micro_batch": adaptive_micro_batch is not None,
+            "eval_batch_size": config["runtime"].get("eval_batch_size", 1),
             **batch_stats,
             "selection_metric": "seen_shapes.macro_task_answer_accuracy"})
         # A stop or decoder failure immediately before validation must not skip it,
         # including a checkpoint already at the final optimizer update.
         if validation_pending:
             validate_and_save()
+        window_seconds = window_questions = window_updates = 0
         while step < maximum:
             stop_requested = parallel.any(stop_requested)
             if stop_requested:
                 break
+            update_start = time.perf_counter()
             micro_batches = []
             for _ in range(training["gradient_accumulation_steps"]):
                 if cursor >= len(batches):
@@ -1123,12 +1332,19 @@ def main():
             values, micro_batch_size, execution = backward_update(
                 llm, sidecar, tokenizer, train_data, micro_batches, device, dtype, training,
                 parallel, micro_batch_size, token_cache=token_cache,
-                auto_micro_batch=config["runtime"].get("auto_micro_batch", True))
+                auto_micro_batch=config["runtime"].get("auto_micro_batch", True),
+                adaptive_micro_batch=adaptive_micro_batch)
             loss_value, answer_ce, reconstruction = values
             grad_norm = torch.nn.utils.clip_grad_norm_(sidecar.parameters(), training["grad_clip_norm"], error_if_nonfinite=True)
             optimizer.step()
             scheduler.step()
             step += 1
+            # This existing stop collective also completes the CUDA update.
+            # Time only training here, excluding validation/checkpoint/log I/O.
+            stop_requested = parallel.any(stop_requested)
+            window_seconds += time.perf_counter() - update_start
+            window_questions += total_records
+            window_updates += 1
             log_to_file = step % training["log_interval"] == 0 or step == 1
             log_to_console = log_to_file if cli.verbose else step == 1 or step % cli.console_every_updates == 0 or step == maximum
             if log_to_file or log_to_console:
@@ -1143,6 +1359,9 @@ def main():
                          "questions_in_update": total_records,
                          "micro_batch_sizes": [len(indices) for indices in micro_batches],
                          "per_rank_execution": execution,
+                         "training_window": {"updates": window_updates, "questions": window_questions,
+                             "seconds": window_seconds, "seconds_per_update": window_seconds / window_updates,
+                             "questions_per_second": window_questions / max(window_seconds, 1e-9)},
                          "per_rank_memory": memory_by_rank,
                          "peak_allocated_gib": max(m["peak_allocated_gib"] for m in memory_by_rank)
                          if device.type == "cuda" else None,
@@ -1153,7 +1372,7 @@ def main():
                     core.append_jsonl(output / "train.jsonl", entry)
                 if log_to_console and parallel.primary:
                     print(json.dumps(entry), flush=True)
-            stop_requested = parallel.any(stop_requested)
+                window_seconds = window_questions = window_updates = 0
             should_stop = stop_requested or (cli.stop_after_updates is not None and step - invocation_start_step >= cli.stop_after_updates)
             validation_pending = step % training["eval_every_updates"] == 0 or step == maximum
             # Save before potentially long validation, so termination loses no completed update.

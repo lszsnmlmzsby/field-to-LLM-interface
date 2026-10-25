@@ -773,7 +773,8 @@ def test_epoch_budget_tail_and_signal_exit(data_fixture, tmp_path, monkeypatch):
     # Isolate the training budget/interrupt behavior; generation is covered by the integration test above.
     monkeypatch.setattr(trainer, "evaluate", lambda *a, **k: {
         "seen_shapes": {"macro_task_answer_accuracy": 0.}, "heldout_shapes": None,
-        "valid_rate": 0., "errors": {}, "questions": 66})
+        "valid_rate": 0., "errors": {}, "questions": 66, "elapsed_seconds": 0.,
+        "generation_batches": 66, "batch_parity_checked": 0, "batch_parity_mismatches": 0})
     base = ["train_point_readout.py", "--config", str(config_path), "--profile", "full",
             "--qa-dir", str(qa), "--hdf5-path", str(source), "--device", "cpu",
             "--batch-size", "32", "--gradient-accumulation-steps", "3", "--epochs", "2",

@@ -127,6 +127,14 @@ runtime:
   # global update into smaller chunks without dropping/truncating any question.
   max_micro_batch_size: 16
   auto_micro_batch: true
+  # Per-rank area/text buckets replace a permanently reduced global micro cap.
+  # Global question membership, optimizer updates and two epochs stay unchanged.
+  adaptive_micro_batch: true
+  # Batch questions about ONE field; independent text KV/EOS, complete scoring.
+  eval_batch_size: 8
+  # A spot check, not a proof of bitwise parity for the complete BF16 evaluation.
+  # On a mismatch, that rank falls back to serial for the remaining evaluation.
+  eval_parity_check_questions: 32
   # Compact token arrays plus conservative per-entry accounting. No model graphs.
   token_cache_bytes: 2147483648
   token_cache_entries: 2000000

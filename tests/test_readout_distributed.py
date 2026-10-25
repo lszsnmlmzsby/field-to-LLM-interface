@@ -172,6 +172,7 @@ def _distributed_worker(rank, world, rendezvous, root, config_path, barrier=None
         # Unequal local counts 3/2/2 and smaller chunks 2/1 must preserve the mean.
         _, llm, sidecar, tokenizer, config = tiny_components()
         config["evaluation"].update(max_new_tokens=3)
+        config["runtime"].update(eval_batch_size=8, eval_parity_check_questions=32)
         context.synchronize_parameters(sidecar)
         _, _, execution = trainer.backward_update(llm, sidecar, tokenizer, examples, [list(range(7))],
             device, torch.float32, config["training"], context, 2)
@@ -238,17 +239,20 @@ def _distributed_worker(rank, world, rendezvous, root, config_path, barrier=None
              patch.object(trainer.core, "load_llm_with_bounded_host_memory", load_model):
             run("complete")
             run("interrupted", "--stop-after-updates", "1")
-            run("interrupted", "--resume", str(root / "interrupted/last.pt"))
+            run("interrupted", "--resume", str(root / "interrupted/last.pt"),
+                "--adaptive-micro-batch", "--eval-batch-size", "8", "--eval-parity-check-questions", "32")
         expected = torch.load(root / "complete/last.pt", weights_only=True)
         actual = torch.load(root / "interrupted/last.pt", weights_only=True)
         assert expected["step"] == actual["step"] == 2
         assert (expected["epoch"], expected["cursor"]) == (actual["epoch"], actual["cursor"])
         assert len(actual["rank_states"]) == world
         assert actual["parallel_execution"]["world_size"] == world
+        assert actual["identity"] == expected["identity"]
         for wanted, restored in zip(expected["rank_states"], actual["rank_states"]):
             assert wanted["python_rng"] == restored["python_rng"]
             assert torch.equal(wanted["torch_rng"], restored["torch_rng"])
             assert wanted["micro_batch_limit"] == restored["micro_batch_limit"] == 2
+            assert restored["adaptive_micro_batch_limits"] == []
         for name, value in expected["sidecar"].items():
             torch.testing.assert_close(value, actual["sidecar"][name], rtol=0, atol=0)
         (root / f"rank{rank}.passed").write_text("ok")

@@ -911,6 +911,12 @@ class GatedTensorCrossAttention(nn.Module):
                 self._projected_memory, self._projection_signature = (key, value), signature
             else:
                 self._projected_memory = self._projection_signature = None
+        if cacheable and key.shape[0] == 1 and query.shape[0] > 1:
+            # Several independent evaluation questions may share ONE field.
+            # Explicit zero-stride views keep batch dimensions equal for fused
+            # SDPA dispatch, without re-encoding or copying field K/V per question.
+            key = key.expand(query.shape[0], -1, -1, -1)
+            value = value.expand(query.shape[0], -1, -1, -1)
         attended = F.scaled_dot_product_attention(
             query,
             key,
