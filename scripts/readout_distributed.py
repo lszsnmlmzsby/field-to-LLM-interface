@@ -7,6 +7,7 @@ DDP hooks entering collectives halfway through a failed backward.
 from __future__ import annotations
 
 from datetime import timedelta
+from array import array
 import os
 import random
 
@@ -147,6 +148,45 @@ def partition_batch(indices, rank, world_size):
     quotient, remainder = divmod(len(indices), world_size)
     start = rank * quotient + min(rank, remainder)
     return indices[start:start + quotient + int(rank < remainder)]
+
+
+def merge_strided_lengths(local_lengths, total, parallel):
+    """One compact collective after preflight, not extra tokenization per step."""
+    expected = len(range(parallel.rank, total, parallel.world_size))
+    parallel.check_errors(None if len(local_lengths) == expected else "Preflight length count mismatch")
+    lengths = torch.zeros(total, dtype=torch.int32, device=parallel.device)
+    lengths[parallel.rank::parallel.world_size] = torch.tensor(local_lengths, dtype=torch.int32,
+                                                              device=parallel.device)
+    if parallel.world_size > 1:
+        dist.all_reduce(lengths, op=dist.ReduceOp.SUM)
+    if bool((lengths <= 0).any()):
+        raise ValueError("Every training question must have a positive complete token length")
+    result = array("I")
+    result.frombytes(lengths.cpu().numpy().tobytes())
+    return result
+
+
+def length_balanced_partitions(indices, lengths, world_size, *, chunk_size=4):
+    """Assign length-homogeneous chunks by padded-token cost, then sort locally.
+
+    Input is ONE existing same-shape batch. Preserve its multiset, including
+    tails; only rank ownership and within-update execution order may change.
+    Length is a cost proxy, not a measured runtime or a memory-fit guarantee.
+    """
+    if world_size <= 0 or chunk_size <= 0:
+        raise ValueError("world_size and chunk_size must be positive")
+    ordered = sorted(indices, key=lambda i: (-lengths[i], i))
+    if any(lengths[i] <= 0 for i in ordered):
+        raise ValueError("Token lengths must be positive")
+    # Small global tails should still use available ranks when possible.
+    size = min(chunk_size, max(1, len(indices) // world_size))
+    parts, loads = [[] for _ in range(world_size)], [0] * world_size
+    for start in range(0, len(ordered), size):
+        chunk = ordered[start:start + size]
+        rank = min(range(world_size), key=lambda r: (loads[r], len(parts[r]), r))
+        parts[rank].extend(chunk)
+        loads[rank] += len(chunk) * max(lengths[i] for i in chunk)
+    return [sorted(part, key=lambda i: (-lengths[i], i)) for part in parts]
 
 
 def capture_rng(device):

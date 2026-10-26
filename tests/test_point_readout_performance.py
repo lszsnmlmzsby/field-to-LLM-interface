@@ -356,6 +356,110 @@ def test_adaptive_oom_learning_survives_restore_and_retries_whole_update(monkeyp
     assert torch.equal(final_rng["torch_rng"], torch.get_rng_state())
 
 
+def test_length_scheduling_and_token_budget_preserve_gradients_and_reduce_padding():
+    from scripts.readout_distributed import ParallelContext
+    from array import array
+    _, llm, sidecar, tokenizer, config = tiny_components()
+    dataset = TinyDataset()
+    base = dataset.records[0]
+    dataset.records = [copy.deepcopy(base) for _ in range(8)]
+    for i, extra in enumerate([0, 50, 2, 40, 5, 30, 8, 20]):
+        dataset.records[i]["question"] += " extra" * extra
+    lengths = array("I")
+    trainer.preflight_token_budgets(dataset.records, tokenizer, config["training"], token_lengths=lengths)
+    assert list(lengths) == [len(p) + len(a) for p, a in
+        (trainer.encode_training_record(row, tokenizer, config["training"]) for row in dataset.records)]
+    results = []
+    budget = max(lengths) * 2
+    for balanced in (False, True):
+        sidecar.train()
+        values, _, execution = trainer.backward_update(llm, sidecar, tokenizer, dataset, [list(range(8))],
+            torch.device("cpu"), torch.float32, config["training"], ParallelContext("cpu"), 4,
+            token_lengths=lengths, balance_by_length=balanced,
+            micro_batch_token_budget=budget if balanced else 0)
+        results.append((values, {n: p.grad.clone() for n, p in sidecar.named_parameters()
+                                if p.grad is not None}, execution[0]))
+    assert results[0][0] == pytest.approx(results[1][0], rel=1e-5, abs=1e-6)
+    for name, gradient in results[0][1].items():
+        torch.testing.assert_close(gradient, results[1][1][name], rtol=2e-4, atol=2e-6)
+    assert results[1][2]["true_text_tokens"] == results[0][2]["true_text_tokens"] == sum(lengths)
+    assert results[1][2]["padded_text_tokens"] < results[0][2]["padded_text_tokens"]
+    assert results[1][2]["questions"] == 8
+    assert max(results[1][2]["micro_batch_sizes"]) <= 4
+
+
+def test_one_long_question_is_never_truncated_by_execution_token_budget():
+    from scripts.readout_distributed import ParallelContext
+    _, llm, sidecar, tokenizer, config = tiny_components()
+    dataset = TinyDataset()
+    lengths = [sum(map(len, trainer.encode_training_record(row, tokenizer, config["training"])))
+               for row in dataset.records]
+    _, _, execution = trainer.backward_update(llm, sidecar, tokenizer, dataset, [[0, 1, 3]],
+        torch.device("cpu"), torch.float32, config["training"], ParallelContext("cpu"), 8,
+        token_lengths=lengths, balance_by_length=True, micro_batch_token_budget=1)
+    assert execution[0]["micro_batch_sizes"] == [1, 1, 1]
+    assert execution[0]["true_text_tokens"] == sum(lengths[i] for i in [0, 1, 3])
+
+
+def test_adaptive_limits_apply_per_chunk_not_to_all_short_questions(monkeypatch):
+    from scripts.readout_distributed import ParallelContext
+    from test_readout_distributed import ToySidecar
+    dataset = TinyDataset()
+    dataset.records = [copy.deepcopy(dataset.records[0]) for _ in range(6)]
+    lengths = [900, 800, 200, 190, 180, 170]
+    controller = trainer.AdaptiveMicroBatch(4)
+    controller.record_oom((4, 8), 2)
+    def loss_fn(llm, module, tokenizer, records, fields, *args, **kwargs):
+        loss = (module.weight * fields).square().mean()
+        return loss, {"answer_ce": float(loss.detach()), "reconstruction": 0.}
+    monkeypatch.setattr(trainer, "training_loss", loss_fn)
+    _, _, execution = trainer.backward_update(None, ToySidecar(), None, dataset, [list(range(6))],
+        torch.device("cpu"), torch.float32, {}, ParallelContext("cpu"), 4,
+        token_lengths=lengths, balance_by_length=True, adaptive_micro_batch=controller)
+    assert execution[0]["micro_batch_sizes"] == [2, 4]
+    assert execution[0]["questions"] == 6
+
+
+def test_fixed_checkpoint_benchmark_restores_state_and_compares_identical_questions():
+    from scripts.readout_distributed import ParallelContext, capture_rng
+    from array import array
+    _, llm, sidecar, tokenizer, config = tiny_components()
+    config["training"].update(batch_size=3, gradient_accumulation_steps=1)
+    dataset, lengths = TinyDataset(), array("I")
+    trainer.preflight_token_budgets(dataset.records, tokenizer, config["training"], token_lengths=lengths)
+    initial_state = {name: value.clone() for name, value in sidecar.state_dict().items()}
+    rng = capture_rng(torch.device("cpu"))
+    checkpoint = {"epoch": 0, "cursor": 0, "rank_states": [rng]}
+    result = trainer.benchmark_execution(llm, sidecar, tokenizer, dataset, torch.device("cpu"),
+        torch.float32, config, ParallelContext("cpu"), trainer.TrainingTokenCache(tokenizer, config["training"]),
+        lengths, checkpoint, updates=2, warmup=1)
+    assert result["optimizer_updates"] == 0 and result["checkpoint_written"] is False
+    assert len(result["results"]) == 3
+    for policy in result["results"]:
+        assert policy["questions"] == 4 and policy["updates"] == 2
+        assert policy["true_text_tokens"] == sum(lengths)
+        assert policy["max_loss_abs_diff_vs_original"] < 1e-5
+        assert policy["first_update_gradient_vs_original"]["relative_l2"] < 1e-4
+    for name, value in sidecar.state_dict().items():
+        torch.testing.assert_close(value, initial_state[name], rtol=0, atol=0)
+    assert torch.equal(torch.get_rng_state(), rng["torch_rng"])
+
+
+def test_execution_settings_do_not_change_strict_checkpoint_identity():
+    from types import SimpleNamespace
+    _, llm, _, tokenizer, config = tiny_components()
+    dataset = SimpleNamespace(identity="unchanged-complete-dataset")
+    original = trainer.run_identity(config, dataset, llm, tokenizer)
+    config["runtime"].update(length_balanced_batches=True, micro_batch_token_budget=4096,
+                            max_micro_batch_size=8, adaptive_micro_batch=True)
+    trainer.validate_resume({"checkpoint_type": trainer.CHECKPOINT_TYPE, "identity": original},
+                            trainer.run_identity(config, dataset, llm, tokenizer))
+    config["training"]["batch_size"] += 1
+    with pytest.raises(ValueError, match="differs"):
+        trainer.validate_resume({"checkpoint_type": trainer.CHECKPOINT_TYPE, "identity": original},
+                                trainer.run_identity(config, dataset, llm, tokenizer))
+
+
 def test_multisource_cli_training_resume_test_and_independent_provenance_scores(
         multisource_fixture, tmp_path, monkeypatch):
     """Real HDF5 factory/audit, tiny Qwen training, strict resume and held-out test.
@@ -418,6 +522,19 @@ def test_multisource_cli_training_resume_test_and_independent_provenance_scores(
     interrupted = tmp_path / "interrupted"
     run(interrupted, "--stop-after-updates", "1")
     assert torch.load(interrupted / "last.pt", weights_only=True)["step"] == 1
+    # Read-only execution benchmark must never advance or overwrite the source run.
+    checkpoint_bytes = (interrupted / "last.pt").read_bytes()
+    config_bytes = (interrupted / "resolved_config.json").read_bytes()
+    benchmark_dir = tmp_path / "execution_benchmark"
+    run(benchmark_dir, "--resume", str(interrupted / "last.pt"),
+        "--benchmark-updates", "1", "--benchmark-warmup-updates", "0")
+    assert (interrupted / "last.pt").read_bytes() == checkpoint_bytes
+    assert (interrupted / "resolved_config.json").read_bytes() == config_bytes
+    assert not (benchmark_dir / "last.pt").exists()
+    report = json.loads((benchmark_dir / "execution_benchmark.json").read_text())
+    assert report["optimizer_updates"] == 0 and report["checkpoint_step"] == 1
+    with pytest.raises(SystemExit):
+        run(interrupted, "--resume", str(interrupted / "last.pt"), "--benchmark-updates", "1")
     run(interrupted, "--resume", str(interrupted / "last.pt"))
     resumed = torch.load(interrupted / "last.pt", weights_only=True)
     assert resumed["step"] == expected["step"] == 2

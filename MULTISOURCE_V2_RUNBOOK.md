@@ -124,15 +124,17 @@ Qwen分词器资产缺失；尚未测出服务器这份完整QA的最大token长
 
 ## 3. 真实 Qwen 检查与正式训练
 
-2026-10-22 三卡更新：`--batch-size` 始终表示所有 GPU 合计的 batch 上限。
-full/pilot 默认48、累积1、两轮；`--micro-batch-size` 是每卡一次前后向的上限，默认16。
-每个同形状全局批次均匀分到各卡，正常为16+16+16；尾批如17则为6+6+5，
-不足3题允许某卡不处理样本，不补重复题也不丢尾批。每次更新使用实际全局题数归一化。
+`--batch-size` 始终表示所有 GPU 合计的 batch 上限，full/pilot 默认48、累积1、两轮。
+2026-10-26 起，`--micro-batch-size` 默认8，表示每卡一次前后向的上限。
+原分配按题数均分，例如48题分为16+16+16；新版默认在同一个全局批次内按完整文本长度
+均衡各卡负担，因此各卡题数可能不同。全局问题集合不变，尾批仍全部保留，
+不足3题允许某卡不处理样本。每次更新使用实际全局题数归一化。
 同一全局批次可在每卡拆成若干小批次累积；发生前后向 CUDA OOM 时，清除本卡这次
 更新的全部梯度、恢复随机/缓冲状态，然后减小小批次重算，其他卡等待后统一同步梯度。
-重试上限按16→8→4→2→1降低（尾批可能更小）；降到1仍OOM会明确失败。
+重试上限按8→4→2→1降低（尾批可能更小）；降到1仍OOM会明确失败。
 2026-10-25 起，新配置默认按场面积和完整文本长度分别记忆小批次上限，
-不再让一次大输入的 OOM 永久限制后续所有小输入；每卡上限仍为16。
+不再让一次大输入的 OOM 永久限制后续所有小输入。2026-10-26 起，上限改为8，
+每个小批次还受4096个填充后文本token的执行预算约束，具体语义见4.2。
 该恢复只针对前后向显存不足，不能修复模型加载、优化器状态、通信阶段或其他异常。
 成功降低的每卡上限会保存到 checkpoint 并在续训时恢复。
 
@@ -160,7 +162,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2
 export OMP_NUM_THREADS=1
 ```
 
-先执行三卡几何检查和smoke；smoke覆盖小场流水线，不能证明完整长文本一定能用每卡16。
+先执行三卡几何检查和smoke；smoke覆盖小场流水线，不能证明完整长文本一定能用每卡8。
 三个进程各持有一张卡，`--device` 保持auto，不要为每个进程指定同一个cuda:0。
 
 ```bash
@@ -176,7 +178,7 @@ export OMP_NUM_THREADS=1
     python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
       scripts/train_point_readout.py \
       --config "$MULTI_CONFIG" --profile smoke \
-      --batch-size 48 --micro-batch-size 16 \
+      --batch-size 48 --micro-batch-size 8 \
       --block-shape "$block" "$block" --console-every-updates 10 \
       --output-dir "$FIELD_TO_LLM_RUNS_DIR/multisource_v2_3gpu_b48_smoke_${block}x${block}"
   done
@@ -195,7 +197,7 @@ smoke 仅20次更新，不能称为正式训练。通过后，在持久终端中
     python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
       scripts/train_point_readout.py \
       --config "$MULTI_CONFIG" --profile full \
-      --batch-size 48 --micro-batch-size 16 \
+      --batch-size 48 --micro-batch-size 8 \
       --block-shape "$block" "$block" --console-every-updates 200 \
       --output-dir "$FIELD_TO_LLM_RUNS_DIR/multisource_v2_3gpu_b48_full_${block}x${block}"
   done
@@ -207,7 +209,7 @@ smoke 仅20次更新，不能称为正式训练。通过后，在持久终端中
 best仍根据已见尺寸上的宏平均任务答案准确率选择，输入关闭诊断不参与。
 训练时间需根据实际 training_plan、稳定 step 时间和一次完整验证时间估算，
 不能保证24小时完成。验证场编码与分词缓存继续启用。
-启动日志应含 `global_batch=48 world_size=3 per_device_micro_batch_limit=16`。
+启动日志应含 `global_batch=48 world_size=3 per_device_micro_batch_limit=8`。
 `questions_in_update`是三卡实际总题数；`per_rank_execution`记录每卡处理题数、小批次拆分
 和OOM重试次数，`per_rank_memory`记录各卡显存峰值，顶层峰值为各卡的最大值而非相加。
 若希望先观察正式数据上的显存和速度，可在full命令加 `--stop-after-updates 20`：
@@ -239,6 +241,9 @@ torchrun启动器被终止时可能强制结束worker，不能保证信号处理
 
 ### 4.1 已有三卡训练启用执行加速（2026-10-25）
 
+本节保留上一版改动的说明；下方续训命令已同步为2026-10-26的执行设置。
+之前启用自适应上限16后的日志未证明训练加速，最新对比方法见4.2。
+
 同步本次 `scripts/train_point_readout.py`、`scripts/train_tensor_qwen_cross_attention.py`
 和配置后，已有完整源数据、QA和checkpoint可继续使用。
 旧 `resolved_config.json` 没有新增开关，因此第一次续训显式启用：
@@ -254,7 +259,8 @@ python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
   scripts/train_point_readout.py \
   --config "$RUN/resolved_config.json" --profile full \
   --resume "$RUN/last.pt" --output-dir "$RUN" \
-  --micro-batch-size 16 --adaptive-micro-batch \
+  --micro-batch-size 8 --adaptive-micro-batch \
+  --length-balanced-batches --micro-batch-token-budget 4096 \
   --eval-batch-size 8 --eval-parity-check-questions 32 \
   --console-every-updates 200
 ```
@@ -262,7 +268,7 @@ python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
 不加覆盖参数，不重建数据，不修改全局 `--batch-size`。三卡数量仍须一致。
 原数据每轮4,685,677题、两轮9,371,354次呈现、208,570次更新保持不变。
 全局每批上限48，同形状尾批仍可不足48；此次变化的是每卡物理计算块，
-允许便宜输入恢复到8/16，不同卡也可使用不同计算块。梯度仍按全局实际题数归一化。
+允许便宜输入恢复到8，不同卡也可使用不同计算块。梯度仍按全局实际题数归一化。
 学习率、优化器状态、下一批位置、验证/保存间隔继续从原checkpoint恢复。
 
 按成本分桶仅是显存适配启发式，不能保证每个新桶第一次就适配。
@@ -297,6 +303,70 @@ python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
 全局batch按成本变化并非天然有害，但会改变梯度噪声、每轮更新次数以及基于step的
 学习率调度；若简单对不同大小的batch等权，还会改变样本对每次更新的相对权重。
 因此这次对正在进行的实验先采用物理计算块自适应，保留既定优化过程。
+
+### 4.2 按长度均衡、减少padding与固定checkpoint测速（2026-10-26）
+
+上一版日志的稳定片段约2.29秒/更新，旧片段约2.14秒/更新，不能据此声称训练加速。
+其中一次更新三卡各16题，本地计算却分别约1.83、1.50、3.09秒，较快的卡需要等待。
+这些不是同批输入的严格对照，但提示应优先减少负载不均衡、padding和OOM重算。
+
+本版不拆Qwen权重，不修改完整源、QA、全局更新的问题集合、训练两轮、损失权重或学习率：
+
+- 完整分词预检顺便保留每题实际的prompt+answer长度，三卡一次汇总，随后各卡仅查表。
+  当前4,685,677题约占每卡17.9 MiB的CPU内存，不额外重做一次全集分词。
+- 每个既有全局同形状batch内部，先将相近长度问题分组，再按估计的填充token成本分卡；
+  各卡内部也按长度执行，减少短问题被长问题填充。这个成本只是启发式，须以实测为准。
+- 每卡最多8题，并逐个小批次应用4096个填充后文本token的预算。例如最长800token时，
+  上限会降到4；最长400token时可尝试8。场面积仍由原自适应OOM分桶保护。
+  4096不是问题长度上限，不截断任何文本；即使单题超过执行预算，也完整地用1题计算。
+  原2048/256的prompt/answer完整预检限制仍保留。这不是显存不会OOM的保证。
+- 按每个小批次选择上限，避免一题长文本限制同次更新中的所有短题；保留完整重算回退。
+  新日志记录真实/填充token数、`padding_fraction`及窗口内各卡`rank_oom_retries`之和。
+
+每题仍按全局实际题数加权。重新分卡、排序、合批会改变浮点累加顺序，不能承诺参数逐位
+一致；不会主动改变样本权重或任务。换了执行策略的收益与数值差异可先通过以下入口检查。
+
+先同步训练脚本、`readout_distributed.py`和配置；在原训练已停止并完成保存后执行：
+
+```bash
+source /workspace/wyx/f2llm/enter_f2llm.sh
+cd /workspace/wyx/f2llm/tensor-compression
+export CUDA_VISIBLE_DEVICES=0,1,2
+export OMP_NUM_THREADS=1
+RUN="$FIELD_TO_LLM_RUNS_DIR/multisource_v2_3gpu_b48_full_1x1"
+BENCH="$FIELD_TO_LLM_RUNS_DIR/multisource_v2_execution_benchmark_$(date +%Y%m%d_%H%M%S)"
+
+python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
+  scripts/train_point_readout.py \
+  --config "$RUN/resolved_config.json" --profile full \
+  --resume "$RUN/last.pt" --benchmark-updates 30 --benchmark-warmup-updates 3 \
+  --output-dir "$BENCH"
+```
+
+三种策略固定为`original_micro4`、`balanced_micro4`、`balanced_budgeted_micro8`，分别表示
+原均分/每卡4、长度均衡/每卡4、长度均衡/每卡最多8且token预算4096。最后一种继承checkpoint
+已有的分桶显存限制，三者均允许OOM回退；报告包含最终上限和实际拆分成本。
+使用相同checkpoint的后续30次全局更新问题；每种先预热3次，权重保持固定，不执行optimizer
+或scheduler更新，不写任何checkpoint，也不覆盖原运行目录。输出目录必须是另一个空目录。
+这是明确的短程执行诊断，不是缩减后的正式训练或准确率评测。
+
+终端的`benchmark_policy=`和`$BENCH/execution_benchmark.json`保存各方案的题/秒、秒/更新、
+padding比例、OOM次数、各卡显存峰值、逐次loss差及首个全局更新的未裁剪梯度相对L2差。
+计时包含前后向、同步和梯度裁剪，排除启动审计/预检、optimizer.step、验证和CPU梯度比较。
+因此不能直接与包含优化器的训练窗口时间等同，也不能用它预测整轮验证耗时。
+前置全量审计/分词预检仍会执行；30步可能没有覆盖所有场尺寸或最长文本，不自动挑选策略。
+
+新版默认采用长度均衡、每卡最多8和4096-token预算；按4.1的命令即可恢复原训练。
+如果实测`balanced_micro4`更快，将4.1中的三个执行选项改为：
+
+```bash
+  --micro-batch-size 4 --no-adaptive-micro-batch \
+  --length-balanced-batches --micro-batch-token-budget 0 \
+```
+
+若只有原分配更快，再把`--length-balanced-batches`改为`--no-length-balanced-batches`。
+关闭自适应时，checkpoint中已有的更低统一OOM上限仍会保留，以启动日志和实际拆分为准。
+这些开关不修改全局batch或续训身份，无需重建QA。测速后恢复训练仍从原`last.pt`开始。
 
 ## 5. 正式测试、语言测试和输入依赖诊断
 
@@ -358,6 +428,13 @@ python scripts/score_point_readout.py \
 ```
 
 ## 验证记录
+
+2026-10-26 长度均衡与固定checkpoint测速回归：**178 passed、2 skipped，97.18秒**。
+覆盖真实小型Qwen的长短文本padding减少、逐题/全局加权梯度一致性、尾批与空rank、
+低token预算不截断问题、逐小批次自适应、三进程长度汇总和协调报错、旧checkpoint恢复、
+连续/中断续训参数及随机状态一致，以及三方案测速不推进优化器、不改写原checkpoint。
+两项跳过仍为缺少真实Qwen分词器资产和Windows原生Gloo不可用；三进程测试使用文件通信
+替身，OOM由测试注入。没有远端Qwen14B/NCCL测速或准确率结果，不据本地用例宣称加速。
 
 2026-10-25 执行加速主回归：**163 passed、2 skipped，106.27秒**。
 随后加入共享场K/V零拷贝批维展开，相关专项回归：**42 passed、1 skipped，31.85秒**；

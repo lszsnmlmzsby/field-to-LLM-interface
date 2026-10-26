@@ -125,11 +125,17 @@ runtime:
   seed: 42
   # Actual local batches use dynamic text padding. OOM retries split the same
   # global update into smaller chunks without dropping/truncating any question.
-  max_micro_batch_size: 16
+  max_micro_batch_size: 8
   auto_micro_batch: true
   # Per-rank area/text buckets replace a permanently reduced global micro cap.
   # Global question membership, optimizer updates and two epochs stay unchanged.
   adaptive_micro_batch: true
+  # Preserve each global batch's membership. Balance homogeneous text chunks
+  # across ranks, then sort locally to reduce padding and straggler time.
+  length_balanced_batches: true
+  # A conservative padded-text budget, NOT a truncation limit or VRAM guarantee.
+  # E.g. 300-token questions may use 8; 700-token questions use at most 4.
+  micro_batch_token_budget: 4096
   # Batch questions about ONE field; independent text KV/EOS, complete scoring.
   eval_batch_size: 8
   # A spot check, not a proof of bitwise parity for the complete BF16 evaluation.

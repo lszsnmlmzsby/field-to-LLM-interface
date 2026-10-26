@@ -27,6 +27,7 @@ from scripts import train_tensor_qwen_cross_attention as core
 from scripts.readout_distributed import (
     ParallelContext, RecordView, capture_rng, restore_rng, partition_batch,
     evaluation_indices, merge_token_reports,
+    length_balanced_partitions, merge_strided_lengths,
 )
 from tensor_compression.downstream.point_readout import (
     FORMAT, PROMPT_VERSION, build_prompt, json_hash, score_answer,
@@ -188,7 +189,7 @@ class TrainingTokenCache:
 
 
 def preflight_token_budgets(records, tokenizer, training, *, token_cache=None, split="unknown",
-                            raise_on_overflow=True):
+                            raise_on_overflow=True, token_lengths=None):
     """Scan every record and collect budget failures; semantic errors still stop immediately."""
     report = {"questions": 0, "max_prompt_tokens_observed": 0, "max_target_tokens_observed": 0,
               "prompt_limit": int(training["max_prompt_tokens"]),
@@ -204,6 +205,8 @@ def preflight_token_budgets(records, tokenizer, training, *, token_cache=None, s
         except TokenBudgetError as exc:
             prompt_length, target_length = exc.prompt_tokens, exc.target_tokens
         # This is bounded diagnostic metadata, not a second cache of all records.
+        if token_lengths is not None:
+            token_lengths.append(prompt_length + target_length)
         detail = {"qa_id": row["qa_id"], "task_type": row.get("task_type"),
                   "template_family": row.get("template_family"),
                   "prompt_tokens": prompt_length, "target_tokens_including_eos": target_length}
@@ -279,11 +282,27 @@ def training_loss(llm, sidecar, tokenizer, records, fields, device, dtype, train
 
 
 def _backward_chunks(llm, sidecar, tokenizer, dataset, local_batches, device, dtype,
-                     training, token_cache, micro_batch_size, global_count, attempt_state):
+                     training, token_cache, micro_batch_size, global_count, attempt_state,
+                     adaptive_micro_batch=None, token_lengths=None, micro_batch_token_budget=0):
     values, sizes = [0.0, 0.0, 0.0], []
+    true_tokens = padded_tokens = 0
     for indices in local_batches:
-        for start in range(0, len(indices), micro_batch_size):
-            chunk = indices[start:start + micro_batch_size]
+        start = 0
+        while start < len(indices):
+            limit = adaptive_micro_batch.maximum if adaptive_micro_batch is not None else micro_batch_size
+            probe = indices[start:start + limit]
+            if adaptive_micro_batch is not None:
+                key, limit = adaptive_micro_batch.select(dataset, [probe], tokenizer, training, token_cache,
+                                                         token_lengths=token_lengths)
+                attempt_state["cost_bucket"] = key
+            if micro_batch_token_budget:
+                if token_lengths is None:
+                    raise ValueError("A micro-batch token budget requires preflight token lengths")
+                safe = max(1, micro_batch_token_budget // max(token_lengths[i] for i in probe))
+                if safe < limit:
+                    limit = 1 << (safe.bit_length() - 1)
+            chunk = indices[start:start + limit]
+            attempt_state["limit"] = limit
             attempt_state["size"] = len(chunk)
             records, fields = zip(*(dataset[index] for index in chunk))
             try:
@@ -295,11 +314,15 @@ def _backward_chunks(llm, sidecar, tokenizer, dataset, local_batches, device, dt
                 values[1] += components["answer_ce"] * weight
                 values[2] += components["reconstruction"] * weight
                 sizes.append(len(chunk))
+                if token_lengths is not None:
+                    true_tokens += sum(token_lengths[i] for i in chunk)
+                    padded_tokens += len(chunk) * max(token_lengths[i] for i in chunk)
                 del loss
             finally:
                 # Hooks must remain bound throughout checkpoint recomputation.
                 sidecar.clear()
-    return values, sizes
+            start += len(chunk)
+    return values, sizes, true_tokens, padded_tokens
 
 
 class AdaptiveMicroBatch:
@@ -314,15 +337,18 @@ class AdaptiveMicroBatch:
         self.maximum = int(maximum)
         self.limits = {tuple(row[:2]): int(row[2]) for row in (state or [])}
 
-    def select(self, dataset, local_batches, tokenizer, training, token_cache):
+    def select(self, dataset, local_batches, tokenizer, training, token_cache, *, token_lengths=None):
         area = length = 1
         for indices in local_batches:
             for index in indices:
                 row = dataset.records[index]
                 area = max(area, math.prod(row["grid_shape"]))
-                prompt, answer = (token_cache.get(row, tokenizer, training) if token_cache is not None
-                                  else encode_training_record(row, tokenizer, training))
-                length = max(length, len(prompt) + len(answer))
+                if token_lengths is not None:
+                    length = max(length, token_lengths[index])
+                else:
+                    prompt, answer = (token_cache.get(row, tokenizer, training) if token_cache is not None
+                                      else encode_training_record(row, tokenizer, training))
+                    length = max(length, len(prompt) + len(answer))
         key = ((area - 1).bit_length(), (length + 127) // 128)
         limit = min([self.maximum] + [cap for (a, t), cap in self.limits.items()
                                      if a <= key[0] and t <= key[1]])
@@ -337,7 +363,8 @@ class AdaptiveMicroBatch:
 
 def backward_update(llm, sidecar, tokenizer, dataset, batches, device, dtype, training,
                     parallel, micro_batch_size, *, token_cache=None, auto_micro_batch=True,
-                    adaptive_micro_batch=None):
+                    adaptive_micro_batch=None, token_lengths=None, balance_by_length=False,
+                    micro_batch_token_budget=0):
     """One complete global update; retry local OOMs BEFORE any gradient collective.
 
     Retry all local contributions, not only the failed chunk: backward may have
@@ -349,23 +376,26 @@ def backward_update(llm, sidecar, tokenizer, dataset, batches, device, dtype, tr
         raise ValueError("An optimizer update must contain questions")
     local_batches = [partition_batch(batch, parallel.rank, parallel.world_size) for batch in batches]
     compute_start = time.perf_counter()
-    cost_bucket = None
     initial_rng = capture_rng(device)
     initial_buffers = {name: buffer.detach().clone() for name, buffer in sidecar.named_buffers()}
     attempts, error, values, sizes = 0, None, [0.0] * 3, []
-    attempt_state = {"size": 0}
+    attempt_state = {"size": 0, "limit": micro_batch_size, "cost_bucket": None}
+    true_tokens = padded_tokens = 0
     while True:
         sidecar.zero_grad(set_to_none=True)
         failed_size = None
         try:
-            if adaptive_micro_batch is not None and attempts == 0:
-                # A preparation error participates in the same coordinated
-                # failure path as backward, rather than stranding other ranks.
-                # Old checkpoints' universal OOM cap does not cap new buckets.
-                cost_bucket, micro_batch_size = adaptive_micro_batch.select(
-                    dataset, local_batches, tokenizer, training, token_cache)
-            values, sizes = _backward_chunks(llm, sidecar, tokenizer, dataset, local_batches,
-                device, dtype, training, token_cache, micro_batch_size, global_count, attempt_state)
+            if balance_by_length and attempts == 0:
+                if token_lengths is None:
+                    raise ValueError("Length-balanced execution requires preflight token lengths")
+                local_batches = [length_balanced_partitions(batch, token_lengths, parallel.world_size)
+                                 [parallel.rank] for batch in batches]
+            values, sizes, true_tokens, padded_tokens = _backward_chunks(
+                llm, sidecar, tokenizer, dataset, local_batches, device, dtype, training, token_cache,
+                micro_batch_size, global_count, attempt_state, adaptive_micro_batch,
+                token_lengths, micro_batch_token_budget)
+            if adaptive_micro_batch is not None:
+                micro_batch_size = attempt_state["limit"]
             break
         except torch.cuda.OutOfMemoryError as exc:
             attempted = attempt_state["size"]
@@ -389,9 +419,9 @@ def backward_update(llm, sidecar, tokenizer, dataset, batches, device, dtype, tr
         with torch.no_grad():
             for name, buffer in sidecar.named_buffers():
                 buffer.copy_(initial_buffers[name])
-        micro_batch_size = max(1, min(micro_batch_size // 2, failed_size - 1))
+        micro_batch_size = max(1, min(attempt_state["limit"] // 2, failed_size - 1))
         if adaptive_micro_batch is not None:
-            adaptive_micro_batch.record_oom(cost_bucket, micro_batch_size)
+            adaptive_micro_batch.record_oom(attempt_state["cost_bucket"], micro_batch_size)
         attempts += 1
         print(f"oom_retry rank={parallel.rank} micro_batch={micro_batch_size} "
               f"global_questions={global_count} retry_entire_local_update=true", flush=True)
@@ -403,7 +433,11 @@ def backward_update(llm, sidecar, tokenizer, dataset, batches, device, dtype, tr
     sync_seconds = time.perf_counter() - sync_start
     execution = parallel.gather({"rank": parallel.rank, "questions": sum(map(len, local_batches)),
         "micro_batch_sizes": sizes, "micro_batch_limit": micro_batch_size, "oom_retries": attempts,
-        "cost_bucket": cost_bucket, "local_compute_seconds": compute_seconds,
+        "cost_bucket": attempt_state["cost_bucket"], "local_compute_seconds": compute_seconds,
+        "true_text_tokens": true_tokens if token_lengths is not None else None,
+        "padded_text_tokens": padded_tokens if token_lengths is not None else None,
+        "padding_fraction": 1 - true_tokens / padded_tokens if padded_tokens else 0.,
+        "length_balanced": balance_by_length,
         "synchronization_and_wait_seconds": sync_seconds})
     if sum(item["questions"] for item in execution) != global_count:
         raise RuntimeError("Global question accounting differs across ranks")
@@ -818,6 +852,11 @@ def validate_config(config):
         raise ValueError("runtime.auto_micro_batch must be boolean")
     if type(config["runtime"].get("adaptive_micro_batch", False)) is not bool:
         raise ValueError("runtime.adaptive_micro_batch must be boolean")
+    if type(config["runtime"].get("length_balanced_batches", False)) is not bool:
+        raise ValueError("runtime.length_balanced_batches must be boolean")
+    budget = config["runtime"].get("micro_batch_token_budget", 0)
+    if type(budget) is not int or budget < 0:
+        raise ValueError("runtime.micro_batch_token_budget must be a nonnegative integer")
     eval_batch = config["runtime"].get("eval_batch_size", 1)
     if type(eval_batch) is not int or eval_batch <= 0:
         raise ValueError("runtime.eval_batch_size must be a positive integer")
@@ -855,7 +894,7 @@ def run_identity(config, dataset, llm, tokenizer):
     # Execution chunking can be reduced to fit memory without changing the
     # global batch/optimizer recipe. Floating-point rounding need not be bitwise identical.
     for key in ("max_micro_batch_size", "auto_micro_batch", "adaptive_micro_batch", "eval_batch_size",
-                "eval_parity_check_questions"):
+                "eval_parity_check_questions", "length_balanced_batches", "micro_batch_token_budget"):
         recipe["runtime"].pop(key, None)
     identity = {"protocol": FORMAT, "prompt_version": PROMPT_VERSION, "dataset": dataset.identity,
             "text_encoding": {"version": TEXT_ENCODING_VERSION, "system_message": SYSTEM_MESSAGE,
@@ -911,6 +950,131 @@ def planned_updates(records, training, seed):
         return training["max_updates"]
     count = len(shape_batches(records, training["batch_size"], seed, 0))
     return math.ceil(count * training["epochs"] / training["gradient_accumulation_steps"])
+
+
+def benchmark_execution(llm, sidecar, tokenizer, dataset, device, dtype, config, parallel,
+                        token_cache, token_lengths, checkpoint, *, updates, warmup):
+    """Fixed weights, identical upcoming questions; never steps or writes a checkpoint.
+
+    This measures complete global forward/backward + clipping, not optimizer,
+    validation or startup throughput. Optimizer state is already resident.
+    """
+    if updates <= 0:
+        raise ValueError("No remaining updates to benchmark at this checkpoint")
+    training = config["training"]
+    epoch, cursor = checkpoint["epoch"], checkpoint["cursor"]
+    batches = shape_batches(dataset.records, training["batch_size"], config["runtime"]["seed"], epoch)
+    plan = []
+    for _ in range(updates):
+        update = []
+        for _ in range(training["gradient_accumulation_steps"]):
+            if cursor >= len(batches):
+                if training.get("max_updates") is None and epoch + 1 >= training["epochs"]:
+                    break
+                epoch, cursor = epoch + 1, 0
+                batches = shape_batches(dataset.records, training["batch_size"], config["runtime"]["seed"], epoch)
+            update.append(batches[cursor])
+            cursor += 1
+        if update:
+            plan.append(update)
+    if not plan:
+        raise ValueError("No remaining questions to benchmark")
+    # Equalize token-cache warming; no timing includes this preparation.
+    for index in sorted({i for update in plan for batch in update for i in batch}):
+        token_cache.get(dataset.records[index], tokenizer, training)
+    initial_rng = capture_rng(device)
+    initial_buffers = {name: b.detach().clone() for name, b in sidecar.named_buffers()}
+    reference_gradients, results = {}, []
+    def reset():
+        sidecar.clear()
+        sidecar.zero_grad(set_to_none=True)
+        restore_rng(initial_rng, device)
+        with torch.no_grad():
+            for name, buffer in sidecar.named_buffers():
+                buffer.copy_(initial_buffers[name])
+    def gradient_difference():
+        actual = {name: p.grad.detach().float().cpu().clone() for name, p in sidecar.named_parameters()
+                  if p.grad is not None}
+        if not reference_gradients:
+            reference_gradients.update(actual)
+            return {"relative_l2": 0., "max_abs": 0.}
+        if actual.keys() != reference_gradients.keys():
+            raise ValueError("Execution policies produced different trainable gradient sets")
+        numerator = denominator = maximum = 0.
+        for name, value in actual.items():
+            delta = value - reference_gradients[name]
+            numerator += float(delta.square().sum())
+            denominator += float(reference_gradients[name].square().sum())
+            maximum = max(maximum, float(delta.abs().max()))
+        return {"relative_l2": math.sqrt(numerator / max(denominator, 1e-30)), "max_abs": maximum}
+    core.set_frozen_llm_execution_mode(llm, checkpoint_training=True)
+    sidecar.train()
+    try:
+        for name, cap, balanced, budget in (
+                ("original_micro4", 4, False, 0),
+                ("balanced_micro4", 4, True, 0),
+                ("balanced_budgeted_micro8", 8, True, 4096)):
+            reset()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            saved = checkpoint.get("rank_states", [checkpoint])[parallel.rank]
+            adaptive = AdaptiveMicroBatch(cap, saved.get("adaptive_micro_batch_limits")) if budget else None
+            retries_warmup = 0
+            def run(update):
+                return backward_update(llm, sidecar, tokenizer, dataset, update, device, dtype,
+                    training, parallel, cap, token_cache=token_cache, auto_micro_batch=True,
+                    adaptive_micro_batch=adaptive, token_lengths=token_lengths,
+                    balance_by_length=balanced, micro_batch_token_budget=budget)
+            for update in plan[:warmup]:
+                _, cap, execution = run(update)
+                retries_warmup += sum(r["oom_retries"] for r in execution)
+            reset()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+            seconds = questions = true_tokens = padded_tokens = retries = 0
+            losses, difference = [], None
+            for j, update in enumerate(plan):
+                parallel.any(False)  # Align ranks before the timed region.
+                began = time.perf_counter()
+                values, cap, execution = run(update)
+                # Compare un-clipped gradients, but exclude CPU diagnostics from timing.
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                before_diagnostic = time.perf_counter()
+                if j == 0:
+                    difference = parallel.main(gradient_difference)
+                parallel.any(False)
+                after_diagnostic = time.perf_counter()
+                torch.nn.utils.clip_grad_norm_(sidecar.parameters(), training["grad_clip_norm"], error_if_nonfinite=True)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                elapsed = before_diagnostic - began + time.perf_counter() - after_diagnostic
+                seconds += max(parallel.gather(elapsed))
+                questions += sum(map(len, update))
+                true_tokens += sum(r["true_text_tokens"] for r in execution)
+                padded_tokens += sum(r["padded_text_tokens"] for r in execution)
+                retries += sum(r["oom_retries"] for r in execution)
+                losses.append(values[0])
+            peaks = parallel.gather(torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None)
+            result = {"policy": name, "updates": len(plan), "questions": questions,
+                "seconds": seconds, "questions_per_second": questions / seconds,
+                "seconds_per_update": seconds / len(plan), "true_text_tokens": true_tokens,
+                "padded_text_tokens": padded_tokens, "padding_fraction": 1 - true_tokens / padded_tokens,
+                "rank_oom_retries": retries, "warmup_rank_oom_retries": retries_warmup,
+                "final_micro_batch_limits": parallel.gather(cap),
+                "first_update_gradient_vs_original": difference, "losses": losses,
+                "peak_allocated_gib_per_rank": peaks,
+                "max_loss_abs_diff_vs_original": max(abs(a - b) for a, b in zip(losses, results[0]["losses"])) if results else 0.}
+            results.append(result)
+            if parallel.primary:
+                print("benchmark_policy=" + json.dumps({k: v for k, v in result.items() if k != "losses"}), flush=True)
+    finally:
+        reset()
+    return {"scope": "fixed_checkpoint_forward_backward_and_clipping", "optimizer_updates": 0,
+        "checkpoint_written": False, "world_size": parallel.world_size, "global_batch_plan_sha256": json_hash(plan),
+        "warmup_updates_per_policy": min(warmup, len(plan)), "results": results,
+        "limitation": "Short fixed-weight benchmark; excludes startup, optimizer steps and full validation. No automatic policy selection."}
 
 
 def geometry_probe_indices(rows):
@@ -988,6 +1152,14 @@ def main():
                         help="Fail on CUDA OOM instead of retrying the complete local update with smaller chunks")
     parser.add_argument("--adaptive-micro-batch", action=argparse.BooleanOptionalAction, default=None,
                         help="Remember OOM limits by field area/text length, allowing cheaper inputs larger batches")
+    parser.add_argument("--length-balanced-batches", action=argparse.BooleanOptionalAction, default=None,
+                        help="Balance padded-token cost across ranks within each unchanged global batch")
+    parser.add_argument("--micro-batch-token-budget", type=int,
+                        help="Per-chunk padded text-token budget; zero disables; never truncates a question")
+    parser.add_argument("--benchmark-updates", type=int,
+                        help="Compare execution policies on the same next N global updates WITHOUT optimizer steps; needs --resume and a separate empty output directory")
+    parser.add_argument("--benchmark-warmup-updates", type=int, default=3,
+                        help="Warmup forwards/backwards per policy before repeating measured updates (default: 3)")
     parser.add_argument("--eval-batch-size", type=int,
                         help="Per-device questions about one shared field decoded together; preserves every evaluation QA")
     parser.add_argument("--eval-parity-check-questions", type=int,
@@ -1015,6 +1187,16 @@ def main():
     parser.add_argument("--console-every-updates", type=int, default=200,
                         help="Console cadence only; detailed train.jsonl stays unchanged (default: 200)")
     cli = parser.parse_args()
+    if cli.benchmark_updates is not None:
+        if cli.benchmark_updates <= 0 or cli.benchmark_warmup_updates < 0:
+            parser.error("Benchmark updates must be positive and warmup nonnegative")
+        if (not cli.resume or cli.evaluate_only or cli.audit_only or cli.token_check_only or
+                cli.geometry_check_only or cli.overwrite_output_dir or cli.stop_after_updates):
+            parser.error("--benchmark-updates requires --resume and cannot combine with other run modes")
+        if Path(os.path.expandvars(cli.output_dir)).resolve() == Path(cli.resume).resolve().parent:
+            parser.error("Benchmark output must differ from the checkpoint directory")
+    elif cli.benchmark_warmup_updates != 3:
+        parser.error("--benchmark-warmup-updates requires --benchmark-updates")
     if cli.overwrite_output_dir and (cli.resume or cli.evaluate_only or cli.audit_only or cli.geometry_check_only or cli.token_check_only):
         parser.error("--overwrite-output-dir is only for fresh training")
     if cli.token_check_only and (cli.resume or cli.evaluate_only or cli.audit_only or cli.geometry_check_only
@@ -1055,6 +1237,10 @@ def main():
         config["runtime"]["auto_micro_batch"] = False
     if cli.adaptive_micro_batch is not None:
         config["runtime"]["adaptive_micro_batch"] = cli.adaptive_micro_batch
+    if cli.length_balanced_batches is not None:
+        config["runtime"]["length_balanced_batches"] = cli.length_balanced_batches
+    if cli.micro_batch_token_budget is not None:
+        config["runtime"]["micro_batch_token_budget"] = cli.micro_batch_token_budget
     if cli.eval_batch_size is not None:
         config["runtime"]["eval_batch_size"] = cli.eval_batch_size
     if cli.eval_parity_check_questions is not None:
@@ -1067,7 +1253,8 @@ def main():
     # Directory mutation and all shared artifacts have exactly one writer.
     try:
         output = Path(parallel.main(lambda: str(prepare_output_directory(os.path.expandvars(cli.output_dir),
-            resume=bool(cli.resume and not cli.evaluate_only), overwrite=cli.overwrite_output_dir))))
+            resume=bool(cli.resume and not cli.evaluate_only and cli.benchmark_updates is None),
+            overwrite=cli.overwrite_output_dir))))
     except BaseException:
         parallel.close()
         raise
@@ -1155,19 +1342,29 @@ def main():
             max_bytes=int(config["runtime"].get("token_cache_bytes", 256 * 2**20)),
             max_entries=int(config["runtime"].get("token_cache_entries", 262144)))
         token_reports = {}
+        training_token_lengths = None
+        collect_lengths = (bool(config["runtime"].get("length_balanced_batches", False)) or
+                           bool(config["runtime"].get("micro_batch_token_budget", 0)) or
+                           cli.benchmark_updates is not None)
         for split, d in datasets.items():
             say(f"token_preflight split={split} questions={len(d.records)} world_size={parallel.world_size}")
             rows = RecordView(d.records, range(parallel.rank, len(d.records), parallel.world_size))
             local_report, error = None, None
+            local_lengths = array("I") if split == "train" and collect_lengths else None
             try:
                 local_report = preflight_token_budgets(rows, tokenizer, config["training"],
-                    token_cache=token_cache, split=f"{split}/rank{parallel.rank}", raise_on_overflow=False)
+                    token_cache=token_cache, split=f"{split}/rank{parallel.rank}", raise_on_overflow=False,
+                    token_lengths=local_lengths)
             except Exception as exc:
                 if parallel.world_size == 1:
                     raise
                 error = f"{type(exc).__name__}: {exc}"
             parallel.check_errors(error)
             token_reports[split] = merge_token_reports(parallel.gather(local_report))
+            if local_lengths is not None:
+                training_token_lengths = merge_strided_lengths(local_lengths, len(d.records), parallel)
+                say(f"training_token_lengths questions={len(training_token_lengths)} "
+                    f"bytes_per_rank={len(training_token_lengths) * training_token_lengths.itemsize}")
         token_report_path = output / "token_preflight.json"
         write_shared(token_report_path, token_reports)
         overflow_splits = [split for split, report in token_reports.items() if report["overflow_questions"]]
@@ -1245,6 +1442,15 @@ def main():
         train_data = datasets["train"]
         batches = shape_batches(train_data.records, training["batch_size"], args.seed, epoch)
         batch_stats = batch_statistics(batches, training["batch_size"])
+        if cli.benchmark_updates is not None:
+            benchmark = benchmark_execution(llm, sidecar, tokenizer, train_data, device, dtype,
+                config, parallel, token_cache, training_token_lengths, checkpoint,
+                updates=min(cli.benchmark_updates, maximum - step), warmup=cli.benchmark_warmup_updates)
+            benchmark.update(checkpoint=str(Path(cli.resume).resolve()), checkpoint_step=step,
+                             requested_updates=cli.benchmark_updates)
+            write_shared(output / "execution_benchmark.json", benchmark)
+            say("execution_benchmark=" + json.dumps(benchmark))
+            return
         invocation_start_step = step
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.signal(signum, request_stop)
@@ -1289,6 +1495,8 @@ def main():
               f"global_batch={training['batch_size']} world_size={parallel.world_size} "
               f"per_device_micro_batch_limit={execution_limit} accumulation={training['gradient_accumulation_steps']} "
               f"adaptive_micro_batch={adaptive_micro_batch is not None} "
+              f"length_balanced_batches={config['runtime'].get('length_balanced_batches', False)} "
+              f"micro_batch_token_budget={config['runtime'].get('micro_batch_token_budget', 0)} "
               f"eval_batch_size={config['runtime'].get('eval_batch_size', 1)} "
               f"text_encoding={TEXT_ENCODING_VERSION} stop_token_ids={generation_stop_ids(llm, tokenizer)}")
         start = time.perf_counter()
@@ -1302,6 +1510,8 @@ def main():
             "world_size": parallel.world_size, "per_device_micro_batch_limit": execution_limit,
             "auto_micro_batch": config["runtime"].get("auto_micro_batch", True),
             "adaptive_micro_batch": adaptive_micro_batch is not None,
+            "length_balanced_batches": config["runtime"].get("length_balanced_batches", False),
+            "micro_batch_token_budget": config["runtime"].get("micro_batch_token_budget", 0),
             "eval_batch_size": config["runtime"].get("eval_batch_size", 1),
             **batch_stats,
             "selection_metric": "seen_shapes.macro_task_answer_accuracy"})
@@ -1310,6 +1520,7 @@ def main():
         if validation_pending:
             validate_and_save()
         window_seconds = window_questions = window_updates = 0
+        window_true_tokens = window_padded_tokens = window_oom_retries = 0
         while step < maximum:
             stop_requested = parallel.any(stop_requested)
             if stop_requested:
@@ -1333,7 +1544,9 @@ def main():
                 llm, sidecar, tokenizer, train_data, micro_batches, device, dtype, training,
                 parallel, micro_batch_size, token_cache=token_cache,
                 auto_micro_batch=config["runtime"].get("auto_micro_batch", True),
-                adaptive_micro_batch=adaptive_micro_batch)
+                adaptive_micro_batch=adaptive_micro_batch, token_lengths=training_token_lengths,
+                balance_by_length=config["runtime"].get("length_balanced_batches", False),
+                micro_batch_token_budget=config["runtime"].get("micro_batch_token_budget", 0))
             loss_value, answer_ce, reconstruction = values
             grad_norm = torch.nn.utils.clip_grad_norm_(sidecar.parameters(), training["grad_clip_norm"], error_if_nonfinite=True)
             optimizer.step()
@@ -1345,6 +1558,9 @@ def main():
             window_seconds += time.perf_counter() - update_start
             window_questions += total_records
             window_updates += 1
+            window_true_tokens += sum(r["true_text_tokens"] or 0 for r in execution)
+            window_padded_tokens += sum(r["padded_text_tokens"] or 0 for r in execution)
+            window_oom_retries += sum(r["oom_retries"] for r in execution)
             log_to_file = step % training["log_interval"] == 0 or step == 1
             log_to_console = log_to_file if cli.verbose else step == 1 or step % cli.console_every_updates == 0 or step == maximum
             if log_to_file or log_to_console:
@@ -1361,7 +1577,11 @@ def main():
                          "per_rank_execution": execution,
                          "training_window": {"updates": window_updates, "questions": window_questions,
                              "seconds": window_seconds, "seconds_per_update": window_seconds / window_updates,
-                             "questions_per_second": window_questions / max(window_seconds, 1e-9)},
+                             "questions_per_second": window_questions / max(window_seconds, 1e-9),
+                             "true_text_tokens": window_true_tokens if training_token_lengths is not None else None,
+                             "padded_text_tokens": window_padded_tokens if training_token_lengths is not None else None,
+                             "padding_fraction": 1 - window_true_tokens / window_padded_tokens if window_padded_tokens else None,
+                             "rank_oom_retries": window_oom_retries},
                          "per_rank_memory": memory_by_rank,
                          "peak_allocated_gib": max(m["peak_allocated_gib"] for m in memory_by_rank)
                          if device.type == "cuda" else None,
@@ -1373,6 +1593,7 @@ def main():
                 if log_to_console and parallel.primary:
                     print(json.dumps(entry), flush=True)
                 window_seconds = window_questions = window_updates = 0
+                window_true_tokens = window_padded_tokens = window_oom_retries = 0
             should_stop = stop_requested or (cli.stop_after_updates is not None and step - invocation_start_step >= cli.stop_after_updates)
             validation_pending = step % training["eval_every_updates"] == 0 or step == maximum
             # Save before potentially long validation, so termination loses no completed update.

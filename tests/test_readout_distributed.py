@@ -18,7 +18,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from scripts import train_point_readout as trainer
-from scripts.readout_distributed import ParallelContext, partition_batch, evaluation_indices, capture_rng, restore_rng
+from scripts.readout_distributed import (ParallelContext, partition_batch, evaluation_indices, capture_rng,
+                                        restore_rng, length_balanced_partitions, merge_strided_lengths)
 from test_point_readout import tiny_components, data_fixture
 from test_point_readout_performance import TinyDataset, sample_rows
 
@@ -29,6 +30,30 @@ def test_partitions_preserve_each_question_once(count):
     parts = [partition_batch(indices, rank, 3) for rank in range(3)]
     assert sum(parts, []) == indices
     assert max(map(len, parts)) - min(map(len, parts)) <= 1
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 3, 4, 7, 16, 48, 49])
+def test_length_balancing_covers_exact_batch_and_uses_available_ranks(count):
+    indices, lengths = list(range(count)), [100 + (i * 173) % 850 for i in range(count)]
+    original = list(indices)
+    parts = length_balanced_partitions(indices, lengths, 3)
+    assert sorted(sum(parts, [])) == indices == original
+    assert sum(bool(part) for part in parts) == min(3, count)
+    assert parts == length_balanced_partitions(indices, lengths, 3)
+    for part in parts:
+        assert [lengths[i] for i in part] == sorted([lengths[i] for i in part], reverse=True)
+
+
+def test_length_balancing_reduces_padding_and_straggler_cost():
+    lengths = [800, 180, 200, 190] * 12
+    old = [partition_batch(list(range(48)), rank, 3) for rank in range(3)]
+    balanced = length_balanced_partitions(list(range(48)), lengths, 3)
+    def cost(part):
+        return sum(len(part[i:i+4]) * max(lengths[j] for j in part[i:i+4])
+                   for i in range(0, len(part), 4))
+    assert sum(map(cost, balanced)) < .6 * sum(map(cost, old))
+    assert max(map(cost, balanced)) < .6 * max(map(cost, old))
+    assert sorted(sum(length_balanced_partitions([0, 0, 1, 2], lengths, 3), [])) == [0, 0, 1, 2]
 
 
 def test_eval_keeps_field_groups_and_rejects_missing_duplicate_rows(tmp_path):
@@ -148,7 +173,9 @@ def _distributed_worker(rank, world, rendezvous, root, config_path, barrier=None
     _, llm, sidecar, tokenizer, config = tiny_components()
     config["evaluation"].update(max_new_tokens=3)
     rows, fields = sample_rows()
-    examples = [(rows[i % 2], fields["a"]) for i in range(7)]
+    examples = [(copy.deepcopy(rows[i % 2]), fields["a"]) for i in range(7)]
+    for (row, _), extra in zip(examples, [0, 12, 1, 10, 2, 8, 3]):
+        row["question"] += " extra words" * extra
     single = ParallelContext(device)
     trainer.backward_update(llm, sidecar, tokenizer, examples, [list(range(7))], device,
         torch.float32, config["training"], single, 7)
@@ -169,6 +196,13 @@ def _distributed_worker(rank, world, rendezvous, root, config_path, barrier=None
         transport_patch.start()
     try:
         context = ParallelContext(device)
+        lengths = [len(p) + len(a) for p, a in
+                   (trainer.encode_training_record(row, tokenizer, config["training"]) for row, _ in examples)]
+        merged = merge_strided_lengths(lengths[rank::world], len(lengths), context)
+        assert list(merged) == lengths
+        with pytest.raises(RuntimeError, match="Preflight length count mismatch"):
+            merge_strided_lengths(lengths[rank::world][:-1] if rank == 1 else lengths[rank::world],
+                                  len(lengths), context)
         # Unequal local counts 3/2/2 and smaller chunks 2/1 must preserve the mean.
         _, llm, sidecar, tokenizer, config = tiny_components()
         config["evaluation"].update(max_new_tokens=3)
@@ -177,6 +211,15 @@ def _distributed_worker(rank, world, rendezvous, root, config_path, barrier=None
         _, _, execution = trainer.backward_update(llm, sidecar, tokenizer, examples, [list(range(7))],
             device, torch.float32, config["training"], context, 2)
         assert [r["questions"] for r in execution] == [3, 2, 2]
+        for name, p in sidecar.named_parameters():
+            if name in reference:
+                torch.testing.assert_close(p.grad, reference[name], rtol=2e-4, atol=2e-6)
+        # Different question ownership still gives the SAME globally weighted
+        # gradient, including heterogeneous real prompt lengths.
+        _, _, execution = trainer.backward_update(llm, sidecar, tokenizer, examples, [list(range(7))],
+            device, torch.float32, config["training"], context, 2,
+            token_lengths=lengths, balance_by_length=True, micro_batch_token_budget=2048)
+        assert sum(r["questions"] for r in execution) == 7
         for name, p in sidecar.named_parameters():
             if name in reference:
                 torch.testing.assert_close(p.grad, reference[name], rtol=2e-4, atol=2e-6)
@@ -239,6 +282,13 @@ def _distributed_worker(rank, world, rendezvous, root, config_path, barrier=None
              patch.object(trainer.core, "load_llm_with_bounded_host_memory", load_model):
             run("complete")
             run("interrupted", "--stop-after-updates", "1")
+            previous_bytes = (root / "interrupted/last.pt").read_bytes()
+            run("benchmark", "--resume", str(root / "interrupted/last.pt"),
+                "--benchmark-updates", "1", "--benchmark-warmup-updates", "0")
+            assert (root / "interrupted/last.pt").read_bytes() == previous_bytes
+            benchmark = json.loads((root / "benchmark/execution_benchmark.json").read_text())
+            assert benchmark["optimizer_updates"] == 0 and len(benchmark["results"]) == 3
+            assert not (root / "benchmark/last.pt").exists()
             run("interrupted", "--resume", str(root / "interrupted/last.pt"),
                 "--adaptive-micro-batch", "--eval-batch-size", "8", "--eval-parity-check-questions", "32")
         expected = torch.load(root / "complete/last.pt", weights_only=True)
@@ -281,6 +331,7 @@ def test_three_process_training_evaluation_and_exact_resume(data_fixture, tmp_pa
     config["training"].update(batch_size=7, gradient_accumulation_steps=2, max_updates=2,
                               save_every_updates=1, eval_every_updates=2, log_interval=1)
     config["runtime"]["max_micro_batch_size"] = 2
+    config["runtime"].update(length_balanced_batches=True, micro_batch_token_budget=4096)
     config["experiment_profile"] = "smoke"
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
