@@ -61,6 +61,7 @@ Thumbs.db
 !/scripts/readout_distributed.py
 !/scripts/score_point_readout.py
 !/scripts/benchmark_point_readout.py
+!/scripts/benchmark_readout_efficiency.py
 !/scripts/compare_block_readout.py
 !/scripts/chat_point_readout.py
 !/scripts/setup_field_qa_server.sh
@@ -90,6 +91,7 @@ Thumbs.db
 !/tests/test_tensor_qwen_cross_attention.py
 !/tests/test_variable_shape_fields.py
 !/tests/test_point_readout.py
+!/tests/test_readout_efficiency.py
 !/tests/test_readout_distributed.py
 !/tests/test_block_readout.py
 !/tests/test_ins_tracer_readout.py
