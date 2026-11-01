@@ -101,7 +101,8 @@ cross_attention:
   gate_init: 0.0
 training:
   epochs: 2
-  # Global upper bound, NOT per GPU. Three ranks normally receive 16 each.
+  # Global upper bound, NOT per GPU; independent of the number of ranks.
+  # Length balancing may assign different question counts to each rank.
   batch_size: 48
   gradient_accumulation_steps: 1
   lr: 5.0e-5
@@ -136,10 +137,11 @@ runtime:
   # A conservative padded-text budget, NOT a truncation limit or VRAM guarantee.
   # E.g. 300-token questions may use 8; 700-token questions use at most 4.
   micro_batch_token_budget: 4096
-  # Batch questions about ONE field; independent text KV/EOS, complete scoring.
-  eval_batch_size: 8
-  # A spot check, not a proof of bitwise parity for the complete BF16 evaluation.
-  # On a mismatch, that rank falls back to serial for the remaining evaluation.
+  # Conservative reference: score every question with serial generation per GPU.
+  # Batched generation remains opt-in; a spot check cannot prove full BF16 parity.
+  eval_batch_size: 1
+  # Used only if evaluation batching is explicitly enabled. On a mismatch,
+  # that rank falls back to serial for the remaining evaluation.
   eval_parity_check_questions: 32
   # Compact token arrays plus conservative per-entry accounting. No model graphs.
   token_cache_bytes: 2147483648

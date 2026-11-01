@@ -28,6 +28,7 @@ from scripts.readout_distributed import (
     ParallelContext, RecordView, capture_rng, restore_rng, partition_batch,
     evaluation_indices, merge_token_reports,
     length_balanced_partitions, merge_strided_lengths,
+    resume_execution_state,
 )
 from tensor_compression.downstream.point_readout import (
     FORMAT, PROMPT_VERSION, build_prompt, json_hash, score_answer,
@@ -953,7 +954,7 @@ def planned_updates(records, training, seed):
 
 
 def benchmark_execution(llm, sidecar, tokenizer, dataset, device, dtype, config, parallel,
-                        token_cache, token_lengths, checkpoint, *, updates, warmup):
+                        token_cache, token_lengths, checkpoint, *, updates, warmup, resume_state=None):
     """Fixed weights, identical upcoming questions; never steps or writes a checkpoint.
 
     This measures complete global forward/backward + clipping, not optimizer,
@@ -1017,7 +1018,8 @@ def benchmark_execution(llm, sidecar, tokenizer, dataset, device, dtype, config,
             reset()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-            saved = checkpoint.get("rank_states", [checkpoint])[parallel.rank]
+            saved = (resume_state if resume_state is not None else
+                     checkpoint.get("rank_states", [checkpoint])[parallel.rank])
             adaptive = AdaptiveMicroBatch(cap, saved.get("adaptive_micro_batch_limits")) if budget else None
             retries_warmup = 0
             def run(update):
@@ -1166,7 +1168,11 @@ def main():
                         help="Compare the first N batched questions per rank/evaluation against serial greedy decoding")
     parser.add_argument("--distributed-timeout-minutes", type=int, default=360,
                         help="Collective timeout, including complete data audit/preflight (default: 360)")
-    parser.add_argument("--resume", help="Strict resume from this numerical-generation experiment")
+    parser.add_argument("--resume", help="Resume this experiment's complete training state")
+    parser.add_argument("--allow-world-size-change", action="store_true",
+                        help="Allow a recorded change of GPU/process count; keep global batch, optimizer, scheduler and data cursor; no bitwise replay guarantee")
+    parser.add_argument("--reset-micro-batch-limits", action="store_true",
+                        help="Discard saved OOM caps after a hardware change; start from the requested micro-batch cap")
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument("--eval-suite", choices=("main", "language", "field-pairs"), default="main",
                         help="Diagnostic pairs are explicit evaluations, never periodic training validation")
@@ -1187,6 +1193,9 @@ def main():
     parser.add_argument("--console-every-updates", type=int, default=200,
                         help="Console cadence only; detailed train.jsonl stays unchanged (default: 200)")
     cli = parser.parse_args()
+    if (cli.allow_world_size_change or cli.reset_micro_batch_limits) and (
+            not cli.resume or cli.evaluate_only or cli.audit_only or cli.token_check_only or cli.geometry_check_only):
+        parser.error("Execution migration flags require training/benchmark --resume")
     if cli.benchmark_updates is not None:
         if cli.benchmark_updates <= 0 or cli.benchmark_warmup_updates < 0:
             parser.error("Benchmark updates must be positive and warmup nonnegative")
@@ -1280,6 +1289,11 @@ def main():
         say(f"parallel_setup world_size={parallel.world_size} device_type={device.type} "
             f"global_batch_limit={config['training']['batch_size']} "
             f"micro_batch_limit={config['runtime'].get('max_micro_batch_size', config['training']['batch_size'])}")
+        hardware = {"rank": parallel.rank, "device": str(device)}
+        if device.type == "cuda":
+            properties = torch.cuda.get_device_properties(device)
+            hardware.update(name=properties.name, vram_gib=properties.total_memory / 2**30)
+        say("visible_training_devices=" + json.dumps(parallel.gather(hardware)))
         for split in splits:
             say(f"dataset_load split={split} validating_manifest_and_loading_records=true")
             suite_options = {"suite": cli.eval_suite} if cli.eval_suite == "language" else {}
@@ -1388,13 +1402,34 @@ def main():
         if existing_contract.exists() and json.loads(existing_contract.read_text(encoding="utf-8")) != identity:
             raise ValueError("Output directory belongs to another experiment")
         checkpoint = torch.load(cli.resume, map_location="cpu", weights_only=True) if cli.resume else None
+        resume_state, resume_report = None, None
+        execution_migrations = []
         if checkpoint:
             validate_resume(checkpoint, identity)
+            execution_migrations = list(checkpoint.get("execution_migrations", []))
+            if not cli.evaluate_only:
+                error = None
+                try:
+                    resume_state, local_report = resume_execution_state(checkpoint, parallel,
+                        allow_world_size_change=cli.allow_world_size_change,
+                        reset_micro_batch_limits=cli.reset_micro_batch_limits, seed=args.seed)
+                except Exception as exc:
+                    if parallel.world_size == 1:
+                        raise
+                    error = f"{type(exc).__name__}: {exc}"
+                parallel.check_errors(error)
+                resume_report = {"checkpoint": str(Path(cli.resume).resolve()),
+                                 "per_rank": parallel.gather(local_report)}
+                if local_report["world_size_changed"] or local_report["micro_batch_limits_reset"]:
+                    execution_migrations.append(resume_report)
             sidecar.load_state_dict(checkpoint["sidecar"], strict=True)
         parallel.synchronize_parameters(sidecar)
         write_shared(output / "contract.json", identity)
         write_shared(output / "resolved_config.json", config)
         write_shared(output / "architecture.json", report)
+        if resume_report is not None:
+            write_shared(output / "resume_execution.json", resume_report)
+            say("resume_execution=" + json.dumps(resume_report))
         if cli.geometry_check_only:
             geometry = check_geometry(llm, sidecar, tokenizer, datasets["train"], device, dtype, config, parallel=parallel)
             reports = parallel.gather(geometry)
@@ -1428,15 +1463,11 @@ def main():
             scheduler.load_state_dict(checkpoint["scheduler"])
             step, epoch, cursor, best = (checkpoint[k] for k in ("step", "epoch", "cursor", "best"))
             validation_pending = checkpoint.get("validation_pending", False)
-            execution = checkpoint.get("parallel_execution", {"world_size": 1})
-            if execution["world_size"] != parallel.world_size:
-                raise ValueError("Strict training resume requires the same GPU/process count; evaluation may use another count")
-            rank_states = checkpoint.get("rank_states", [checkpoint])
-            restore_rng(rank_states[parallel.rank], device)
-            micro_batch_size = min(micro_batch_size, rank_states[parallel.rank].get("micro_batch_limit", micro_batch_size))
+            restore_rng(resume_state, device)
+            micro_batch_size = min(micro_batch_size, resume_state.get("micro_batch_limit", micro_batch_size))
             if adaptive_micro_batch is not None:
                 adaptive_micro_batch = AdaptiveMicroBatch(adaptive_micro_batch.maximum,
-                    rank_states[parallel.rank].get("adaptive_micro_batch_limits"))
+                    resume_state.get("adaptive_micro_batch_limits"))
         if step > maximum:
             raise ValueError("Checkpoint step exceeds configured training budget")
         train_data = datasets["train"]
@@ -1445,9 +1476,11 @@ def main():
         if cli.benchmark_updates is not None:
             benchmark = benchmark_execution(llm, sidecar, tokenizer, train_data, device, dtype,
                 config, parallel, token_cache, training_token_lengths, checkpoint,
-                updates=min(cli.benchmark_updates, maximum - step), warmup=cli.benchmark_warmup_updates)
+                updates=min(cli.benchmark_updates, maximum - step), warmup=cli.benchmark_warmup_updates,
+                resume_state=resume_state)
             benchmark.update(checkpoint=str(Path(cli.resume).resolve()), checkpoint_step=step,
                              requested_updates=cli.benchmark_updates)
+            benchmark["resume_execution"] = resume_report
             write_shared(output / "execution_benchmark.json", benchmark)
             say("execution_benchmark=" + json.dumps(benchmark))
             return
@@ -1464,6 +1497,7 @@ def main():
                 "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                 "step": step, "epoch": epoch, "cursor": cursor, "best": best,
                 "validation_pending": validation_pending, **states[0],
+                "execution_migrations": execution_migrations,
                 "rank_states": states, "parallel_execution": {"world_size": parallel.world_size,
                     "global_batch_size": training["batch_size"], "gradient_reduction": "global_question_mean"}}))
 

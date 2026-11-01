@@ -143,8 +143,9 @@ Qwen分词器资产缺失；尚未测出服务器这份完整QA的最大token长
 全局48相比原16减少每轮更新次数；精确次数以 `training_plan.json` 为准，不保证恰好1/3。
 学习率仍为5e-5/gate 5e-4，warmup比例和两轮不变，不自动将学习率乘3。
 保存/验证仍按原2048/8192次更新触发；因此两次检查之间通常会覆盖更多问题。
-验证、测试按场分给三卡生成；新配置每卡最多合批8个同场问题，独立维护文本上下文
-和结束符。汇总完整预测检查QA ID无遗漏、无重复，再计算总指标。
+验证、测试按场分给各卡生成；2026-11-01起默认每卡逐题生成，保留场编码复用。
+此前的同场合批仍可显式启用，但每卡32题抽查不足以证明全量预测与逐题一致。
+汇总完整预测检查QA ID无遗漏、无重复，再计算总指标。
 
 源裁剪审计只由rank0完整执行一次；分词预检按问题分片，全体合起来仍覆盖所有要求的题。
 模型文件哈希只在rank0读取一次，各rank模型/分词器/配置/数据身份还会相互核对。
@@ -231,8 +232,9 @@ python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
 
 正在训练2×2时改为它的目录。不要添加覆盖参数，不要拿旧数据实验的 checkpoint
 续训新版。正常终止会请求在完整更新处保存；强制断电/SIGKILL只能恢复最近 checkpoint。
-严格续训要求进程数相同，三卡checkpoint请继续用三卡；旧全局16的checkpoint不能直接
-改变为48续训，本次48实验使用新目录从头开始。评估允许使用不同进程数。
+默认严格续训要求进程数相同；2026-11-01起，跨卡数迁移可以显式使用
+`--allow-world-size-change`，详见4.3。这不允许改变全局batch；旧全局16的checkpoint不能
+直接改变为48续训，本次48实验使用新目录从头开始。评估允许使用不同进程数。
 可以在续训命令追加 `--micro-batch-size 8` 降低每卡计算块，仍保持全局48；
 它属于执行设置，不更改训练身份。checkpoint包含每个rank的随机状态、小批次上限，
 以及统一的优化器、调度器、epoch/cursor和待完成验证标记，由rank0原子写入。
@@ -261,11 +263,11 @@ python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
   --resume "$RUN/last.pt" --output-dir "$RUN" \
   --micro-batch-size 8 --adaptive-micro-batch \
   --length-balanced-batches --micro-batch-token-budget 4096 \
-  --eval-batch-size 8 --eval-parity-check-questions 32 \
+  --eval-batch-size 1 \
   --console-every-updates 200
 ```
 
-不加覆盖参数，不重建数据，不修改全局 `--batch-size`。三卡数量仍须一致。
+不加覆盖参数，不重建数据，不修改全局 `--batch-size`。本节按三卡续训；换卡数见4.3。
 原数据每轮4,685,677题、两轮9,371,354次呈现、208,570次更新保持不变。
 全局每批上限48，同形状尾批仍可不足48；此次变化的是每卡物理计算块，
 允许便宜输入恢复到8，不同卡也可使用不同计算块。梯度仍按全局实际题数归一化。
@@ -279,6 +281,7 @@ python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
 
 验证、测试保留全部问题、原生成长度上限、贪心策略和评分标准；同一场只编码一次，
 共享只读场记忆，问题之间不共享文本历史。解码OOM时减小合批重试同一组待答问题。
+以下为显式启用合批时的抽查行为，上方保守续训命令已改为逐题：
 每次验证、每张卡对最先进入合批的最多32题再做逐条生成对照；若有差异，
 当前组改用逐条结果，该卡本次剩余验证回退到逐条。输出 `batch_parity_checked`、
 `batch_parity_mismatches`，并记录各卡最终 `evaluation_batch_limit`。
@@ -368,6 +371,104 @@ padding比例、OOM次数、各卡显存峰值、逐次loss差及首个全局更
 关闭自适应时，checkpoint中已有的更低统一OOM上限仍会保留，以启动日志和实际拆分为准。
 这些开关不修改全局batch或续训身份，无需重建QA。测速后恢复训练仍从原`last.pt`开始。
 
+### 4.3 三卡checkpoint迁移到单卡，以及120 GB MIG分配（2026-11-01）
+
+本次服务器输出显示两个物理A800，但实际分为三个`3g.40gb` MIG实例：第一张物理卡
+有两个40448 MiB分区，第二张有一个。它们不是“可用80 GB单卡＋40 GB”，不能将两个
+40 GB分区当作一个80 GB设备。R550驱动存在单进程MIG枚举限制，NVIDIA也注明MIG不支持
+NCCL，因此本训练器不能直接把这些分区作为普通三卡启动。参考
+[CUDA/MIG设备枚举](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/mig-device-names.html)与
+[MIG通信限制](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/latest/deployment-considerations.html)。
+PyTorch先报告`device_count=2`而在读取设备属性时断言失败，不证明有两个可用CUDA设备。
+必须以新进程初始化、设备属性和实际分配小张量成功为准。代码不会修改MIG或宿主机驱动。
+
+当前分配中可先绑定平台已分配的一个MIG UUID，做初始化检查（资源重新申请后UUID会变）：
+
+```bash
+source /workspace/wyx/f2llm/enter_f2llm.sh
+cd /workspace/wyx/f2llm/tensor-compression
+export CUDA_VISIBLE_DEVICES=MIG-38367797-ed34-5814-bfc6-d8122fc62576
+export OMP_NUM_THREADS=1
+python -c "import torch; torch.cuda.init(); p=torch.cuda.get_device_properties(0); x=torch.ones(1, device='cuda'); print(p.name, round(p.total_memory/2**30, 2), 'GiB', 'allocation:', x.item())"
+```
+
+成功只证明单个约40 GB分区可用，不证明Qwen14B完整训练可放下。如果希望试运行，
+在同步本次代码后，使用以下单进程命令。保留全部原始源、完整QA、全局batch48和原两轮
+调度，只执行额外20次更新后保存停止，不能将其称为完成训练：
+
+```bash
+RUN="$FIELD_TO_LLM_RUNS_DIR/multisource_v2_3gpu_b48_full_1x1"
+STAMP="$(date +%Y%m%d_%H%M%S)"
+cp -- "$RUN/last.pt" "$RUN/last_before_device_change_$STAMP.pt"
+cp -- "$RUN/resolved_config.json" "$RUN/resolved_config_before_device_change_$STAMP.json"
+if [ -f "$RUN/best.pt" ]; then
+  cp -- "$RUN/best.pt" "$RUN/best_before_device_change_$STAMP.pt"
+fi
+
+python -u scripts/train_point_readout.py \
+  --config "$RUN/resolved_config.json" --profile full --device cuda \
+  --resume "$RUN/last.pt" --output-dir "$RUN" \
+  --allow-world-size-change --reset-micro-batch-limits \
+  --micro-batch-size 1 --no-adaptive-micro-batch \
+  --length-balanced-batches --micro-batch-token-budget 0 \
+  --eval-batch-size 1 --console-every-updates 20 --stop-after-updates 20
+```
+
+每次更新仍包含原全局batch的全部问题，由这一张设备分多次前后向累积，再做一次优化器
+更新。若micro=1仍OOM，会报错停止，不删题、缩场、截断或量化权重。短跑未遇到OOM也
+不能证明后续最大场、最长文本或完整验证一定可运行；还需保留启动和显存日志。
+不要在此分配上使用`CUDA_VISIBLE_DEVICES=0,1,2`或三进程torchrun。
+
+若换成完整80 GB单卡，请向管理员明确要求“单个CUDA设备可用约80 GB”，不是两个
+40 GB MIG分区相加。获得新分配后，下面检查应显示单设备约79 GiB，并完成CUDA分配：
+
+```bash
+source /workspace/wyx/f2llm/enter_f2llm.sh
+cd /workspace/wyx/f2llm/tensor-compression
+export CUDA_VISIBLE_DEVICES=0
+export OMP_NUM_THREADS=1
+python - <<'PY'
+import torch
+torch.cuda.init()
+p = torch.cuda.get_device_properties(0)
+print('CUDA devices:', torch.cuda.device_count(), p.name, p.total_memory / 2**30, 'GiB')
+assert p.total_memory >= 70 * 2**30, 'This is not a single device with about 80 GB; check the allocation.'
+print('CUDA allocation OK:', torch.ones(1, device='cuda').item())
+PY
+```
+
+确认检查通过、代码已同步后，仍从最新的`last.pt`继续，不管它是原三卡还是单分区短跑
+保存的。首次迁移前保留上面的备份；运行目录里的`3gpu`是历史名称，不决定实际卡数：
+
+```bash
+RUN="$FIELD_TO_LLM_RUNS_DIR/multisource_v2_3gpu_b48_full_1x1"
+python -u scripts/train_point_readout.py \
+  --config "$RUN/resolved_config.json" --profile full --device cuda \
+  --resume "$RUN/last.pt" --output-dir "$RUN" \
+  --allow-world-size-change --reset-micro-batch-limits \
+  --micro-batch-size 4 --adaptive-micro-batch \
+  --length-balanced-batches --micro-batch-token-budget 4096 \
+  --eval-batch-size 1 --console-every-updates 200
+```
+
+80 GB命令从每次最多4题开始，可在OOM时进一步拆分；全局batch不是4，仍保持checkpoint
+规定的48及原有尾批。没有重新初始化模型、优化器或学习率调度，也不从头消耗两轮。
+正常续训不必每次清空OOM经验；同一硬件下一次启动可去掉`--reset-micro-batch-limits`。
+只有跨卡数才必须加`--allow-world-size-change`，保留它也不会改变同卡数恢复的行为。
+以后恢复2×2时，使用它自己的运行目录和checkpoint。
+
+跨卡数恢复会保存`resume_execution.json`及checkpoint内的`execution_migrations`。
+记录旧/新进程数、迁移step、随机状态映射及OOM限制清空情况。保留的rank使用对应旧rank
+的Python/Torch/CUDA随机状态，新增rank才派生独立可复现的随机流；减少rank不会丢失其
+应处理的数据，因为下一次更新从完整的全局索引重新划分。数据/模型身份、优化器状态、
+学习率调度、epoch/cursor和待完成验证标记仍检查并恢复。
+进程数及归约顺序变化不能保证位级一致；这不是原三卡轨迹的逐位重放。
+
+迁移命令显式设`--eval-batch-size 1`，避免将每卡32题的合批抽查当作全量等价证明。
+所有验证题仍会生成、评分，三卡减少到单卡也会让完整验证更慢。已存在的合批验证分数
+不会自动重算；若需要对已保存候选checkpoint做严格比较，须统一使用逐题全量评估。
+本次不自动改变数据、任务、训练预算或模型结构，也不强制安装/升级PyTorch。
+
 ## 5. 正式测试、语言测试和输入依赖诊断
 
 训练结束后对每个结构执行以下四种独立评测。后三种是补充诊断，不能替代正式test。
@@ -428,6 +529,18 @@ python scripts/score_point_readout.py \
 ```
 
 ## 验证记录
+
+2026-11-01 跨卡数恢复主回归：**179 passed、2 skipped，135.59秒**。
+实际生成三个CPU进程的step-1 checkpoint，再分别用一个、两个进程恢复；核对下一次更新的
+数据位置、模型参数、Adam状态和scheduler状态，随后验证新卡数的正常严格恢复。
+测试还覆盖拒绝未显式声明的跨卡数恢复、迁移记录、随机状态映射、旧OOM上限清空、
+新增rank的确定性随机流，以及迁移后的只读性能诊断不改原checkpoint。
+三进程通信使用文件测试替身；不证明服务器NCCL、MIG或Qwen14B显存可用。
+两项跳过仍是本机原生Gloo不可用和缺少真实Qwen分词器资产。
+首次专项回归因Windows系统临时目录清理权限失败；改用pytest项目内临时目录后，
+分布式专项22通过、1跳过，再完成上述主回归。CLI帮助与`git diff --check`通过。
+最后将新配置的验证默认值收紧为逐题；旧运行须用`--eval-batch-size 1`显式覆盖保存配置。
+未在远端执行本次训练命令，没有测得当前40 GB分区的完整训练容量或单卡80 GB速度。
 
 2026-10-26 长度均衡与固定checkpoint测速回归：**178 passed、2 skipped，97.18秒**。
 覆盖真实小型Qwen的长短文本padding减少、逐题/全局加权梯度一致性、尾批与空rank、

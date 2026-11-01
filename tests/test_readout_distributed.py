@@ -9,7 +9,6 @@ import pickle
 from pathlib import Path
 import random
 import sys
-import tempfile
 from unittest.mock import patch
 
 import pytest
@@ -19,7 +18,8 @@ import torch.multiprocessing as mp
 
 from scripts import train_point_readout as trainer
 from scripts.readout_distributed import (ParallelContext, partition_batch, evaluation_indices, capture_rng,
-                                        restore_rng, length_balanced_partitions, merge_strided_lengths)
+                                        restore_rng, length_balanced_partitions, merge_strided_lengths,
+                                        resume_execution_state)
 from test_point_readout import tiny_components, data_fixture
 from test_point_readout_performance import TinyDataset, sample_rows
 
@@ -54,6 +54,42 @@ def test_length_balancing_reduces_padding_and_straggler_cost():
     assert sum(map(cost, balanced)) < .6 * sum(map(cost, old))
     assert max(map(cost, balanced)) < .6 * max(map(cost, old))
     assert sorted(sum(length_balanced_partitions([0, 0, 1, 2], lengths, 3), [])) == [0, 0, 1, 2]
+
+
+def test_resume_execution_mapping_preserves_state_and_requires_explicit_migration():
+    from types import SimpleNamespace
+    rng = capture_rng(torch.device("cpu"))
+    state = {**rng, "micro_batch_limit": 2, "adaptive_micro_batch_limits": [[12, 4, 2]]}
+    checkpoint = {"step": 123, "parallel_execution": {"world_size": 3},
+                  "rank_states": [state, state, state], "epoch": 1, "cursor": 17}
+    context = SimpleNamespace(world_size=1, rank=0, device=torch.device("cpu"))
+    with pytest.raises(ValueError, match="allow-world-size-change"):
+        resume_execution_state(checkpoint, context)
+    mapped, report = resume_execution_state(checkpoint, context, allow_world_size_change=True)
+    assert torch.equal(mapped["torch_rng"], rng["torch_rng"])
+    assert mapped["python_rng"] == rng["python_rng"]
+    assert "micro_batch_limit" not in mapped and "adaptive_micro_batch_limits" not in mapped
+    assert report["world_size_changed"] and report["micro_batch_limits_reset"]
+    assert report["from_world_size"] == 3 and report["to_world_size"] == 1
+    assert state["micro_batch_limit"] == 2 and checkpoint["cursor"] == 17  # no source mutation
+    context.world_size = 3
+    strict, report = resume_execution_state(checkpoint, context)
+    assert strict["micro_batch_limit"] == 2 and not report["world_size_changed"]
+    assert not report["micro_batch_limits_reset"]
+    reset, report = resume_execution_state(checkpoint, context, reset_micro_batch_limits=True)
+    assert "micro_batch_limit" not in reset and report["micro_batch_limits_reset"]
+    context.world_size = 5
+    seeds = []
+    for rank in (3, 4):
+        context.rank = rank
+        first, report = resume_execution_state(checkpoint, context, allow_world_size_change=True, seed=42)
+        second, again = resume_execution_state(checkpoint, context, allow_world_size_change=True, seed=42)
+        assert torch.equal(first["torch_rng"], second["torch_rng"]) and report == again
+        seeds.append(report["added_rank_seed"])
+    assert seeds[0] != seeds[1]
+    assert torch.equal(torch.get_rng_state(), rng["torch_rng"])  # preparing state doesn't change active RNG
+    with pytest.raises(ValueError, match="rank state count"):
+        resume_execution_state({**checkpoint, "rank_states": [state]}, context, allow_world_size_change=True)
 
 
 def test_eval_keeps_field_groups_and_rejects_missing_duplicate_rows(tmp_path):
@@ -283,6 +319,7 @@ def _distributed_worker(rank, world, rendezvous, root, config_path, barrier=None
             run("complete")
             run("interrupted", "--stop-after-updates", "1")
             previous_bytes = (root / "interrupted/last.pt").read_bytes()
+            context.main(lambda: (root / "migration_source.pt").write_bytes(previous_bytes))
             run("benchmark", "--resume", str(root / "interrupted/last.pt"),
                 "--benchmark-updates", "1", "--benchmark-warmup-updates", "0")
             assert (root / "interrupted/last.pt").read_bytes() == previous_bytes
@@ -336,11 +373,77 @@ def test_three_process_training_evaluation_and_exact_resume(data_fixture, tmp_pa
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
     # FileStore's native Windows file API does not handle percent-encoded URIs.
-    with tempfile.TemporaryDirectory(prefix="readout_gloo_") as store_dir:
-        rendezvous = str(Path(store_dir) / "store")
-        barrier = mp.get_context("spawn").Barrier(3) if transport == "file_test_double" else None
-        mp.spawn(_distributed_worker, args=(3, rendezvous, str(tmp_path), str(path), barrier), nprocs=3, join=True)
+    rendezvous = str(tmp_path / "gloo_store")
+    barrier = mp.get_context("spawn").Barrier(3) if transport == "file_test_double" else None
+    mp.spawn(_distributed_worker, args=(3, rendezvous, str(tmp_path), str(path), barrier), nprocs=3, join=True)
     assert all((tmp_path / f"rank{rank}.passed").is_file() for rank in range(3))
+    if transport == "file_test_double":
+        # Resume the ACTUAL three-process step-1 checkpoint using fewer processes.
+        source_bytes = (tmp_path / "migration_source.pt").read_bytes()
+        for world in (1, 2):
+            destination = tmp_path / f"migration_{world}"
+            destination.mkdir()
+            barrier = mp.get_context("spawn").Barrier(world)
+            mp.spawn(_migration_worker, args=(world, str(tmp_path), str(path), barrier), nprocs=world, join=True)
+            migrated = torch.load(destination / "run/last.pt", weights_only=True)
+            expected = torch.load(tmp_path / "complete/last.pt", weights_only=True)
+            assert migrated["step"] == 2
+            assert (migrated["epoch"], migrated["cursor"]) == (expected["epoch"], expected["cursor"])
+            assert migrated["identity"] == expected["identity"]
+            assert migrated["scheduler"] == expected["scheduler"]
+            assert migrated["parallel_execution"]["world_size"] == world
+            assert len(migrated["rank_states"]) == world
+            event = migrated["execution_migrations"][-1]
+            assert all(r["from_world_size"] == 3 and r["to_world_size"] == world for r in event["per_rank"])
+            for name, value in expected["sidecar"].items():
+                torch.testing.assert_close(value, migrated["sidecar"][name], rtol=2e-4, atol=3e-6)
+            for key, state in expected["optimizer"]["state"].items():
+                for name, value in state.items():
+                    torch.testing.assert_close(value, migrated["optimizer"]["state"][key][name], rtol=2e-4, atol=3e-6)
+            assert (tmp_path / "migration_source.pt").read_bytes() == source_bytes
+
+
+def _migration_worker(rank, world, root, config_path, barrier):
+    """CPU file-collective integration only; not a MIG/NCCL capability test."""
+    os.environ.update(WORLD_SIZE=str(world), RANK=str(rank), LOCAL_RANK=str(rank))
+    torch.set_num_threads(1)
+    root = Path(root)
+    output = root / f"migration_{world}"
+    _, example_llm, _, tokenizer, _ = tiny_components()
+    from transformers import Qwen2ForCausalLM
+    def load_model(args, device):
+        torch.manual_seed(123)
+        model = Qwen2ForCausalLM(copy.deepcopy(example_llm.config)).to(device)
+        model.config.use_cache = False
+        if args.llm_gradient_checkpointing:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        return model, torch.float32
+    transport = FileCollectives(output, rank, world, barrier)
+    def run(name, *options):
+        argv = ["train_point_readout.py", "--config", config_path, "--profile", "smoke", "--device", "cpu",
+                "--output-dir", str(output / name), "--resume", str(root / "migration_source.pt"), *options]
+        with patch.object(sys, "argv", argv):
+            trainer.main()
+    with patch.multiple(dist, is_initialized=lambda: True, get_rank=lambda: rank,
+            get_world_size=lambda: world, all_reduce=transport.all_reduce,
+            all_gather_object=transport.all_gather_object, broadcast=transport.broadcast,
+            broadcast_object_list=transport.broadcast_object_list), \
+         patch.object(trainer.core, "load_tokenizer", lambda args: tokenizer), \
+         patch.object(trainer.core, "load_llm_with_bounded_host_memory", load_model):
+        with pytest.raises((ValueError, RuntimeError), match="allow-world-size-change"):
+            run("rejected")
+        assert not (output / "rejected/resolved_config.json").exists()
+        run("benchmark", "--allow-world-size-change", "--benchmark-updates", "1", "--benchmark-warmup-updates", "0")
+        assert not (output / "benchmark/last.pt").exists()
+        run("run", "--allow-world-size-change", "--micro-batch-size", "1", "--eval-batch-size", "1")
+        # Once saved on this world size, normal strict resume works without the flag.
+        argv = ["train_point_readout.py", "--config", str(output / "run/resolved_config.json"),
+                "--profile", "smoke", "--device", "cpu", "--resume", str(output / "run/last.pt"),
+                "--output-dir", str(output / "run")]
+        with patch.object(sys, "argv", argv):
+            trainer.main()
+        state = torch.load(output / "run/last.pt", weights_only=True)
+        assert len(state["execution_migrations"]) == 1 and not state["validation_pending"]
 
 
 def test_token_report_reduction_keeps_global_maxima_and_overflows():

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from array import array
+import hashlib
 import os
 import random
 
@@ -199,6 +200,53 @@ def restore_rng(state, device):
     torch.set_rng_state(state["torch_rng"])
     if device.type == "cuda" and state["cuda_rng"] is not None:
         torch.cuda.set_rng_state(state["cuda_rng"], device)
+
+
+def resume_execution_state(checkpoint, parallel, *, allow_world_size_change=False,
+                           reset_micro_batch_limits=False, seed=0):
+    """Map execution state only; model/optimizer/global data cursor stay untouched.
+
+    Surviving ranks keep their RNG streams. Added ranks get deterministic distinct
+    streams. A different world size is a recorded migration, not bitwise replay.
+    OOM caps from different hardware must not be treated as memory-fit evidence.
+    """
+    old_world = checkpoint.get("parallel_execution", {}).get("world_size", 1)
+    if type(old_world) is not int or old_world < 1:
+        raise ValueError("Invalid checkpoint process count")
+    states = checkpoint.get("rank_states", [checkpoint])
+    if len(states) != old_world:
+        raise ValueError("Checkpoint rank state count differs from its process count")
+    changed = old_world != parallel.world_size
+    if changed and not allow_world_size_change:
+        raise ValueError("Strict training resume requires the same GPU/process count; "
+                         "use --allow-world-size-change for a recorded migration preserving "
+                         "the global batch, optimizer, scheduler and data cursor")
+    if not 0 <= parallel.rank < parallel.world_size:
+        raise ValueError("Invalid current rank")
+    added_seed = None
+    if parallel.rank < old_world:
+        state = dict(states[parallel.rank])
+    else:
+        payload = (f"readout-rank-migration-v1:{seed}:{checkpoint['step']}:"
+                   f"{old_world}:{parallel.world_size}:{parallel.rank}").encode()
+        payload += states[0]["torch_rng"].cpu().numpy().tobytes()
+        added_seed = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**63)
+        state = {"python_rng": random.Random(added_seed).getstate(),
+                 "torch_rng": torch.Generator().manual_seed(added_seed).get_state(),
+                 "cuda_rng": (torch.Generator(device=parallel.device).manual_seed(added_seed).get_state()
+                              if parallel.device.type == "cuda" else None)}
+    reset_limits = changed or reset_micro_batch_limits
+    if reset_limits:
+        state.pop("micro_batch_limit", None)
+        state.pop("adaptive_micro_batch_limits", None)
+    report = {"checkpoint_step": checkpoint["step"], "from_world_size": old_world,
+              "to_world_size": parallel.world_size, "world_size_changed": changed,
+              "micro_batch_limits_reset": reset_limits,
+              "rng_policy": "preserve_surviving_ranks_seed_added_ranks_v1",
+              "rank": parallel.rank, "restored_rng_from_rank": parallel.rank if parallel.rank < old_world else None,
+              "added_rank_seed": added_seed,
+              "bitwise_replay_guaranteed": False}
+    return state, report
 
 
 class RecordView:
