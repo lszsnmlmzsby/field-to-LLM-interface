@@ -609,7 +609,10 @@ def build_multisource_dataset(config, output_dir):
 
 class MultiSourcePointReadoutDataset:
     """Lazy, bounded-handle replay of immutable scalar crops across source files."""
-    def __init__(self, qa_dir, split, cache_size=8, source_root_overrides=None, suite="main"):
+    def __init__(self, qa_dir, split, cache_size=8, source_root_overrides=None, suite="main", *,
+                 verified_metadata=None):
+        # Internal launch-only reuse: the leader has just checked every QA file
+        # digest. Never populate this argument from an unverified saved receipt.
         if split not in SPLITS or cache_size < 0:
             raise ValueError("Invalid split/cache size")
         if suite not in ("main", "language") or (suite == "language" and split == "train"):
@@ -619,6 +622,8 @@ class MultiSourcePointReadoutDataset:
         if (self.qa_dir / ".build_in_progress").exists():
             raise ValueError("Dataset build did not finish")
         self.metadata = _json(self.qa_dir / "metadata.json")
+        if verified_metadata is not None and self.metadata != verified_metadata:
+            raise ValueError("QA metadata differs from the verified launch metadata")
         if (self.metadata.get("format") != FORMAT or self.metadata.get("prompt_version") != PROMPT_VERSION
                 or self.metadata.get("source", {}).get("kind") != "multisource"):
             raise ValueError("Unsupported multi-source QA protocol")
@@ -631,9 +636,10 @@ class MultiSourcePointReadoutDataset:
             raise ValueError("Incomplete dataset manifest")
         if suite == "language" and f"diagnostics_{split}.jsonl" not in expected_files:
             raise ValueError("This dataset has no paired language diagnostics; rebuild with query_program enabled")
-        for name, digest in self.metadata["files"].items():
-            if sha256_file(self.qa_dir / name) != digest:
-                raise ValueError(f"Dataset file changed: {name}")
+        if verified_metadata is None:
+            for name, digest in self.metadata["files"].items():
+                if sha256_file(self.qa_dir / name) != digest:
+                    raise ValueError(f"Dataset file changed: {name}")
         self.identity = json_hash(self.metadata)
         parts = self.metadata["trajectory_splits"]
         flattened = [x for ids in parts.values() for x in ids]
@@ -641,14 +647,36 @@ class MultiSourcePointReadoutDataset:
             raise ValueError("Trajectory leakage or incomplete partitions")
         part_sets = {s: set(ids) for s, ids in parts.items()}
         from tensor_compression.downstream.point_readout_data import read_jsonl
-        states = read_jsonl(self.qa_dir / "states.jsonl")
-        self.states = {state["state_ref"]: state for state in states}
-        if len(states) != len(self.states):
-            raise ValueError("Duplicate state references")
-        for state in states:
-            if f"{state['source_file_id']}:{state['sample_index']}" not in part_sets[state["split"]]:
-                raise ValueError("State violates trajectory partition")
-        self.records = read_jsonl(self.qa_dir / (f"diagnostics_{split}.jsonl" if suite == "language" else f"{split}.jsonl"))
+        record_path = self.qa_dir / (f"diagnostics_{split}.jsonl" if suite == "language" else f"{split}.jsonl")
+        if verified_metadata is None:
+            states = read_jsonl(self.qa_dir / "states.jsonl")
+            self.states = {state["state_ref"]: state for state in states}
+            if len(states) != len(self.states):
+                raise ValueError("Duplicate state references")
+            for state in states:
+                if f"{state['source_file_id']}:{state['sample_index']}" not in part_sets[state["split"]]:
+                    raise ValueError("State violates trajectory partition")
+            self.records = read_jsonl(record_path)
+        else:
+            self.records = read_jsonl(record_path)
+            wanted = {row["state_ref"] for row in self.records}
+            self.states, seen = {}, set()
+            with (self.qa_dir / "states.jsonl").open(encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    state = json.loads(line)
+                    ref = state["state_ref"]
+                    if ref in seen:
+                        raise ValueError("Duplicate state references")
+                    seen.add(ref)
+                    if (state["split"] not in part_sets or
+                            f"{state['source_file_id']}:{state['sample_index']}" not in part_sets[state["split"]]):
+                        raise ValueError("State violates trajectory partition")
+                    if ref in wanted:
+                        self.states[ref] = state
+            if wanted != self.states.keys():
+                raise ValueError("Question references a missing state")
         if not self.records or len({r["qa_id"] for r in self.records}) != len(self.records):
             raise ValueError("Empty dataset or duplicate question IDs")
         for row in self.records:
@@ -682,6 +710,10 @@ class MultiSourcePointReadoutDataset:
         self.readers = _Readers(source["sources"], source["files"],
                                 int(self.metadata["config"]["data"].get("max_open_hdf5", 8)), source_root_overrides)
         self.cache_handle, self.checked_sources = None, set()
+        if verified_metadata is not None:
+            for file_id in source["files"]:
+                self.readers.check_file(file_id)
+                self.checked_sources.add(file_id)
 
     def __len__(self):
         return len(self.records)

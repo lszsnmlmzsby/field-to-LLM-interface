@@ -58,6 +58,9 @@ Thumbs.db
 !/scripts/build_variable_shape_qa.py
 !/scripts/build_point_readout_qa.py
 !/scripts/train_point_readout.py
+!/scripts/prepare_readout_training_cache.py
+!/scripts/readout_prefetch.py
+!/scripts/readout_input_runtime.py
 !/scripts/readout_distributed.py
 !/scripts/score_point_readout.py
 !/scripts/benchmark_point_readout.py
@@ -91,6 +94,12 @@ Thumbs.db
 !/tests/test_tensor_qwen_cross_attention.py
 !/tests/test_variable_shape_fields.py
 !/tests/test_point_readout.py
+!/tests/test_readout_training_cache.py
+!/tests/test_readout_prefetch.py
+!/tests/test_readout_position_cache.py
+!/tests/test_readout_answer_ce.py
+!/tests/test_readout_input_pipeline.py
+!/tests/test_readout_verified_validation.py
 !/tests/test_readout_efficiency.py
 !/tests/test_readout_distributed.py
 !/tests/test_block_readout.py

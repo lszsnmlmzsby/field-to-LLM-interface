@@ -12,11 +12,12 @@ import random
 import signal
 import sys
 import time
-from collections import OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,9 @@ from scripts.readout_distributed import (
     evaluation_indices, merge_token_reports,
     length_balanced_partitions, merge_strided_lengths,
     resume_execution_state,
+)
+from scripts.readout_input_runtime import (
+    PreparedTokenLookup, StageTimer, local_update_indices, queue_following_updates,
 )
 from tensor_compression.downstream.point_readout import (
     FORMAT, PROMPT_VERSION, build_prompt, json_hash, score_answer,
@@ -242,36 +246,55 @@ def preflight_token_budgets(records, tokenizer, training, *, token_cache=None, s
     return report
 
 
-def training_tensors(records, tokenizer, training, *, token_cache=None):
+def training_tensors(records, tokenizer, training, *, token_cache=None, token_pairs=None):
     if tokenizer.eos_token_id is None or tokenizer.pad_token_id is None:
         raise ValueError("Numerical generation requires an EOS and a padding token")
-    encoded = []
-    for row in records:
-        prompt, answer = (token_cache.get(row, tokenizer, training) if token_cache is not None else
-                          encode_training_record(row, tokenizer, training))
-        encoded.append((prompt, answer))
+    encoded = list(token_pairs) if token_pairs is not None else []
+    if token_pairs is not None and len(encoded) != len(records):
+        raise ValueError("Prepared token count differs from the question count")
+    if token_pairs is None:
+        for row in records:
+            prompt, answer = (token_cache.get(row, tokenizer, training) if token_cache is not None else
+                              encode_training_record(row, tokenizer, training))
+            encoded.append((prompt, answer))
     width = max(len(p) + len(a) for p, a in encoded)
     ids = torch.full((len(records), width), tokenizer.pad_token_id, dtype=torch.long)
     mask, labels = torch.zeros_like(ids), torch.full_like(ids, -100)
     for i, (prompt, answer) in enumerate(encoded):
-        ids[i, :len(prompt) + len(answer)] = torch.tensor(list(prompt) + list(answer))
+        ids[i, :len(prompt)] = torch.from_numpy(np.asarray(prompt, dtype=np.int64))
+        ids[i, len(prompt):len(prompt) + len(answer)] = torch.from_numpy(np.asarray(answer, dtype=np.int64))
         mask[i, :len(prompt) + len(answer)] = 1
-        labels[i, len(prompt):len(prompt) + len(answer)] = torch.tensor(list(answer))
+        labels[i, len(prompt):len(prompt) + len(answer)] = ids[i, len(prompt):len(prompt) + len(answer)]
     return ids, mask, labels
 
 
-def training_loss(llm, sidecar, tokenizer, records, fields, device, dtype, training, *, token_cache=None):
-    ids, mask, labels = [x.to(device) for x in training_tensors(records, tokenizer, training, token_cache=token_cache)]
+def training_loss(llm, sidecar, tokenizer, records, fields, device, dtype, training, *, token_cache=None,
+                  token_pairs=None, pin_memory=False, timings=None):
+    timings = timings or StageTimer(device)
+    with timings.cpu("text_pack"):
+        host = training_tensors(records, tokenizer, training, token_cache=token_cache, token_pairs=token_pairs)
+        ends = host[1].sum(dim=1).tolist()
+        counts = host[2].ne(-100).sum(dim=1).tolist()
+        answer_spans = [(end - count, end) for end, count in zip(ends, counts)]
+    with timings.cpu("pin_and_transfer_submit"):
+        if pin_memory and device.type == "cuda":
+            host = tuple(x.pin_memory() for x in host)
+            fields = fields.pin_memory()
+        with timings.gpu("host_to_device"):
+            ids, mask, labels = [x.to(device, non_blocking=pin_memory) for x in host]
+            fields = fields.to(device, non_blocking=pin_memory)
     try:
-        with core.autocast_context(device, dtype):
-            memory = sidecar.bind(fields.to(device), mode="correct")
-            hidden = core.decoder_backbone(llm)(input_ids=ids, attention_mask=mask,
-                                                use_cache=False, return_dict=True).last_hidden_state
+        with timings.gpu("forward_and_loss"), core.autocast_context(device, dtype):
+            with timings.gpu("field_memory"):
+                memory = sidecar.bind(fields, mode="correct")
+            with timings.gpu("qwen_forward"):
+                hidden = core.decoder_backbone(llm)(input_ids=ids, attention_mask=mask,
+                                                    use_cache=False, return_dict=True).last_hidden_state
             # Equal question weights even when answer lengths differ. Project only
             # answer positions to the full vocabulary; never materialize prompt logits.
-            answer_ce = torch.stack([core.full_answer_ce(hidden[i:i+1], labels[i:i+1],
-                                                        llm.get_output_embeddings())
-                                     for i in range(len(records))]).mean()
+            with timings.gpu("answer_ce"):
+                answer_ce = core.batched_per_question_answer_ce(
+                    hidden, labels, llm.get_output_embeddings(), answer_spans=answer_spans)
             reconstruction = memory.reconstruction_loss
             loss = answer_ce + float(training.get("value_reconstruction_weight", 0.01)) * reconstruction
         if not bool(torch.isfinite(loss)):
@@ -284,7 +307,9 @@ def training_loss(llm, sidecar, tokenizer, records, fields, device, dtype, train
 
 def _backward_chunks(llm, sidecar, tokenizer, dataset, local_batches, device, dtype,
                      training, token_cache, micro_batch_size, global_count, attempt_state,
-                     adaptive_micro_batch=None, token_lengths=None, micro_batch_token_budget=0):
+                     adaptive_micro_batch=None, token_lengths=None, micro_batch_token_budget=0,
+                     prepared_update=None, pin_memory=False, timings=None):
+    timings = timings or StageTimer(device)
     values, sizes = [0.0, 0.0, 0.0], []
     true_tokens = padded_tokens = 0
     for indices in local_batches:
@@ -299,25 +324,37 @@ def _backward_chunks(llm, sidecar, tokenizer, dataset, local_batches, device, dt
             if micro_batch_token_budget:
                 if token_lengths is None:
                     raise ValueError("A micro-batch token budget requires preflight token lengths")
-                safe = max(1, micro_batch_token_budget // max(token_lengths[i] for i in probe))
+                safe = max(1, micro_batch_token_budget // max(int(token_lengths[i]) for i in probe))
                 if safe < limit:
                     limit = 1 << (safe.bit_length() - 1)
             chunk = indices[start:start + limit]
             attempt_state["limit"] = limit
             attempt_state["size"] = len(chunk)
-            records, fields = zip(*(dataset[index] for index in chunk))
+            with timings.cpu("data_fetch"):
+                if prepared_update is None:
+                    records, fields = zip(*(dataset[index] for index in chunk))
+                    field_batch = torch.stack(fields)
+                    prepared_options = {"timings": timings} if timings.cuda_events else {}
+                else:
+                    samples = [prepared_update.item(index) for index in chunk]
+                    records = [dataset.records[index] for index in chunk]
+                    field_batch = torch.from_numpy(np.stack([sample.field for sample in samples]))
+                    prepared_options = {"token_pairs": [(sample.prompt, sample.answer) for sample in samples],
+                                        "pin_memory": pin_memory, "timings": timings}
             try:
-                loss, components = training_loss(llm, sidecar, tokenizer, records, torch.stack(fields),
-                    device, dtype, training, token_cache=token_cache)
+                with timings.cpu("forward_host"):
+                    loss, components = training_loss(llm, sidecar, tokenizer, records, field_batch,
+                        device, dtype, training, token_cache=token_cache, **prepared_options)
                 weight = len(chunk) / global_count
-                (loss * weight).backward()
+                with timings.cpu("backward_host"), timings.gpu("backward"):
+                    (loss * weight).backward()
                 values[0] += float(loss.detach()) * weight
                 values[1] += components["answer_ce"] * weight
                 values[2] += components["reconstruction"] * weight
                 sizes.append(len(chunk))
                 if token_lengths is not None:
-                    true_tokens += sum(token_lengths[i] for i in chunk)
-                    padded_tokens += len(chunk) * max(token_lengths[i] for i in chunk)
+                    true_tokens += sum(int(token_lengths[i]) for i in chunk)
+                    padded_tokens += len(chunk) * max(int(token_lengths[i]) for i in chunk)
                 del loss
             finally:
                 # Hooks must remain bound throughout checkpoint recomputation.
@@ -345,7 +382,7 @@ class AdaptiveMicroBatch:
                 row = dataset.records[index]
                 area = max(area, math.prod(row["grid_shape"]))
                 if token_lengths is not None:
-                    length = max(length, token_lengths[index])
+                    length = max(length, int(token_lengths[index]))
                 else:
                     prompt, answer = (token_cache.get(row, tokenizer, training) if token_cache is not None
                                       else encode_training_record(row, tokenizer, training))
@@ -365,7 +402,8 @@ class AdaptiveMicroBatch:
 def backward_update(llm, sidecar, tokenizer, dataset, batches, device, dtype, training,
                     parallel, micro_batch_size, *, token_cache=None, auto_micro_batch=True,
                     adaptive_micro_batch=None, token_lengths=None, balance_by_length=False,
-                    micro_batch_token_budget=0):
+                    micro_batch_token_budget=0, prepared_update=None, pin_memory=False, profile_cuda=False,
+                    input_wait_seconds=0.):
     """One complete global update; retry local OOMs BEFORE any gradient collective.
 
     Retry all local contributions, not only the failed chunk: backward may have
@@ -377,6 +415,7 @@ def backward_update(llm, sidecar, tokenizer, dataset, batches, device, dtype, tr
         raise ValueError("An optimizer update must contain questions")
     local_batches = [partition_batch(batch, parallel.rank, parallel.world_size) for batch in batches]
     compute_start = time.perf_counter()
+    timings = StageTimer(device, cuda_events=profile_cuda)
     initial_rng = capture_rng(device)
     initial_buffers = {name: buffer.detach().clone() for name, buffer in sidecar.named_buffers()}
     attempts, error, values, sizes = 0, None, [0.0] * 3, []
@@ -394,7 +433,7 @@ def backward_update(llm, sidecar, tokenizer, dataset, batches, device, dtype, tr
             values, sizes, true_tokens, padded_tokens = _backward_chunks(
                 llm, sidecar, tokenizer, dataset, local_batches, device, dtype, training, token_cache,
                 micro_batch_size, global_count, attempt_state, adaptive_micro_batch,
-                token_lengths, micro_batch_token_budget)
+                token_lengths, micro_batch_token_budget, prepared_update, pin_memory, timings)
             if adaptive_micro_batch is not None:
                 micro_batch_size = attempt_state["limit"]
             break
@@ -439,7 +478,8 @@ def backward_update(llm, sidecar, tokenizer, dataset, batches, device, dtype, tr
         "padded_text_tokens": padded_tokens if token_lengths is not None else None,
         "padding_fraction": 1 - true_tokens / padded_tokens if padded_tokens else 0.,
         "length_balanced": balance_by_length,
-        "synchronization_and_wait_seconds": sync_seconds})
+        "synchronization_and_wait_seconds": sync_seconds,
+        "input_stages": timings.summary(), "input_wait_seconds": input_wait_seconds})
     if sum(item["questions"] for item in execution) != global_count:
         raise RuntimeError("Global question accounting differs across ranks")
     return values, micro_batch_size, execution
@@ -558,12 +598,22 @@ def generate_answer(llm, sidecar, tokenizer, record, field, device, dtype, *,
         sidecar.clear()
 
 
+def record_shapes(records):
+    columns = getattr(records, "shape_columns", None)
+    if columns is not None:
+        for h, w in zip(*columns):
+            yield int(h), int(w)
+    else:
+        for row in records:
+            yield tuple(row["grid_shape"])
+
+
 def shape_batches(records, batch_size, seed, epoch):
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     rng, buckets = random.Random(seed + epoch), defaultdict(list)
-    for i, row in enumerate(records):
-        buckets[tuple(row["grid_shape"])].append(i)
+    for i, shape in enumerate(record_shapes(records)):
+        buckets[shape].append(i)
     batches = []
     for shape in sorted(buckets):
         indices = buckets[shape]
@@ -895,7 +945,9 @@ def run_identity(config, dataset, llm, tokenizer):
     # Execution chunking can be reduced to fit memory without changing the
     # global batch/optimizer recipe. Floating-point rounding need not be bitwise identical.
     for key in ("max_micro_batch_size", "auto_micro_batch", "adaptive_micro_batch", "eval_batch_size",
-                "eval_parity_check_questions", "length_balanced_batches", "micro_batch_token_budget"):
+                "eval_parity_check_questions", "length_balanced_batches", "micro_batch_token_budget",
+                "training_cache", "input_workers", "prefetch_updates", "prefetch_mib",
+                "pin_training_memory", "profile_updates", "input_timeout_seconds"):
         recipe["runtime"].pop(key, None)
     identity = {"protocol": FORMAT, "prompt_version": PROMPT_VERSION, "dataset": dataset.identity,
             "text_encoding": {"version": TEXT_ENCODING_VERSION, "system_message": SYSTEM_MESSAGE,
@@ -949,7 +1001,7 @@ def validate_resume(checkpoint, identity):
 def planned_updates(records, training, seed):
     if training.get("max_updates") is not None:
         return training["max_updates"]
-    count = len(shape_batches(records, training["batch_size"], seed, 0))
+    count = sum(math.ceil(n / training["batch_size"]) for n in Counter(record_shapes(records)).values())
     return math.ceil(count * training["epochs"] / training["gradient_accumulation_steps"])
 
 
@@ -1128,12 +1180,26 @@ def check_geometry(llm, sidecar, tokenizer, dataset, device, dtype, config, *, p
 
 
 def main():
+    invocation_started = time.perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(ROOT / "configs/field_to_llm_point_readout.yaml"))
     parser.add_argument("--profile", choices=("smoke", "pilot", "full"), required=True)
     parser.add_argument("--qa-dir")
     parser.add_argument("--hdf5-path")
     parser.add_argument("--model-dir")
+    parser.add_argument("--training-cache", help="Complete audited mmap training cache built by prepare_readout_training_cache.py")
+    parser.add_argument("--input-workers", type=int, default=2,
+                        help="Spawned CPU readers per rank for --training-cache; 0 reads synchronously (default 2)")
+    parser.add_argument("--prefetch-updates", type=int, default=2,
+                        help="Bound on current plus queued prepared updates per rank (default 2)")
+    parser.add_argument("--prefetch-mib", type=int, default=256,
+                        help="Per-rank bound on forecast prepared input payloads, not total process RSS (default 256 MiB)")
+    parser.add_argument("--input-timeout-seconds", type=float, default=300,
+                        help="Fail clearly if a prepared update does not arrive before this timeout")
+    parser.add_argument("--pin-training-memory", action=argparse.BooleanOptionalAction, default=True,
+                        help="Pin only assembled training micro batches when using CUDA and --training-cache")
+    parser.add_argument("--profile-updates", type=int, default=0,
+                        help="Record CUDA stage events for the first N updates of this invocation; diagnostic overhead applies")
     parser.add_argument("--block-shape", type=int, nargs=2, metavar=("H", "W"),
                         help="Cells per field token; e.g. 1 1 or 2 2. Requires a matching checkpoint when resuming.")
     parser.add_argument("--output-dir", required=True)
@@ -1193,6 +1259,12 @@ def main():
     parser.add_argument("--console-every-updates", type=int, default=200,
                         help="Console cadence only; detailed train.jsonl stays unchanged (default: 200)")
     cli = parser.parse_args()
+    if not 0 <= cli.input_workers <= 4 or cli.prefetch_updates < 1 or cli.prefetch_mib < 1:
+        parser.error("Input workers must be 0..4, prefetch updates and MiB must be positive")
+    if cli.input_timeout_seconds <= 0 or not math.isfinite(cli.input_timeout_seconds) or cli.profile_updates < 0:
+        parser.error("Input timeout must be finite and positive; profile updates must be nonnegative")
+    if cli.training_cache and (cli.evaluate_only or cli.audit_only or cli.token_check_only or cli.geometry_check_only):
+        parser.error("--training-cache is for training/benchmark; its builder performs full training audit and token preflight")
     if (cli.allow_world_size_change or cli.reset_micro_batch_limits) and (
             not cli.resume or cli.evaluate_only or cli.audit_only or cli.token_check_only or cli.geometry_check_only):
         parser.error("Execution migration flags require training/benchmark --resume")
@@ -1273,6 +1345,8 @@ def main():
         if parallel.primary:
             print(message, flush=True)
     datasets = {}
+    input_loader = None
+    prepared_manifest = None
     geometry_original_records = {}
     stop_requested = False
     def request_stop(signum, frame):
@@ -1294,11 +1368,40 @@ def main():
             properties = torch.cuda.get_device_properties(device)
             hardware.update(name=properties.name, vram_gib=properties.total_memory / 2**30)
         say("visible_training_devices=" + json.dumps(parallel.gather(hardware)))
+        if cli.training_cache:
+            from tensor_compression.downstream.readout_training_cache import (
+                PreparedTrainingDataset, validate_training_cache, training_token_identity,
+            )
+            say("phase=verify_prepared_training_cache gpu_compute_started=false")
+            prepared_manifest = parallel.main(lambda: validate_training_cache(
+                resolve_path(cli.training_cache), qa_dir=qa_dir, training=config["training"]))
         for split in splits:
             say(f"dataset_load split={split} validating_manifest_and_loading_records=true")
+            if split == "train" and prepared_manifest is not None:
+                open_error = None
+                try:
+                    dataset = PreparedTrainingDataset(resolve_path(cli.training_cache), validate=False)
+                    datasets[split] = dataset
+                except Exception as exc:
+                    open_error = f"Prepared cache open failed: {type(exc).__name__}: {exc}"
+                parallel.check_errors(open_error)
+                say("prepared_training_audit=" + json.dumps(prepared_manifest["source_audit"]))
+                continue
             suite_options = {"suite": cli.eval_suite} if cli.eval_suite == "language" else {}
-            dataset = PointReadoutDataset(qa_dir, hdf5_path, split,
-                cache_size=int(config["data"].get("input_cache_size", 8)), **suite_options)
+            if prepared_manifest is not None:
+                from tensor_compression.downstream.multisource_readout_data import MultiSourcePointReadoutDataset
+                open_error = None
+                try:
+                    dataset = MultiSourcePointReadoutDataset(qa_dir, split,
+                        cache_size=int(config["data"].get("input_cache_size", 8)),
+                        verified_metadata=prepared_manifest["metadata"], **suite_options)
+                    datasets[split] = dataset
+                except Exception as exc:
+                    open_error = f"Verified validation dataset open failed: {type(exc).__name__}: {exc}"
+                parallel.check_errors(open_error)
+            else:
+                dataset = PointReadoutDataset(qa_dir, hdf5_path, split,
+                    cache_size=int(config["data"].get("input_cache_size", 8)), **suite_options)
             datasets[split] = dataset
             if cli.geometry_check_only:
                 original_records = dataset.records
@@ -1355,12 +1458,25 @@ def main():
         token_cache = TrainingTokenCache(tokenizer, config["training"],
             max_bytes=int(config["runtime"].get("token_cache_bytes", 256 * 2**20)),
             max_entries=int(config["runtime"].get("token_cache_entries", 262144)))
+        if prepared_manifest is not None:
+            observed_tokens = training_token_identity(tokenizer, text_encoding_version=TEXT_ENCODING_VERSION,
+                                                       system_message=SYSTEM_MESSAGE)
+            parallel.check_errors("Prepared training cache uses different tokenizer/template/encoding assets"
+                                  if observed_tokens != prepared_manifest["token_identity"] else None)
+            if len(set(parallel.gather(json_hash(observed_tokens)))) != 1:
+                raise ValueError("Ranks loaded different tokenizer identities")
+            token_cache = PreparedTokenLookup(datasets["train"], token_cache)
         token_reports = {}
         training_token_lengths = None
         collect_lengths = (bool(config["runtime"].get("length_balanced_batches", False)) or
                            bool(config["runtime"].get("micro_batch_token_budget", 0)) or
                            cli.benchmark_updates is not None)
         for split, d in datasets.items():
+            if split == "train" and prepared_manifest is not None:
+                token_reports[split] = prepared_manifest["token_report"]
+                training_token_lengths = d.token_lengths
+                say(f"token_preflight split=train reused_verified_cache=true questions={len(d)}")
+                continue
             say(f"token_preflight split={split} questions={len(d.records)} world_size={parallel.world_size}")
             rows = RecordView(d.records, range(parallel.rank, len(d.records), parallel.world_size))
             local_report, error = None, None
@@ -1390,6 +1506,7 @@ def main():
         if cli.token_check_only:
             say("token_check_complete=" + json.dumps(token_reports))
             return
+        say("phase=model_load gpu_training_started=false")
         llm, dtype = core.load_llm_with_bounded_host_memory(args, device)
         core.seed_everything(args.seed)
         encoder, spatial, _, _ = core.build_scratch_memory_components(args, (1, args.patch_size, args.patch_size))
@@ -1479,7 +1596,9 @@ def main():
                 updates=min(cli.benchmark_updates, maximum - step), warmup=cli.benchmark_warmup_updates,
                 resume_state=resume_state)
             benchmark.update(checkpoint=str(Path(cli.resume).resolve()), checkpoint_step=step,
-                             requested_updates=cli.benchmark_updates)
+                             requested_updates=cli.benchmark_updates,
+                             input_execution="synchronous_prepared_mmap" if prepared_manifest is not None else "legacy_warm_token_cache",
+                             prefetch_measured=False)
             benchmark["resume_execution"] = resume_report
             write_shared(output / "execution_benchmark.json", benchmark)
             say("execution_benchmark=" + json.dumps(benchmark))
@@ -1553,6 +1672,30 @@ def main():
         # including a checkpoint already at the final optimizer update.
         if validation_pending:
             validate_and_save()
+        if prepared_manifest is not None:
+            from scripts.readout_prefetch import PreparedBatchLoader
+            loader_error = None
+            try:
+                input_loader = PreparedBatchLoader(resolve_path(cli.training_cache), workers=cli.input_workers,
+                    prefetch_updates=cli.prefetch_updates, max_bytes=cli.prefetch_mib * 2**20,
+                    pin_memory=False, timeout_seconds=cli.input_timeout_seconds)
+            except Exception as exc:
+                loader_error = f"Input reader initialization failed: {type(exc).__name__}: {exc}"
+            parallel.check_errors(loader_error)
+        startup_seconds = time.perf_counter() - invocation_started
+        write_shared(output / "input_pipeline.json", {
+            "mode": "prepared_mmap" if input_loader is not None else "legacy_json_hdf5",
+            "cache": str(resolve_path(cli.training_cache)) if cli.training_cache else None,
+            "workers_per_rank": cli.input_workers if input_loader is not None else 0,
+            "max_prepared_updates_per_rank": cli.prefetch_updates if input_loader is not None else 0,
+            "prepared_payload_budget_bytes_per_rank": cli.prefetch_mib * 2**20 if input_loader is not None else 0,
+            "memory_scope": "Bounded prepared payloads; excludes Python/torch runtimes, model, mmap page cache, and micro-batch assembly",
+            "pin_micro_batches": bool(input_loader is not None and cli.pin_training_memory and device.type == "cuda"),
+            "profile_updates": cli.profile_updates, "startup_seconds": startup_seconds,
+            "qa_order_and_optimizer_budget": "unchanged",
+        })
+        say(f"phase=train_loop startup_seconds={startup_seconds:.1f} step={step} "
+            f"prepared_input={input_loader is not None}")
         window_seconds = window_questions = window_updates = 0
         window_true_tokens = window_padded_tokens = window_oom_retries = 0
         while step < maximum:
@@ -1571,6 +1714,24 @@ def main():
                 micro_batches.append(batches[cursor])
                 cursor += 1
             total_records = sum(map(len, micro_batches))
+            prepared_update, input_error = None, None
+            wait_started = time.perf_counter()
+            if input_loader is not None:
+                try:
+                    local_indices = local_update_indices(micro_batches, parallel, training_token_lengths,
+                        config["runtime"].get("length_balanced_batches", False))
+                    if not input_loader.prefetch(step, local_indices):
+                        raise RuntimeError("Prepared input queue cannot reserve the current update")
+                    queue_following_updates(input_loader, step=step, maximum=maximum, batches=batches,
+                        cursor=cursor, accumulation=training["gradient_accumulation_steps"], parallel=parallel,
+                        token_lengths=training_token_lengths,
+                        balance_by_length=config["runtime"].get("length_balanced_batches", False))
+                    prepared_update = input_loader.get(step)
+                except Exception as exc:
+                    input_error = f"Prepared input failed on rank {parallel.rank}: {type(exc).__name__}: {exc}"
+                parallel.check_errors(input_error)
+            data_wait_seconds = time.perf_counter() - wait_started
+            profile_this_update = step - invocation_start_step < cli.profile_updates
             optimizer.zero_grad(set_to_none=True)
             core.set_frozen_llm_execution_mode(llm, checkpoint_training=True)
             sidecar.train()
@@ -1580,7 +1741,14 @@ def main():
                 auto_micro_batch=config["runtime"].get("auto_micro_batch", True),
                 adaptive_micro_batch=adaptive_micro_batch, token_lengths=training_token_lengths,
                 balance_by_length=config["runtime"].get("length_balanced_batches", False),
-                micro_batch_token_budget=config["runtime"].get("micro_batch_token_budget", 0))
+                micro_batch_token_budget=config["runtime"].get("micro_batch_token_budget", 0),
+                prepared_update=prepared_update,
+                pin_memory=bool(input_loader is not None and cli.pin_training_memory and device.type == "cuda"),
+                profile_cuda=profile_this_update,
+                input_wait_seconds=data_wait_seconds if input_loader is not None else 0.)
+            if input_loader is not None:
+                input_loader.release(step)
+            del prepared_update
             loss_value, answer_ce, reconstruction = values
             grad_norm = torch.nn.utils.clip_grad_norm_(sidecar.parameters(), training["grad_clip_norm"], error_if_nonfinite=True)
             optimizer.step()
@@ -1595,6 +1763,11 @@ def main():
             window_true_tokens += sum(r["true_text_tokens"] or 0 for r in execution)
             window_padded_tokens += sum(r["padded_text_tokens"] or 0 for r in execution)
             window_oom_retries += sum(r["oom_retries"] for r in execution)
+            if profile_this_update:
+                profile_record = {"step": step, "per_rank_execution": execution,
+                                  "diagnostic_only": True, "cuda_event_overhead": device.type == "cuda"}
+                if parallel.primary:
+                    core.append_jsonl(output / "input_profile.jsonl", profile_record)
             log_to_file = step % training["log_interval"] == 0 or step == 1
             log_to_console = log_to_file if cli.verbose else step == 1 or step % cli.console_every_updates == 0 or step == maximum
             if log_to_file or log_to_console:
@@ -1647,11 +1820,15 @@ def main():
         write_shared(output / "run_summary.json", {"status": "completed" if step == maximum else "stopped",
             "step": step, "planned_updates": maximum, "best_score": best if best >= 0 else None,
             "elapsed_this_invocation_seconds": time.perf_counter() - start, "last_checkpoint": str(output / "last.pt"),
+            "startup_seconds": startup_seconds,
             "world_size": parallel.world_size,
+            "prepared_input": parallel.gather(input_loader.statistics()) if input_loader is not None else None,
             "token_cache_this_invocation": parallel.gather(token_cache.statistics())})
         if stop_requested:
             raise SystemExit(130)  # Let a shell loop using set -e stop after Ctrl+C.
     finally:
+        if input_loader is not None:
+            input_loader.close()
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
         for split, d in datasets.items():

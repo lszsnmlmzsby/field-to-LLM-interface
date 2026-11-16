@@ -37,6 +37,10 @@ class ParallelContext:
                 raise ValueError("LOCAL_RANK exceeds the number of visible CUDA devices")
             device = torch.device("cuda", local_rank)
         if device.type == "cuda":
+            # set_device requires an explicit index. A standalone process sees
+            # logical cuda:0 after CUDA_VISIBLE_DEVICES filtering, including MIG.
+            if device.index is None:
+                device = torch.device("cuda", 0)
             torch.cuda.set_device(device)
         owned = world > 1 and not dist.is_initialized()
         if owned:
@@ -176,7 +180,7 @@ def length_balanced_partitions(indices, lengths, world_size, *, chunk_size=4):
     """
     if world_size <= 0 or chunk_size <= 0:
         raise ValueError("world_size and chunk_size must be positive")
-    ordered = sorted(indices, key=lambda i: (-lengths[i], i))
+    ordered = sorted(indices, key=lambda i: (-int(lengths[i]), i))
     if any(lengths[i] <= 0 for i in ordered):
         raise ValueError("Token lengths must be positive")
     # Small global tails should still use available ranks when possible.
@@ -186,8 +190,8 @@ def length_balanced_partitions(indices, lengths, world_size, *, chunk_size=4):
         chunk = ordered[start:start + size]
         rank = min(range(world_size), key=lambda r: (loads[r], len(parts[r]), r))
         parts[rank].extend(chunk)
-        loads[rank] += len(chunk) * max(lengths[i] for i in chunk)
-    return [sorted(part, key=lambda i: (-lengths[i], i)) for part in parts]
+        loads[rank] += len(chunk) * max(int(lengths[i]) for i in chunk)
+    return [sorted(part, key=lambda i: (-int(lengths[i]), i)) for part in parts]
 
 
 def capture_rng(device):

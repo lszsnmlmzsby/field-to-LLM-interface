@@ -24,6 +24,40 @@ from test_point_readout import tiny_components, data_fixture
 from test_point_readout_performance import TinyDataset, sample_rows
 
 
+@pytest.mark.parametrize("requested,available,expected", [
+    ("auto", True, "cuda:0"), ("cuda", True, "cuda:0"),
+    ("cuda:1", True, "cuda:1"), ("auto", False, "cpu"), ("cpu", True, "cpu")])
+def test_standalone_device_initialization_resolves_cuda_index(monkeypatch, requested, available, expected):
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: available)
+    calls = []
+    def set_device(device):
+        assert device.index is not None
+        calls.append(device)
+    monkeypatch.setattr(torch.cuda, "set_device", set_device)
+    context = ParallelContext.initialize(requested)
+    assert str(context.device) == expected
+    assert calls == ([torch.device(expected)] if expected.startswith("cuda") else [])
+
+
+@pytest.mark.parametrize("requested", ["auto", "cuda"])
+def test_distributed_device_initialization_keeps_local_rank(monkeypatch, requested):
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda: 1)
+    calls = []
+    monkeypatch.setattr(torch.cuda, "set_device", calls.append)
+    context = ParallelContext.initialize(requested)
+    assert context.device == torch.device("cuda:1") and calls == [context.device]
+    with pytest.raises(ValueError, match="fixed CUDA index"):
+        ParallelContext.initialize("cuda:0")
+
+
 @pytest.mark.parametrize("count", [0, 1, 2, 7, 16, 48, 49])
 def test_partitions_preserve_each_question_once(count):
     indices = list(range(count))

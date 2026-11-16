@@ -218,6 +218,12 @@ best仍根据已见尺寸上的宏平均任务答案准确率选择，输入关�
 
 ## 4. 中断后续训
 
+单卡初始化修正：旧代码会将无编号的`torch.device('cuda')`直接传给`set_device`，
+导致`Expected a torch.device with a specified index ... got:cuda`。已修正为单进程
+使用逻辑`cuda:0`；双卡/三卡继续使用`LOCAL_RANK`。未同步修复时，单卡命令可改为
+`--device cuda:0`立即绕过；torchrun多进程命令仍使用`auto`或`cuda`。
+该错误发生在输出目录创建及训练开始之前，无需因此添加覆盖参数。
+
 ```bash
 source /workspace/wyx/f2llm/enter_f2llm.sh
 export CUDA_VISIBLE_DEVICES=0,1,2
@@ -528,7 +534,144 @@ python scripts/score_point_readout.py \
   --output "$RUN/test_best/test_rescored.json"
 ```
 
+## 6. 训练输入预处理与有界预取（2026-11-16）
+
+这次优化针对实际训练路径：旧版每个 rank 会加载完整 train JSON 对象，训练取每道题时
+再次执行 `validate_record(row, z)`（包含查询执行、答案与哈希校验），token LRU 未命中时
+重新应用聊天模板并分词。它们与训练串行执行。启动的完整审计和分词预检也会让 GPU
+长时间闲置；应结合新的 `phase=...` 日志区分启动阶段和已经开始的更新。
+
+新增的 prepared cache 将完整训练 split 一次性转为可 mmap 的数值数组：
+
+| 文件 | 内容 |
+| --- | --- |
+| `index.npy` | 每题形状、场与 token 偏移、长度、QA/state ID、任务编号 |
+| `token_lengths.npy` | 原始完整问题加答案的长度，用于原有分片和小批次预算 |
+| `fields.npy` | 原 `qa_fields.hdf5` 中完整 `values` 数组的精确 float16 副本 |
+| `tokens.bin` | 完整 native-chat prompt 与含 EOS 答案的 uint32 token，无截断 |
+| `manifest.json` | QA 身份、tokenizer/模板/库版本身份、文件校验和与完整训练审计结果 |
+
+它是实验裁剪与 QA 的派生执行缓存，完整官方源仍由原数据协议和校验记录定义。
+原始 HDF5、完整 QA、轨迹划分、问题顺序、两轮预算、全局 batch 和 loss 的逐题等权保持不变。
+预处理逐题校验并流式分词，原始场回放和归一化结果也进行比对；训练启动由主 rank 校验
+QA 与缓存文件，再复用审计结果。验证仍使用原完整 val 集，保持原生成和评分路径。
+所有 rank 无需各自持有数百万条训练 JSON 对象；只在构建时保留 state 索引。
+
+另外两项计算侧改动同样保持模型/目标定义：动态二维位置编码复用有界的一维轴缓存，
+在 GPU 上组装，避免逐小批次构建并搬运整张 CPU 位置表；答案 CE 合并投影、每块最多
+128 个答案 token，保持每题权重相同，减少逐题 GPU 标量同步。CE 的 autograd 中间量
+仍需保留，不能将这个分块数当作总显存上限。浮点归约顺序变化可能带来舍入差异。
+
+### 6.1 一次性构建缓存
+
+先正常保存并退出正在运行的训练进程，再同步本次代码。下面的 `RUN` 必须改为实际要
+继续的、**尚未完成预算**的运行目录；已经完成两轮的 1×1 checkpoint 不会追加训练。
+保留原来的 GPU 分配环境。此阶段只用 CPU、tokenizer 与磁盘，不加载 Qwen 权重。
+
+```bash
+source /workspace/wyx/f2llm/enter_f2llm.sh
+cd /workspace/wyx/f2llm/tensor-compression
+export OMP_NUM_THREADS=1
+export TOKENIZERS_PARALLELISM=false
+RUN="$FIELD_TO_LLM_RUNS_DIR/填写实际未完成的运行目录"
+CACHE="$FIELD_TO_LLM_ROOT/data/multisource_openbc_v2/full_training_arrays_v1"
+test -f "$RUN/last.pt" && test -f "$RUN/resolved_config.json" || exit 1
+
+python -u scripts/prepare_readout_training_cache.py \
+  --config "$RUN/resolved_config.json" --profile full --output-dir "$CACHE"
+```
+
+缓存应放在容量充足的本机 SSD/NVMe；`CACHE` 可改为服务器实际的本地盘路径，必须与
+原 QA 目录分开。所需额外空间主要是 `2 × 场值数 + 4 × 总 token 数` 字节，再加索引；
+这里的 token 数是完整训练集总量，不能按少量样本的缓存空间估计。预处理只有一个进程，
+逐条处理 QA，不会同时载入全部训练 JSON 或 token。阶段日志包括源 QA 校验、state
+索引、场数组复制、逐题审计/分词、最终复核与发布；每 10,000 题报告一次进度。
+
+完成后同一份 QA、tokenizer、聊天模板与 token 上限的 1×1/2×2 可共享缓存。
+非空输出目录不会覆盖；中断留下的 `.build_in_progress` 不能用于训练，需选择新的空目录
+重新构建。已完成的缓存直接复用。更换 tokenizer 资产、版本、模板或 token 上限需重建。
+启动仍完整核对文件摘要，因此大文件所在磁盘很慢时启动校验也会慢，日志会明确所处阶段。
+
+### 6.2 用原预算中的 20 次更新检查新管线
+
+以下 `NPROC` 设为与该 checkpoint 相同的实际训练进程数，并确保分配的 CUDA 设备可用。
+此处不改卡数、batch、梯度累积、训练轮数或验证周期。20 次更新计入原预算并正常保存；
+它是输入诊断，不能作为完成训练或整套形状都能放入显存的证明。
+
+```bash
+NPROC=1  # 按该 checkpoint 的实际进程数填写：1、2 或 3
+python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$NPROC" \
+  scripts/train_point_readout.py \
+  --config "$RUN/resolved_config.json" --profile full \
+  --resume "$RUN/last.pt" --output-dir "$RUN" \
+  --training-cache "$CACHE" --input-workers 2 \
+  --prefetch-updates 2 --prefetch-mib 256 \
+  --profile-updates 20 --stop-after-updates 20 --console-every-updates 5
+```
+
+确认日志后，用同一命令去掉 `--profile-updates 20 --stop-after-updates 20` 继续剩余预算。
+旧 checkpoint 可直接恢复；原 optimizer、scheduler、epoch/cursor 和待执行验证状态继续
+恢复。若确需换卡数，另按前文的显式迁移流程操作，不能把输入缓存当作迁移授权。
+
+默认每 rank 2 个 CPU 读取进程、准备窗口 2 次更新、256 MiB payload 预算。读取进程只
+打开 mmap 并复制本 rank 要用的 field/token 数组，不加载模型或创建 CUDA tensor。
+可提前读后续更新，但主进程按原更新顺序消费；重复样本保留重复次数。OOM 重试复用同一
+份 CPU 输入。先准备当前更新，再在数量和字节预算内排入后续更新；超预算时不丢题。
+单次更新即超过预算会明确报错，需要提高 `--prefetch-mib`，保持原全局 batch。
+
+256 MiB 是包含序列化副本估计的**预取 payload 预算**，不是整个进程 RSS 上限。
+模型、Python/PyTorch 进程、系统文件页缓存、批次索引和当前小批次组装另外占内存；
+三卡默认共有 6 个读取进程、至多 768 MiB 的 payload 预算。RAM 紧张先用
+`--input-workers 1 --prefetch-updates 1`；`--input-workers 0` 可检查同步 mmap 的表现。
+读取进程数只支持 0–4/每 rank，应由计时决定是否增加，避免 CPU/磁盘竞争。
+只给当前组装的小批次 pin memory，然后 non-blocking 传入 GPU；可用
+`--no-pin-training-memory` 对照，未宣称所有搬运都与 GPU 计算完全重叠。
+
+### 6.3 看什么指标
+
+`input_pipeline.json` 记录本次启动耗时和输入配置；`input_profile.jsonl` 记录指定前 N 次
+更新各 rank 的阶段计时，普通运行不插入 CUDA event 测量。`train.jsonl` 中已有的
+`training_window` 保留实际训练吞吐统计，含取数、前后向、同步和 optimizer，排除验证、
+checkpoint 与日志写入。`run_summary.json` 另记录预取预算峰值和已消费更新数。
+
+| 指标/阶段 | 解读与下一步 |
+| --- | --- |
+| `phase=verify_prepared_training_cache`、审计/分词、`phase=model_load` | 尚未进入训练；先看启动阶段，不由 GPU 采样推断每步 I/O |
+| `input_wait_seconds` | 预取提交、等待输入及 rank 错误协调总耗时；高时检查本地盘、worker、CPU/RAM |
+| `cpu_seconds.data_fetch/text_pack/pin_and_transfer_submit` | 当前小批次场数组组装、文本拼接、锁页与搬运提交耗时 |
+| `cuda_milliseconds.host_to_device/field_memory/qwen_forward/answer_ce/backward` | 诊断更新中各 CUDA stream 区间耗时，确定后续优化落点 |
+| `synchronization_and_wait_seconds` | 梯度同步及 rank 等待；结合最慢 rank 看分配是否均衡 |
+| `training_window.questions_per_second`、`seconds_per_update` | 观察实际更新吞吐；比较时固定卡数、形状和文本长度分布 |
+
+CPU 与 CUDA 区间可能重叠，嵌套区间也不能相加；CUDA event 测的是 stream 区间经过时间，
+可能含主机调度空隙，不能解释为纯 kernel 利用率。第一次 spawn、文件页缓存冷启动和
+最初几次 CUDA 执行会影响短程结果。原 `--benchmark-updates` 使用同步读取与预热 token，
+不测新预取管线、optimizer、启动或完整验证，报告中已标明 `prefetch_measured=false`。
+
+实现参考：[NumPy memory mapping](https://numpy.org/doc/stable/reference/generated/numpy.lib.format.open_memmap.html)、
+[PyTorch 数据加载与性能调优](https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html)、
+[锁页和 non-blocking 搬运的适用条件](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html)。
+本次未在 A800 服务器运行，实际加速比例和常驻内存须由上述正常训练诊断确认。
+
 ## 验证记录
+
+2026-11-16 输入管线与计算开销优化主回归：**275 passed、2 skipped、1 failed，218.33 秒**。
+失败来自旧测试使用 Windows 系统临时目录时，沙箱重定向路径与 `Path.resolve()` 的结果
+不一致；未改变生产路径规则。将测试进程的 TEMP/TMP 指向项目内目录后，对最终缓存、
+预取、位置编码、答案 CE、训练集成、验证数据路径和该失败项复查：
+**67 passed，41.55 秒**。两组有重叠，不相加计数。CLI 帮助与 `git diff --check` 通过。
+
+覆盖完整小型夹具中每题 field/token/顺序一致、输入身份及损坏检测、真实 spawn 读取进程、
+队列数量与 payload 预算、异常/超时清理、空 rank 与重复索引、部分反传后模拟 OOM 的
+完整重试，以及旧管线 checkpoint 切换后模型参数、scheduler、epoch/cursor 一致。
+集成测试过程中修正了 mmap uint32 长度与 Python 整数运算的兼容问题，以及关闭 dataset
+时仍被 traceback/长度表引用的 mmap 视图生命周期问题；相关路径已纳入最终回归。
+
+本机 RTX 5060 Laptop / torch 2.9.1+cu128 另外实际执行了小型 Qwen 的 BF16 前后向、
+锁页传输与 CUDA event 计时，并比较新旧取数路径的损失和梯度。主回归两项跳过为缺少
+真实 Qwen tokenizer 资产、Windows 原生 Gloo transport 不可用；多 rank 集成仍使用
+既有文件通信测试替身。端到端训练集成中的验证生成用固定替身，不能据此报告任务准确率。
+没有运行远端缓存预处理、Qwen14B/A800/NCCL 训练或测速，也未重新下载原始源或生成正式 QA。
 
 2026-11-01 跨卡数恢复主回归：**179 passed、2 skipped，135.59秒**。
 实际生成三个CPU进程的step-1 checkpoint，再分别用一个、两个进程恢复；核对下一次更新的

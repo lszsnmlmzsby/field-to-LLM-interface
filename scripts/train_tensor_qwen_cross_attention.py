@@ -80,6 +80,7 @@ from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
     build_patch_encoder_config,
     require_h5py,
     sinusoidal_2d_position_encoding,
+    sinusoidal_position_encoding,
 )
 from tensor_compression.downstream.patch_qa_prompt import build_prompt  # noqa: E402
 from tensor_compression.downstream.field_diagnostics import prediction_record, write_prediction_shard  # noqa: E402
@@ -689,6 +690,14 @@ class FullGridSpatialBackbone(nn.Module):
                 for _ in range(int(adapter_layers))
             ]
         )
+        # Execution-only cache: retain two 1D axes, never a table per shape.
+        # Plain attributes keep legacy state_dicts and persistent buffers intact.
+        self._position_axes_cache = None
+
+    def _apply(self, fn, recurse=True):
+        # Plain cached tensors are not moved by Module.to()/half()/double().
+        self._position_axes_cache = None
+        return super()._apply(fn, recurse=recurse)
 
     def position_encoding(self, grid) -> torch.Tensor:
         # Absolute original-cell row/column of each block's top-left corner.
@@ -696,6 +705,35 @@ class FullGridSpatialBackbone(nn.Module):
         ph, pw = self.block_shape
         table = sinusoidal_2d_position_encoding(h, w, self.adapter_dim)
         return table.reshape(1, h, w, self.adapter_dim)[:, ::ph, ::pw].reshape(1, -1, self.adapter_dim)
+
+    def _dynamic_position_encoding(self, grid, *, device, dtype) -> torch.Tensor:
+        """Use the original CPU sin/cos values, assembling only on the target device.
+
+        Frequencies depend on channel dimension, not axis length, so larger axes
+        can be sliced exactly. Cache storage is O((max_height + max_width) * dim)
+        for one device/dtype; visiting more shapes cannot accumulate 2D tables.
+        """
+        h, w = (int(value) for value in grid)
+        row_dim = self.adapter_dim // 2
+        col_dim = self.adapter_dim - row_dim
+        device = torch.device(device)
+        cached = self._position_axes_cache
+        if cached is None or cached[0].device != device or cached[0].dtype != dtype:
+            rows = sinusoidal_position_encoding(h, row_dim).to(device=device, dtype=dtype)
+            cols = sinusoidal_position_encoding(w, col_dim).to(device=device, dtype=dtype)
+        else:
+            rows, cols = cached
+            if h > rows.shape[0]:
+                rows = sinusoidal_position_encoding(h, row_dim).to(device=device, dtype=dtype)
+            if w > cols.shape[0]:
+                cols = sinusoidal_position_encoding(w, col_dim).to(device=device, dtype=dtype)
+        self._position_axes_cache = (rows, cols)
+        ph, pw = self.block_shape
+        row_values, col_values = rows[:h:ph], cols[:w:pw]
+        nh, nw = row_values.shape[0], col_values.shape[0]
+        return torch.cat((row_values[:, None, :].expand(nh, nw, row_dim),
+                          col_values[None, :, :].expand(nh, nw, col_dim)), dim=-1).reshape(
+                              1, nh * nw, self.adapter_dim)
 
     def spatial_input_states(self, latent_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if latent_map.ndim != 4 or (not self.dynamic_grid and tuple(int(value) for value in latent_map.shape[-2:]) != self.latent_grid):
@@ -713,7 +751,8 @@ class FullGridSpatialBackbone(nn.Module):
         local_residual = self.local_residual_projection(latent_tokens)
         content = self.latent_projection(latent_tokens)
         grid = tuple(int(value) for value in latent_map.shape[-2:])
-        position_table = self.spatial_pos_encoding if grid == self.latent_grid else self.position_encoding(grid)
+        position_table = (self.spatial_pos_encoding if grid == self.latent_grid else
+                          self._dynamic_position_encoding(grid, device=content.device, dtype=content.dtype))
         position = self.spatial_pos_scale.to(dtype=content.dtype) * position_table.to(
             device=content.device,
             dtype=content.dtype,
@@ -1920,6 +1959,52 @@ def full_answer_ce(
     target_ids = targets[active]
     logits = output_embeddings(prediction_hidden).float()
     return F.cross_entropy(logits, target_ids)
+
+
+def batched_per_question_answer_ce(
+    sequence_hidden: torch.Tensor,
+    labels: torch.Tensor,
+    output_embeddings: nn.Module,
+    *,
+    answer_spans: Sequence[tuple[int, int]],
+    max_projection_tokens: int = 128,
+) -> torch.Tensor:
+    """Equal-question CE from contiguous answer spans prepared on the CPU.
+
+    Spans index the unshifted labels and must contain every answer token,
+    including EOS, with no ignored labels inside them. The caller already knows
+    these boundaries while assembling its CPU training tensors. This avoids
+    per-question GPU scalar checks and limits each vocabulary projection's
+    temporary logits; autograd still retains the required loss intermediates.
+    """
+    if sequence_hidden.ndim != 3 or labels.ndim != 2 or sequence_hidden.shape[:2] != labels.shape:
+        raise ValueError("Hidden states and labels must share [batch, sequence] dimensions")
+    batch, width = labels.shape
+    if batch < 1 or len(answer_spans) != batch:
+        raise ValueError("Provide one nonempty answer span per question")
+    if type(max_projection_tokens) is not int or max_projection_tokens < 1:
+        raise ValueError("max_projection_tokens must be a positive integer")
+    hidden_parts, target_parts, token_weights = [], [], []
+    for index, span in enumerate(answer_spans):
+        if (not isinstance(span, (tuple, list)) or len(span) != 2 or
+                any(type(value) is not int for value in span)):
+            raise ValueError("Answer spans must contain two CPU integer offsets")
+        start, end = span
+        if not 1 <= start < end <= width:
+            raise ValueError("Answer spans must be nonempty and include a preceding prompt token")
+        hidden_parts.append(sequence_hidden[index, start - 1:end - 1])
+        target_parts.append(labels[index, start:end])
+        token_weights.extend([1.0 / (batch * (end - start))] * (end - start))
+    predictions = torch.cat(hidden_parts, dim=0)
+    targets = torch.cat(target_parts, dim=0)
+    weights = predictions.new_tensor(token_weights, dtype=torch.float32)
+    loss = predictions.new_zeros((), dtype=torch.float32)
+    for start in range(0, predictions.shape[0], max_projection_tokens):
+        end = start + max_projection_tokens
+        logits = output_embeddings(predictions[start:end]).float()
+        per_token = F.cross_entropy(logits, targets[start:end], reduction="none")
+        loss = loss + (per_token * weights[start:end]).sum()
+    return loss
 
 
 def forward_training_batch(
