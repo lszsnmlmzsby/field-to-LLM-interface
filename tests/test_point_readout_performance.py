@@ -11,8 +11,8 @@ import torch
 from test_multisource_readout import config as multisource_fixture
 from test_point_readout import CharacterTokenizer, tiny_components
 from tensor_compression.downstream.point_readout import make_record, normalize_field
-from scripts import train_point_readout as trainer
-from scripts.train_tensor_qwen_cross_attention import DenseMemoryState, GatedTensorCrossAttention
+from tensor_compression.workflows import train_point_readout as trainer
+from tensor_compression.workflows.train_tensor_qwen_cross_attention import DenseMemoryState, GatedTensorCrossAttention
 
 
 def sample_rows():
@@ -302,7 +302,7 @@ def test_adaptive_micro_batch_cost_limits_persist_without_penalizing_small_field
 
 
 def test_adaptive_chunks_preserve_global_weighted_gradients():
-    from scripts.readout_distributed import ParallelContext
+    from tensor_compression.workflows.readout_distributed import ParallelContext
     _, llm, sidecar, tokenizer, config = tiny_components()
     dataset, results = TinyDataset(), []
     for controller in (None, trainer.AdaptiveMicroBatch(2)):
@@ -319,7 +319,7 @@ def test_adaptive_chunks_preserve_global_weighted_gradients():
 
 
 def test_adaptive_oom_learning_survives_restore_and_retries_whole_update(monkeypatch):
-    from scripts.readout_distributed import ParallelContext, capture_rng, restore_rng
+    from tensor_compression.workflows.readout_distributed import ParallelContext, capture_rng, restore_rng
     from test_readout_distributed import ToySidecar
     _, _, _, tokenizer, config = tiny_components()
     dataset = TinyDataset()
@@ -357,7 +357,7 @@ def test_adaptive_oom_learning_survives_restore_and_retries_whole_update(monkeyp
 
 
 def test_length_scheduling_and_token_budget_preserve_gradients_and_reduce_padding():
-    from scripts.readout_distributed import ParallelContext
+    from tensor_compression.workflows.readout_distributed import ParallelContext
     from array import array
     _, llm, sidecar, tokenizer, config = tiny_components()
     dataset = TinyDataset()
@@ -389,7 +389,7 @@ def test_length_scheduling_and_token_budget_preserve_gradients_and_reduce_paddin
 
 
 def test_one_long_question_is_never_truncated_by_execution_token_budget():
-    from scripts.readout_distributed import ParallelContext
+    from tensor_compression.workflows.readout_distributed import ParallelContext
     _, llm, sidecar, tokenizer, config = tiny_components()
     dataset = TinyDataset()
     lengths = [sum(map(len, trainer.encode_training_record(row, tokenizer, config["training"])))
@@ -402,7 +402,7 @@ def test_one_long_question_is_never_truncated_by_execution_token_budget():
 
 
 def test_adaptive_limits_apply_per_chunk_not_to_all_short_questions(monkeypatch):
-    from scripts.readout_distributed import ParallelContext
+    from tensor_compression.workflows.readout_distributed import ParallelContext
     from test_readout_distributed import ToySidecar
     dataset = TinyDataset()
     dataset.records = [copy.deepcopy(dataset.records[0]) for _ in range(6)]
@@ -421,7 +421,7 @@ def test_adaptive_limits_apply_per_chunk_not_to_all_short_questions(monkeypatch)
 
 
 def test_fixed_checkpoint_benchmark_restores_state_and_compares_identical_questions():
-    from scripts.readout_distributed import ParallelContext, capture_rng
+    from tensor_compression.workflows.readout_distributed import ParallelContext, capture_rng
     from array import array
     _, llm, sidecar, tokenizer, config = tiny_components()
     config["training"].update(batch_size=3, gradient_accumulation_steps=1)
@@ -469,7 +469,7 @@ def test_multisource_cli_training_resume_test_and_independent_provenance_scores(
     The INS receipt is the explicitly tiny fixture defined by the data tests.
     """
     from transformers import Qwen2ForCausalLM
-    from scripts.score_point_readout import score_predictions
+    from tensor_compression.workflows.score_point_readout import score_predictions
     from tensor_compression.downstream.point_readout_data import PointReadoutDataset, build_dataset
     from tensor_compression.downstream.multisource_readout_data import MultiSourcePointReadoutDataset
 

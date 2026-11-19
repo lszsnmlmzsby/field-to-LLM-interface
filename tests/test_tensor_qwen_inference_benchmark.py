@@ -12,7 +12,7 @@ for search_path in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if str(search_path) not in sys.path:
         sys.path.insert(0, str(search_path))
 
-from scripts.benchmark_tensor_qwen_inference import (  # noqa: E402
+from tensor_compression.workflows.benchmark_tensor_qwen_inference import (  # noqa: E402
     aggregate_cost_reports,
     apply_checkpoint_architecture,
     apply_checkpoint_dataset_policy,
@@ -24,7 +24,7 @@ from scripts.benchmark_tensor_qwen_inference import (  # noqa: E402
     percentile,
     state_cluster_bootstrap,
 )
-from scripts.train_tensor_qwen_cross_attention import (  # noqa: E402
+from tensor_compression.workflows.train_tensor_qwen_cross_attention import (  # noqa: E402
     CHECKPOINT_TYPE,
     CHECKPOINT_VERSION,
 )

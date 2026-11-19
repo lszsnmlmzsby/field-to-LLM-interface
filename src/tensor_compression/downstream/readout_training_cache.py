@@ -5,6 +5,8 @@ numeric arrays and fixed-width identifiers, without loading millions of dicts.
 """
 from __future__ import annotations
 
+from tensor_compression.utils.io import load_json as _json
+
 import importlib.metadata
 import json
 import os
@@ -66,8 +68,6 @@ def training_token_identity(tokenizer, *, text_encoding_version, system_message)
     return result
 
 
-def _json(path):
-    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def _lines(path):

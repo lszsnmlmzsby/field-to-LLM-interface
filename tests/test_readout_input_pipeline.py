@@ -11,10 +11,10 @@ import torch
 from test_multisource_readout import config
 from test_readout_training_cache import cache_inputs, prepare
 from test_point_readout import tiny_components
-from scripts import train_point_readout as trainer
-from scripts.readout_distributed import ParallelContext
-from scripts.readout_input_runtime import PreparedTokenLookup, local_update_indices, queue_following_updates
-from scripts.readout_prefetch import PreparedBatchLoader
+from tensor_compression.workflows import train_point_readout as trainer
+from tensor_compression.workflows.readout_distributed import ParallelContext
+from tensor_compression.workflows.readout_input_runtime import PreparedTokenLookup, local_update_indices, queue_following_updates
+from tensor_compression.workflows.readout_prefetch import PreparedBatchLoader
 from tensor_compression.downstream.multisource_readout_data import MultiSourcePointReadoutDataset
 from tensor_compression.downstream.readout_training_cache import PreparedTrainingDataset
 

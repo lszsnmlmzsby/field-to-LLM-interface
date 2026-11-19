@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from scripts import readout_prefetch as prefetch
+from tensor_compression.workflows import readout_prefetch as prefetch
 from tensor_compression.downstream.point_readout import json_hash
 from tensor_compression.downstream.readout_training_cache import ARRAY_FILES, CACHE_FORMAT, INDEX_DTYPE
 

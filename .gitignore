@@ -50,38 +50,8 @@ Thumbs.db
 !/configs/field_to_llm_stage1_reference.yaml
 !/configs/stage1_test_protocol_lock.example.json
 
-# Paper release entry-point allowlist
-/scripts/*
-!/scripts/train_tensor_patch_text_alignment.py
-!/scripts/build_tensor_patch_qa.py
-!/scripts/build_tensor_patch_matched_qa.py
-!/scripts/build_variable_shape_qa.py
-!/scripts/build_point_readout_qa.py
-!/scripts/train_point_readout.py
-!/scripts/prepare_readout_training_cache.py
-!/scripts/readout_prefetch.py
-!/scripts/readout_input_runtime.py
-!/scripts/readout_distributed.py
-!/scripts/score_point_readout.py
-!/scripts/benchmark_point_readout.py
-!/scripts/benchmark_readout_efficiency.py
-!/scripts/compare_block_readout.py
-!/scripts/chat_point_readout.py
-!/scripts/setup_field_qa_server.sh
-!/scripts/check_field_qa_environment.py
-!/scripts/download_pdebench_field.py
-!/scripts/download_ins_tracer.py
-!/scripts/download_the_well.py
-!/scripts/mixed_shape_qa.py
-!/scripts/analyze_field_predictions.py
-!/scripts/evaluate_variable_shape_checkpoint.py
-!/scripts/summarize_variable_shape_run.py
-!/scripts/train_tensor_llm_adapter.py
-!/scripts/train_tensor_qwen_cross_attention.py
-!/scripts/evaluate_frozen_qwen_patch_qa.py
-!/scripts/benchmark_tensor_qwen_inference.py
-!/scripts/train_tensor_qwen_stage1_ablation.py
-!/scripts/compare_tensor_qwen_stage1_ablation.py
+# Local research scripts are outside the release.
+/scripts/
 
 # Paper release test allowlist
 /tests/*
@@ -136,7 +106,9 @@ Thumbs.db
 
 # Local research history and paper-authoring artifacts
 /training_workflow.md
-/docs/
+/docs/*
+!/docs/protocols.md
+!/docs/sources.md
 /figures/
 
 # Data, checkpoints, model weights, and generated outputs
@@ -212,3 +184,5 @@ id_ed25519*
 *.egg-info/
 /build/
 /dist/
+
+!/tests/test_cli.py

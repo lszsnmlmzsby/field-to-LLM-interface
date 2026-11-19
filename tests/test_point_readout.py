@@ -23,7 +23,7 @@ from tensor_compression.downstream.point_readout import (
 from tensor_compression.downstream.point_readout_data import (
     PointReadoutDataset, build_dataset, load_config, write_json,
 )
-from scripts.score_point_readout import score_predictions
+from tensor_compression.workflows.score_point_readout import score_predictions
 
 
 @pytest.fixture
@@ -283,7 +283,7 @@ class CharacterTokenizer:
 
 def tiny_components(config=None):
     from transformers import Qwen2Config, Qwen2ForCausalLM
-    from scripts import train_point_readout as trainer
+    from tensor_compression.workflows import train_point_readout as trainer
     torch.set_num_threads(1)
     torch.manual_seed(123)
     if config is None:
@@ -305,7 +305,7 @@ def tiny_components(config=None):
 
 
 def test_answer_masking_and_no_truncation(z):
-    from scripts.train_point_readout import training_tensors
+    from tensor_compression.workflows.train_point_readout import training_tensors
     row = make_record("state", z, "multi_point", {"points": [[1, 1], [10, 12]]})
     tokenizer = CharacterTokenizer()
     training = {"max_prompt_tokens": 2048, "max_target_tokens": 96}
@@ -325,7 +325,7 @@ def test_answer_masking_and_no_truncation(z):
 
 
 def test_native_chat_is_required_and_prefix_must_match(z):
-    from scripts.train_point_readout import encode_prompt, training_tensors
+    from tensor_compression.workflows.train_point_readout import encode_prompt, training_tensors
     row = make_record("state", z, "single_point", {"points": [[1, 1]]})
     tokenizer = CharacterTokenizer()
     tokenizer.chat_template = None
@@ -347,7 +347,7 @@ def test_huggingface_native_template_and_supervision(z):
     from tokenizers.models import WordLevel
     from tokenizers.pre_tokenizers import Whitespace
     from transformers import PreTrainedTokenizerFast
-    from scripts.train_point_readout import training_tensors, encode_prompt
+    from tensor_compression.workflows.train_point_readout import training_tensors, encode_prompt
     backend = Tokenizer(WordLevel({"[UNK]": 0, "<|endoftext|>": 1, "<|im_start|>": 2,
                                   "<|im_end|>": 3, "[": 4, "]": 5, "0": 6, ".": 7, "3": 8}, unk_token="[UNK]"))
     backend.pre_tokenizer = Whitespace()
@@ -369,7 +369,7 @@ def test_local_qwen_chat_template_for_all_tasks(z):
     """Uses only local tokenizer/config assets, never downloads or loads model weights."""
     from types import SimpleNamespace
     from transformers import AutoTokenizer, GenerationConfig
-    from scripts.train_point_readout import encode_prompt, training_tensors, generation_stop_ids
+    from tensor_compression.workflows.train_point_readout import encode_prompt, training_tensors, generation_stop_ids
     path = os.environ["FIELD_TO_LLM_MODEL_DIR"]
     tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
     generation = GenerationConfig.from_pretrained(path, local_files_only=True)
@@ -485,7 +485,7 @@ def test_bfloat16_cuda_training_and_generation(z):
 
 
 def test_batching_has_no_duplication_and_is_deterministic(data_fixture):
-    from scripts.train_point_readout import shape_batches
+    from tensor_compression.workflows.train_point_readout import shape_batches
     source, qa, _, _ = data_fixture
     dataset = PointReadoutDataset(qa, source, "train")
     try:
@@ -499,7 +499,7 @@ def test_batching_has_no_duplication_and_is_deterministic(data_fixture):
 
 
 def test_batch32_preserves_tail_samples_and_reports_actual_size():
-    from scripts.train_point_readout import shape_batches, batch_statistics, planned_updates
+    from tensor_compression.workflows.train_point_readout import shape_batches, batch_statistics, planned_updates
     rows = [{"grid_shape": [2, 3]} for _ in range(35)] + [{"grid_shape": [3, 2]} for _ in range(11)]
     batches = shape_batches(rows, 32, 42, 0)
     assert sorted(map(len, batches)) == [3, 11, 32]
@@ -512,7 +512,7 @@ def test_batch32_preserves_tail_samples_and_reports_actual_size():
 
 
 def test_overwrite_preserves_old_run_and_rejects_unrecognized_directory(tmp_path):
-    from scripts.train_point_readout import prepare_output_directory
+    from tensor_compression.workflows.train_point_readout import prepare_output_directory
     output = tmp_path / "run"
     output.mkdir()
     (output / "last.pt").write_bytes(b"original checkpoint")
@@ -534,7 +534,7 @@ def test_overwrite_preserves_old_run_and_rejects_unrecognized_directory(tmp_path
 @pytest.mark.parametrize("flag,value", [("--batch-size", "0"), ("--gradient-accumulation-steps", "-1"),
                                       ("--save-every-updates", "0"), ("--eval-every-updates", "-2")])
 def test_invalid_training_override_fails_before_output_creation(tmp_path, monkeypatch, flag, value):
-    from scripts import train_point_readout as trainer
+    from tensor_compression.workflows import train_point_readout as trainer
     output = tmp_path / "unused"
     monkeypatch.setattr(sys, "argv", ["train_point_readout.py", "--profile", "full",
                                      "--output-dir", str(output), flag, value])
@@ -574,7 +574,7 @@ def test_true_batch32_matches_question_weighted_single_sample_gradients(block):
 
 
 def test_automatic_training_budget_respects_selected_tasks(data_fixture):
-    from scripts.train_point_readout import planned_updates
+    from tensor_compression.workflows.train_point_readout import planned_updates
     source, qa, config, _ = data_fixture
     dataset = PointReadoutDataset(qa, source, "train")
     try:
@@ -588,7 +588,7 @@ def test_automatic_training_budget_respects_selected_tasks(data_fixture):
 
 
 def test_resume_rejects_wrong_protocol_or_changed_contract():
-    from scripts.train_point_readout import CHECKPOINT_TYPE, validate_resume
+    from tensor_compression.workflows.train_point_readout import CHECKPOINT_TYPE, validate_resume
     with pytest.raises(ValueError, match="multiple-choice"):
         validate_resume({"checkpoint_type": "old"}, {})
     with pytest.raises(ValueError, match="differs"):
@@ -616,7 +616,7 @@ def test_resume_binds_native_template_and_generation_stops(data_fixture):
 
 
 def test_local_model_identity_tracks_weight_contents_and_allows_relocation(tmp_path):
-    from scripts.train_point_readout import model_asset_identity
+    from tensor_compression.workflows.train_point_readout import model_asset_identity
     first, second = tmp_path / "first", tmp_path / "second"
     first.mkdir()
     second.mkdir()
@@ -633,7 +633,7 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
     """Exercise the actual CLI loop with a tiny real Qwen, including interrupted resume."""
     import yaml
     from transformers import Qwen2ForCausalLM
-    from scripts import train_point_readout as trainer
+    from tensor_compression.workflows import train_point_readout as trainer
     source, qa, initial, _ = data_fixture
     _, example_llm, _, tokenizer, config = tiny_components(initial)
     llm_config = copy.deepcopy(example_llm.config)
@@ -719,7 +719,7 @@ def test_training_resume_and_independent_test_evaluation(data_fixture, tmp_path,
 
     # Benchmark the same test questions on an untouched tiny Qwen and verify that
     # the baseline never constructs an encoder/adapter/bridge.
-    from scripts import benchmark_point_readout as benchmark
+    from tensor_compression.workflows import benchmark_point_readout as benchmark
     def forbidden_sidecar(*args, **kwargs):
         raise AssertionError("Baseline must not construct a field sidecar")
     monkeypatch.setattr(trainer.core, "build_sidecar", forbidden_sidecar)
@@ -807,7 +807,7 @@ def test_epoch_budget_tail_and_signal_exit(data_fixture, tmp_path, monkeypatch):
 
 
 def test_baseline_serializes_entire_field_exactly_and_no_oracle(z):
-    from scripts.benchmark_point_readout import serialized_messages, encode_serialized_prompt
+    from tensor_compression.workflows.benchmark_point_readout import serialized_messages, encode_serialized_prompt
     row = make_record("state", z, "single_point", {"points": [[1, 1]]})
     messages = serialized_messages(row, z[None])
     matrix = json.loads(messages[1]["content"].splitlines()[2])
@@ -822,7 +822,7 @@ def test_baseline_serializes_entire_field_exactly_and_no_oracle(z):
 
 
 def test_benchmark_pairing_rescores_answers_and_requires_complete_coverage(data_fixture):
-    from scripts.benchmark_point_readout import score_complete_predictions, compare_metrics
+    from tensor_compression.workflows.benchmark_point_readout import score_complete_predictions, compare_metrics
     source, qa, _, _ = data_fixture
     dataset = PointReadoutDataset(qa, source, "val")
     try:
@@ -846,8 +846,8 @@ def test_benchmark_pairing_rescores_answers_and_requires_complete_coverage(data_
 
 def test_server_field_inspection_and_download_checksum(data_fixture, tmp_path):
     import hashlib
-    from scripts.check_field_qa_environment import inspect_fields
-    from scripts.download_pdebench_field import verify
+    from tensor_compression.workflows.check_field_qa_environment import inspect_fields
+    from tensor_compression.workflows.download_pdebench_field import verify
     source, _, _, _ = data_fixture
     result = inspect_fields(source, ["Vx", "Vy"])
     assert result["Vx"] == [20, 3, 24, 28]
@@ -862,7 +862,7 @@ def test_server_field_inspection_and_download_checksum(data_fixture, tmp_path):
 
 def test_local_model_preflight_requires_all_indexed_shards_and_tensor_names(tmp_path):
     from safetensors.torch import save_file
-    from scripts.check_field_qa_environment import inspect_weight_files
+    from tensor_compression.workflows.check_field_qa_environment import inspect_weight_files
 
     shard_a, shard_b = "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"
     index = {"weight_map": {"a": shard_a, "b": shard_b}}
@@ -882,7 +882,7 @@ def test_local_model_preflight_requires_all_indexed_shards_and_tensor_names(tmp_
 def test_local_model_preflight_rejects_truncated_safetensors(tmp_path):
     from safetensors import SafetensorError
     from safetensors.torch import save_file
-    from scripts.check_field_qa_environment import inspect_weight_files
+    from tensor_compression.workflows.check_field_qa_environment import inspect_weight_files
 
     shard = tmp_path / "model.safetensors"
     save_file({"a": torch.ones(16)}, str(shard))
@@ -893,7 +893,7 @@ def test_local_model_preflight_rejects_truncated_safetensors(tmp_path):
 
 
 def test_download_refuses_aria2_partial_without_starting_curl(tmp_path, monkeypatch):
-    from scripts import download_pdebench_field as downloader
+    from tensor_compression.workflows import download_pdebench_field as downloader
 
     partial = tmp_path / "source.hdf5.part"
     partial.write_bytes(b"preserve downloaded ranges")
@@ -910,7 +910,7 @@ def test_download_refuses_aria2_partial_without_starting_curl(tmp_path, monkeypa
 
 def test_download_restarts_partial_transfer_without_discarding_bytes(tmp_path, monkeypatch):
     import subprocess
-    from scripts import download_pdebench_field as downloader
+    from tensor_compression.workflows import download_pdebench_field as downloader
     partial = tmp_path / "source.hdf5.part"
     partial.write_bytes(b"existing")
     calls, sleeps = [], []
@@ -935,7 +935,7 @@ def test_download_restarts_partial_transfer_without_discarding_bytes(tmp_path, m
 @pytest.mark.parametrize("exit_code,attempts", [(18, 3), (22, 1), (23, 1)])
 def test_download_retries_are_bounded_and_preserve_failed_file(tmp_path, monkeypatch, exit_code, attempts):
     import subprocess
-    from scripts import download_pdebench_field as downloader
+    from tensor_compression.workflows import download_pdebench_field as downloader
     partial = tmp_path / "source.hdf5.part"
     partial.write_bytes(b"keep")
     calls = []

@@ -9,8 +9,8 @@ import pytest
 import torch
 
 from test_point_readout import CharacterTokenizer, tiny_components
-from scripts import train_point_readout as trainer
-from scripts.score_point_readout import score_predictions
+from tensor_compression.workflows import train_point_readout as trainer
+from tensor_compression.workflows.score_point_readout import score_predictions
 from tensor_compression.downstream.point_readout import make_record, score_answer
 from tensor_compression.downstream.readout_evaluation import (
     FieldPairDataset, evaluation_annotations, paired_language_metrics, summarize_readout_evaluation,

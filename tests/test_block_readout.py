@@ -16,7 +16,7 @@ for path in (ROOT, ROOT / "src"):
 from tensor_compression.downstream.block_tokens import block_shape, pack_blocks, masked_reconstruction
 from tensor_compression.downstream.point_readout_data import load_config
 from tensor_compression.downstream.point_readout import make_record, normalize_field
-from scripts import train_point_readout as trainer
+from tensor_compression.workflows import train_point_readout as trainer
 from test_point_readout import tiny_components
 
 
@@ -99,7 +99,7 @@ def test_tiny_qwen_training_reload_and_dynamic_shape(shape):
 
 
 def test_one_cell_path_and_absolute_positions_remain_compatible():
-    from scripts.train_tensor_qwen_cross_attention import FullGridSpatialBackbone, sinusoidal_2d_position_encoding
+    from tensor_compression.workflows.train_tensor_qwen_cross_attention import FullGridSpatialBackbone, sinusoidal_2d_position_encoding
     args = dict(latent_channels=3, latent_grid=(8, 8), adapter_dim=16, adapter_layers=1,
                 adapter_heads=2, dropout=0, dynamic_grid=True)
     legacy = FullGridSpatialBackbone(**args)
@@ -128,7 +128,7 @@ def test_feasibility_budget_and_resume_contract():
 
 
 def test_comparison_requires_same_experiment_and_questions(tmp_path, capsys):
-    from scripts.compare_block_readout import compare
+    from tensor_compression.workflows.compare_block_readout import compare
     dirs = [tmp_path / "reference", tmp_path / "compressed"]
     metric = {"questions": 1, "answer_accuracy": .5, "unit_accuracy": .75,
               "macro_task_answer_accuracy": .5, "elapsed_seconds": 1.,

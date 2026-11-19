@@ -379,7 +379,7 @@ def test_bundled_catalogs_work_without_github_or_hf(monkeypatch, name, expected_
 
 def test_default_download_cli_plans_only_active_three_complete_sources(tmp_path, monkeypatch, capsys):
     import sys
-    from scripts import download_the_well
+    from tensor_compression.workflows import download_the_well
     monkeypatch.setattr(source.urllib.request, "urlopen",
                         lambda *a, **k: pytest.fail("pinned planning must be offline"))
     monkeypatch.setattr(sys, "argv", ["download_the_well.py", "--output-dir", str(tmp_path),

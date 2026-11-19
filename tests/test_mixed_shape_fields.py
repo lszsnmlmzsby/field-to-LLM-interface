@@ -13,12 +13,12 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.build_variable_shape_qa import build_dataset
-from scripts.build_tensor_patch_matched_qa import evaluation_record_replay
-from scripts.mixed_shape_qa import synthetic_raw
-from scripts.analyze_field_predictions import analyze
-from scripts import evaluate_variable_shape_checkpoint as inference
-from scripts import train_tensor_qwen_cross_attention as trainer
+from tensor_compression.workflows.build_variable_shape_qa import build_dataset
+from tensor_compression.workflows.build_tensor_patch_matched_qa import evaluation_record_replay
+from tensor_compression.workflows.mixed_shape_qa import synthetic_raw
+from tensor_compression.workflows.analyze_field_predictions import analyze
+from tensor_compression.workflows import evaluate_variable_shape_checkpoint as inference
+from tensor_compression.workflows import train_tensor_qwen_cross_attention as trainer
 from tensor_compression.downstream.variable_shape import experiment_config, parse_shapes, record_shape, ShapeBatchSampler
 from tensor_compression.downstream.field_diagnostics import coordinate_bucket, prediction_record, write_prediction_shard
 from tensor_compression.utils.pipeline_config import load_yaml_mapping

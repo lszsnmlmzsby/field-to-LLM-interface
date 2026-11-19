@@ -122,7 +122,7 @@ def test_complete_validation_catches_nan_and_truncation(tmp_path):
 
 
 def test_production_encoder_handles_one_cell_with_group_norm():
-    from scripts import train_point_readout as trainer
+    from tensor_compression.workflows import train_point_readout as trainer
     config = load_config(ROOT / "configs/field_to_llm_ins_tracer.yaml", "smoke")
     encoder, _, _, _ = trainer.core.build_scratch_memory_components(trainer.model_args(config), (1, 16, 16))
     output = encoder(torch.zeros(1, 1, 1, 1))
@@ -155,7 +155,7 @@ def test_geometry_check_is_not_training_and_covers_extremes():
 
 
 def test_download_resume_after_network_error_and_aria2_guard(tmp_path, monkeypatch):
-    from scripts import download_ins_tracer as downloader
+    from tensor_compression.workflows import download_ins_tracer as downloader
     path = tmp_path / "source.part"
     path.write_bytes(b"first")
     observed = []
@@ -177,7 +177,7 @@ def test_download_resume_after_network_error_and_aria2_guard(tmp_path, monkeypat
 
 
 def test_full_size_aria2_partial_is_not_mistaken_for_complete(tmp_path, monkeypatch):
-    from scripts import download_ins_tracer as downloader
+    from tensor_compression.workflows import download_ins_tracer as downloader
     partial = tmp_path / (downloader.FILENAME + ".part")
     partial.write_bytes(b"allocated")
     partial.with_name(partial.name + ".aria2").write_bytes(b"unfinished ranges")

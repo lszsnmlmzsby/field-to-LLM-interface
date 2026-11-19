@@ -18,9 +18,9 @@ for path in (ROOT, ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from scripts.build_variable_shape_qa import build_dataset
-from scripts.build_tensor_patch_matched_qa import evaluation_record_replay
-from scripts.train_tensor_qwen_cross_attention import (
+from tensor_compression.workflows.build_variable_shape_qa import build_dataset
+from tensor_compression.workflows.build_tensor_patch_matched_qa import evaluation_record_replay
+from tensor_compression.workflows.train_tensor_qwen_cross_attention import (
     DenseTensorMemory, build_scratch_memory_components, build_datasets,
     load_metadata_and_contract, parse_args, validate_checkpoint_contract,
     CHECKPOINT_TYPE, CHECKPOINT_VERSION,
@@ -279,8 +279,8 @@ def test_training_resume_and_evaluate_only_smoke(assets):
     args.screening_fractions = [0.5, 1.0]
     args.save_every_updates = 1
     args.serialize_llm_loading = False
-    import scripts.train_tensor_qwen_cross_attention as trainer
-    import scripts.summarize_variable_shape_run as summarizer
+    import tensor_compression.workflows.train_tensor_qwen_cross_attention as trainer
+    import tensor_compression.workflows.summarize_variable_shape_run as summarizer
 
     def run():
         with patch.object(trainer, "parse_args", return_value=args), patch.object(

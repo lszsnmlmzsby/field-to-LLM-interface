@@ -10,12 +10,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from scripts.train_tensor_patch_text_alignment import TensorPatchAlignmentAdapter
-from scripts.train_tensor_llm_adapter import (
+from tensor_compression.workflows.train_tensor_patch_text_alignment import TensorPatchAlignmentAdapter
+from tensor_compression.workflows.train_tensor_llm_adapter import (
     apply_latent_channel_policy,
     validate_adapter_checkpoint_payload,
 )
-from scripts.train_tensor_qwen_stage1_ablation import (
+from tensor_compression.workflows.train_tensor_qwen_stage1_ablation import (
     ABLATION_MODE,
     DENSE_CHECKPOINT_TYPE,
     DENSE_CHECKPOINT_VERSION,

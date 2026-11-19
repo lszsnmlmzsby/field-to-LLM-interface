@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 for folder in (ROOT, ROOT / "src"):
     sys.path.insert(0, str(folder))
 
-from scripts import benchmark_readout_efficiency as bench
+from tensor_compression.workflows import benchmark_readout_efficiency as bench
 from test_point_readout import data_fixture, tiny_components
 from test_multisource_readout import config as multi_config
 from tensor_compression.downstream.point_readout import normalize_field, make_record

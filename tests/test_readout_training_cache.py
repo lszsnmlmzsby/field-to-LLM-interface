@@ -7,7 +7,7 @@ import torch
 
 from test_multisource_readout import config
 from test_point_readout import CharacterTokenizer
-from scripts import train_point_readout as trainer
+from tensor_compression.workflows import train_point_readout as trainer
 from tensor_compression.downstream import multisource_readout_data as multi
 from tensor_compression.downstream import point_readout_data
 from tensor_compression.downstream.field_query_program import PROGRAM_TASKS

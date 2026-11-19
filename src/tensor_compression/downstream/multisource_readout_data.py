@@ -6,6 +6,8 @@ time index. Neither source identifiers nor physical metadata enter neural prompt
 """
 from __future__ import annotations
 
+from tensor_compression.utils.io import load_json as _json
+
 import copy
 import json
 import math
@@ -28,8 +30,6 @@ from tensor_compression.downstream.random_readout_shapes import fitting_tasks, s
 SPLITS = ("train", "val", "test")
 
 
-def _json(path):
-    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def _write(path, value):

@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_long_program_question_uses_actual_padding_and_preserves_qa():
     import pytest
-    from scripts import train_point_readout as trainer
+    from tensor_compression.workflows import train_point_readout as trainer
     from tensor_compression.downstream.field_query_program import make_program_record
 
     program = {"version": 1, "task": "multi_point", "expression": {"op": "read",
@@ -61,8 +61,8 @@ def test_v2_recipe_preserves_complete_sources_and_expands_crop_budget():
 
 def test_program_training_resume_and_separate_language_diagnostics(source_fixture, tmp_path, monkeypatch):
     from transformers import Qwen2ForCausalLM
-    from scripts import train_point_readout as trainer
-    from scripts.score_point_readout import score_predictions
+    from tensor_compression.workflows import train_point_readout as trainer
+    from tensor_compression.workflows.score_point_readout import score_predictions
     from tensor_compression.downstream.point_readout_data import PointReadoutDataset, read_jsonl
 
     recipe = load_config(ROOT / "configs/field_to_llm_multisource_v2.yaml", "smoke")

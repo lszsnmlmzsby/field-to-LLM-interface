@@ -16,8 +16,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from scripts import train_point_readout as trainer
-from scripts.readout_distributed import (ParallelContext, partition_batch, evaluation_indices, capture_rng,
+from tensor_compression.workflows import train_point_readout as trainer
+from tensor_compression.workflows.readout_distributed import (ParallelContext, partition_batch, evaluation_indices, capture_rng,
                                         restore_rng, length_balanced_partitions, merge_strided_lengths,
                                         resume_execution_state)
 from test_point_readout import tiny_components, data_fixture
@@ -481,7 +481,7 @@ def _migration_worker(rank, world, root, config_path, barrier):
 
 
 def test_token_report_reduction_keeps_global_maxima_and_overflows():
-    from scripts.readout_distributed import merge_token_reports
+    from tensor_compression.workflows.readout_distributed import merge_token_reports
     tokenizer = tiny_components()[3]
     records, _ = sample_rows()
     training = {"max_prompt_tokens": 10, "max_target_tokens": 96}

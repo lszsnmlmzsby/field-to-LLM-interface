@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from scripts import chat_point_readout as chat
+from tensor_compression.workflows import chat_point_readout as chat
 
 
 @pytest.mark.parametrize("response_format", ["json", "free"])

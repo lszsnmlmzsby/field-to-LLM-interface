@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.compare_tensor_qwen_stage1_ablation import CONDITIONS, compare_runs, json_digest
+from tensor_compression.workflows.compare_tensor_qwen_stage1_ablation import CONDITIONS, compare_runs, json_digest
 
 
 def _artifact(condition: str, macro: float, task_a: float, task_b: float) -> dict:

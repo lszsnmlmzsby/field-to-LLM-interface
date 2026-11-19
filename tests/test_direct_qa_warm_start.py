@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 import torch
 
-from scripts.train_tensor_llm_adapter import adapter_from_checkpoint, parse_args
-from scripts.train_tensor_patch_text_alignment import TensorPatchAlignmentAdapter
+from tensor_compression.workflows.train_tensor_llm_adapter import adapter_from_checkpoint, parse_args
+from tensor_compression.workflows.train_tensor_patch_text_alignment import TensorPatchAlignmentAdapter
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

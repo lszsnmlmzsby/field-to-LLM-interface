@@ -11,7 +11,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from scripts.train_tensor_patch_text_alignment import (
+from tensor_compression.workflows.train_tensor_patch_text_alignment import (
     AlignmentAnchor,
     AlignmentProjectionPair,
     DistributedEvalSampler,
@@ -562,6 +562,7 @@ def test_config_defaults_keep_primary_out_of_lower_auxiliary_layers(monkeypatch)
                 "teacher_layer": 4,
                 "auxiliary_teacher_layers": [6, 2],
                 "auxiliary_teacher_layer_weights": [0.25, 0.5],
+                "mean_alignment_loss_weight": 0.1,
             },
         },
     )
