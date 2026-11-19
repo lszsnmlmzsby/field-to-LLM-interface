@@ -18,21 +18,8 @@ COMMANDS = {
     "analyze": ("analyze_field_predictions", ()),
     "compare-blocks": ("compare_block_readout", ()),
     "environment": ("check_field_qa_environment", ()),
-    "download-pdebench": ("download_pdebench_field", ()),
     "download-ins": ("download_ins_tracer", ()),
     "download-well": ("download_the_well", ()),
-    "paper-data": ("build_tensor_patch_qa", ()),
-    "paper-matched-data": ("build_tensor_patch_matched_qa", ()),
-    "paper-align": ("train_tensor_patch_text_alignment", ()),
-    "paper-direct": ("train_tensor_llm_adapter", ()),
-    "paper-train": ("train_tensor_qwen_cross_attention", ()),
-    "paper-baseline": ("evaluate_frozen_qwen_patch_qa", ()),
-    "paper-benchmark": ("benchmark_tensor_qwen_inference", ()),
-    "paper-ablation": ("train_tensor_qwen_stage1_ablation", ()),
-    "paper-compare": ("compare_tensor_qwen_stage1_ablation", ()),
-    "shape-data": ("build_variable_shape_qa", ()),
-    "shape-evaluate": ("evaluate_variable_shape_checkpoint", ()),
-    "shape-summary": ("summarize_variable_shape_run", ()),
 }
 
 

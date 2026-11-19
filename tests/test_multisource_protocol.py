@@ -46,7 +46,7 @@ def test_family_and_source_metrics_do_not_change_original_aggregate():
 
 
 def test_expanded_recipe_preserves_user_budget_and_legacy_source_override():
-    config = load_config(ROOT / "configs/field_to_llm_multisource.yaml", "full")
+    config = load_config(ROOT / "tests/fixtures/field_to_llm_multisource.yaml", "full")
     assert config["generation"]["train_states"] == 16384 * 8
     assert config["training"]["epochs"] == 2
     assert config["training"]["batch_size"] == 16

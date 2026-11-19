@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from .multisource_readout_data import _Readers
-from .patch_qa_contract import sha256_file
+from tensor_compression.utils.io import sha256_file
 from .point_readout import FORMAT, PROMPT_VERSION, json_hash, normalize_field, tensor_hash, validate_record
 
 

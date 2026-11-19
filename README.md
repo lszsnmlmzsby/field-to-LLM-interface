@@ -24,12 +24,10 @@ configs/                  实验配方与固定源清单
 src/tensor_compression/
   workflows/              应用流程及运行时支持
   downstream/             场读取、查询真值、QA 契约、采样与缓存
-  models/                 场编码器与模型构建
+  models/                 场记忆、空间编码器、Qwen 加载与模型构建
   data/                   归一化
-  integrations/           实验记录服务
   utils/                  配置与文件工具
 tests/                    功能、数值一致性与恢复测试
-docs/protocols.md          实验配方映射与论文复现
 docs/sources.md            源规模、字段布局与校验方式
 ```
 
@@ -54,7 +52,7 @@ python field.py download-ins --output-dir "$FIELD_TO_LLM_ROOT/raw/ins_tracer"
 python field.py download-well --output-dir "$FIELD_TO_LLM_ROOT/raw/the_well"
 ```
 
-PDEBench 配方使用 `python field.py download-pdebench --output-dir "$FIELD_TO_LLM_ROOT/raw/pdebench"`，完成后核对官方 MD5。各源规格见[数据源说明](docs/sources.md)。
+各源规格见[数据源说明](docs/sources.md)。
 
 ```bash
 python field.py data --config "$CONFIG" --profile full
@@ -140,7 +138,9 @@ python field.py infer --config "$RUN/resolved_config.json" --profile full \
 
 ## 实验协议与开发
 
-多源 v1/v2、单源数值问答、变形状实验，以及论文两阶段和消融实验共用基础组件，由配置锁定各自的数据、目标和预算。配置映射与复现命令见[实验协议](docs/protocols.md)。
+当前训练配方集中在 `configs/field_to_llm_multisource_v2.yaml`：425,984 个训练裁剪、14 类查询、两轮训练。裁剪配额为 INS 32,768、Acoustic 65,536、Euler openBC 262,144、Gray–Scott 65,536。轨迹划分、形状划分与评分策略由配方及 QA metadata 固定。
+
+`tests/fixtures/` 中的小型配方服务于字段读取、评分与恢复回归测试。正式运行使用上述多源配置。
 
 ```bash
 python field.py --help

@@ -12,7 +12,7 @@ from test_multisource_readout import config as multisource_fixture
 from test_point_readout import CharacterTokenizer, tiny_components
 from tensor_compression.downstream.point_readout import make_record, normalize_field
 from tensor_compression.workflows import train_point_readout as trainer
-from tensor_compression.workflows.train_tensor_qwen_cross_attention import DenseMemoryState, GatedTensorCrossAttention
+from tensor_compression.models.field_memory import DenseMemoryState, GatedTensorCrossAttention
 
 
 def sample_rows():

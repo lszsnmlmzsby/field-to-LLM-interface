@@ -22,7 +22,7 @@ import torch
 
 from tensor_compression.paths import ROOT as ROOT
 
-from tensor_compression.workflows import train_tensor_qwen_cross_attention as core
+from tensor_compression.models import field_memory as core
 from tensor_compression.workflows.readout_distributed import (
     ParallelContext, RecordView, capture_rng, restore_rng, partition_batch,
     evaluation_indices, merge_token_reports,
@@ -1180,7 +1180,7 @@ def check_geometry(llm, sidecar, tokenizer, dataset, device, dtype, config, *, p
 def main():
     invocation_started = time.perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(ROOT / "configs/field_to_llm_point_readout.yaml"))
+    parser.add_argument("--config", default=str(ROOT / "configs/field_to_llm_multisource_v2.yaml"))
     parser.add_argument("--profile", choices=("smoke", "pilot", "full"), required=True)
     parser.add_argument("--qa-dir")
     parser.add_argument("--hdf5-path")

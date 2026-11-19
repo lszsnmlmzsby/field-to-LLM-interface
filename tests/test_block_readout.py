@@ -57,7 +57,7 @@ def test_invalid_block_shape(shape):
 
 @pytest.mark.parametrize("shape", [(1, 1), (2, 2), (2, 3)])
 def test_tiny_qwen_training_reload_and_dynamic_shape(shape):
-    config = load_config(ROOT / "configs/field_to_llm_point_readout.yaml", "smoke")
+    config = load_config(ROOT / "tests/fixtures/field_to_llm_point_readout.yaml", "smoke")
     config["memory"]["block_shape"] = list(shape)
     trainer, llm, sidecar, tokenizer, config = tiny_components(config)
     z = normalize_field(torch.arange(9*17).reshape(9, 17).float())[0]
@@ -99,7 +99,7 @@ def test_tiny_qwen_training_reload_and_dynamic_shape(shape):
 
 
 def test_one_cell_path_and_absolute_positions_remain_compatible():
-    from tensor_compression.workflows.train_tensor_qwen_cross_attention import FullGridSpatialBackbone, sinusoidal_2d_position_encoding
+    from tensor_compression.models.field_memory import FullGridSpatialBackbone, sinusoidal_2d_position_encoding
     args = dict(latent_channels=3, latent_grid=(8, 8), adapter_dim=16, adapter_layers=1,
                 adapter_heads=2, dropout=0, dynamic_grid=True)
     legacy = FullGridSpatialBackbone(**args)
@@ -114,7 +114,7 @@ def test_one_cell_path_and_absolute_positions_remain_compatible():
 
 
 def test_feasibility_budget_and_resume_contract():
-    config = load_config(ROOT / "configs/field_to_llm_block_readout.yaml", "pilot")
+    config = load_config(ROOT / "tests/fixtures/field_to_llm_block_readout.yaml", "pilot")
     trainer.validate_config(config)
     n = config["generation"]["train_states"] * len(config["generation"]["tasks"])
     assert n == 11264

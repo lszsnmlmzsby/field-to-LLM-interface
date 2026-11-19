@@ -179,7 +179,7 @@ def data_fixture(tmp_path):
     with h5py.File(source, "w") as handle:
         handle.create_dataset("Vx", data=array)
         handle.create_dataset("Vy", data=array * 3 + 7)
-    config = load_config(ROOT / "configs/field_to_llm_point_readout.yaml", "smoke")
+    config = load_config(ROOT / "tests/fixtures/field_to_llm_point_readout.yaml", "smoke")
     config["data"].update(fields=["Vx", "Vy"], train_shapes=["8x8", "8x12"], heldout_shapes=["9x11"])
     config["generation"].update(train_states=8, eval_states_per_shape=2)
     output = tmp_path / "qa"
@@ -287,7 +287,7 @@ def tiny_components(config=None):
     torch.set_num_threads(1)
     torch.manual_seed(123)
     if config is None:
-        config = load_config(ROOT / "configs/field_to_llm_point_readout.yaml", "smoke")
+        config = load_config(ROOT / "tests/fixtures/field_to_llm_point_readout.yaml", "smoke")
     config = copy.deepcopy(config)
     config["model"].update(torch_dtype="float32", gradient_checkpointing=False)
     config["spatial_adapter"].update(adapter_dim=16, adapter_layers=1, adapter_heads=2)
@@ -847,17 +847,11 @@ def test_benchmark_pairing_rescores_answers_and_requires_complete_coverage(data_
 def test_server_field_inspection_and_download_checksum(data_fixture, tmp_path):
     import hashlib
     from tensor_compression.workflows.check_field_qa_environment import inspect_fields
-    from tensor_compression.workflows.download_pdebench_field import verify
     source, _, _, _ = data_fixture
     result = inspect_fields(source, ["Vx", "Vy"])
     assert result["Vx"] == [20, 3, 24, 28]
     with pytest.raises(ValueError):
         inspect_fields(source, ["missing"])
-    artifact = tmp_path / "download.part"
-    artifact.write_bytes(b"complete fixture")
-    verify(artifact, hashlib.md5(b"complete fixture").hexdigest())
-    with pytest.raises(ValueError, match="MD5 mismatch"):
-        verify(artifact, hashlib.md5(b"incomplete fixture").hexdigest())
 
 
 def test_local_model_preflight_requires_all_indexed_shards_and_tensor_names(tmp_path):
@@ -890,63 +884,3 @@ def test_local_model_preflight_rejects_truncated_safetensors(tmp_path):
     shard.write_bytes(shard.read_bytes()[:-1])
     with pytest.raises(SafetensorError):
         inspect_weight_files(tmp_path)
-
-
-def test_download_refuses_aria2_partial_without_starting_curl(tmp_path, monkeypatch):
-    from tensor_compression.workflows import download_pdebench_field as downloader
-
-    partial = tmp_path / "source.hdf5.part"
-    partial.write_bytes(b"preserve downloaded ranges")
-    control = partial.with_name(partial.name + ".aria2")
-    control.write_bytes(b"preserve aria2 progress")
-    calls = []
-    monkeypatch.setattr(downloader.subprocess, "run", lambda *args, **kwargs: calls.append(args))
-    with pytest.raises(ValueError, match="aria2 control file"):
-        downloader.download_partial(partial)
-    assert not calls
-    assert partial.read_bytes() == b"preserve downloaded ranges"
-    assert control.read_bytes() == b"preserve aria2 progress"
-
-
-def test_download_restarts_partial_transfer_without_discarding_bytes(tmp_path, monkeypatch):
-    import subprocess
-    from tensor_compression.workflows import download_pdebench_field as downloader
-    partial = tmp_path / "source.hdf5.part"
-    partial.write_bytes(b"existing")
-    calls, sleeps = [], []
-
-    def transfer(command, check):
-        assert check and command[command.index("--continue-at") + 1] == "-"
-        assert command[command.index("--output") + 1] == str(partial)
-        calls.append(partial.read_bytes())
-        with partial.open("ab") as handle:
-            handle.write(b"more")
-        if len(calls) == 1:
-            raise subprocess.CalledProcessError(18, command)
-
-    monkeypatch.setattr(downloader.subprocess, "run", transfer)
-    monkeypatch.setattr(downloader.time, "sleep", sleeps.append)
-    downloader.download_partial(partial, resume_retries=1)
-    assert calls == [b"existing", b"existingmore"]
-    assert partial.read_bytes() == b"existingmoremore"
-    assert sleeps == [10]
-
-
-@pytest.mark.parametrize("exit_code,attempts", [(18, 3), (22, 1), (23, 1)])
-def test_download_retries_are_bounded_and_preserve_failed_file(tmp_path, monkeypatch, exit_code, attempts):
-    import subprocess
-    from tensor_compression.workflows import download_pdebench_field as downloader
-    partial = tmp_path / "source.hdf5.part"
-    partial.write_bytes(b"keep")
-    calls = []
-
-    def fail(command, check):
-        calls.append(command)
-        raise subprocess.CalledProcessError(exit_code, command)
-
-    monkeypatch.setattr(downloader.subprocess, "run", fail)
-    monkeypatch.setattr(downloader.time, "sleep", lambda seconds: None)
-    with pytest.raises(subprocess.CalledProcessError):
-        downloader.download_partial(partial, resume_retries=2)
-    assert len(calls) == attempts
-    assert partial.read_bytes() == b"keep"

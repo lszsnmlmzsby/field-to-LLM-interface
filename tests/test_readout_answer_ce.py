@@ -4,7 +4,7 @@ import copy
 import pytest
 import torch
 
-from tensor_compression.workflows import train_tensor_qwen_cross_attention as core
+from tensor_compression.models import field_memory as core
 
 
 @pytest.mark.parametrize("cap", [1, 4, 128])

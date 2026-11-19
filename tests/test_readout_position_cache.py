@@ -4,7 +4,7 @@ import copy
 import pytest
 import torch
 
-from tensor_compression.workflows import train_tensor_qwen_cross_attention as core
+from tensor_compression.models import field_memory as core
 
 
 def backbone(block=(1, 1), dim=18):

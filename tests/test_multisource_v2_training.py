@@ -39,7 +39,7 @@ def test_long_program_question_uses_actual_padding_and_preserves_qa():
 
 
 def test_v2_recipe_preserves_complete_sources_and_expands_crop_budget():
-    original = load_config(ROOT / "configs/field_to_llm_multisource.yaml", "full")
+    original = load_config(ROOT / "tests/fixtures/field_to_llm_multisource.yaml", "full")
     full = load_config(ROOT / "configs/field_to_llm_multisource_v2.yaml", "full")
     assert full["data"]["sources"] == original["data"]["sources"]
     assert full["data"]["shape_sampling"] == original["data"]["shape_sampling"]

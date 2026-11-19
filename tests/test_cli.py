@@ -27,3 +27,13 @@ def test_evaluate_selects_read_only_mode(monkeypatch):
 def test_unknown_command_is_rejected():
     with pytest.raises(SystemExit, match="Unknown command"):
         field.main(["missing"])
+
+
+def test_current_interface_excludes_retired_experiments():
+    from tensor_compression.models import field_memory, llm_runtime, spatial_encoder
+
+    assert {"train", "evaluate", "infer", "prepare"} <= field.COMMANDS.keys()
+    assert not any(name.startswith(("paper-", "shape-")) for name in field.COMMANDS)
+    for component in (field_memory, llm_runtime, spatial_encoder):
+        assert not hasattr(component, "main")
+        assert not hasattr(component, "parse_args")

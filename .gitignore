@@ -25,18 +25,8 @@ env/
 .DS_Store
 Thumbs.db
 
-# Paper release configuration allowlist
+# Current workflow configuration allowlist
 /configs/*
-!/configs/field_to_llm_stage1.yaml
-!/configs/field_to_llm_direct_qa.yaml
-!/configs/field_to_llm_cross_attention.yaml
-!/configs/field_to_llm_cross_attention_scratch.yaml
-!/configs/field_to_llm_variable_shape.yaml
-!/configs/field_to_llm_variable_shape_mixed.yaml
-!/configs/field_to_llm_point_readout.yaml
-!/configs/field_to_llm_block_readout.yaml
-!/configs/field_to_llm_ins_tracer.yaml
-!/configs/field_to_llm_multisource.yaml
 !/configs/field_to_llm_multisource_v2.yaml
 !/configs/source_manifests/
 /configs/source_manifests/*
@@ -44,25 +34,13 @@ Thumbs.db
 !/configs/source_manifests/euler_multi_quadrants_openBC/
 !/configs/source_manifests/euler_multi_quadrants_periodicBC/
 !/configs/source_manifests/gray_scott_reaction_diffusion/
-!/configs/field_to_llm_benchmark.yaml
-!/configs/field_to_llm_stage1_adapter_ablation.yaml
-!/configs/field_to_llm_no_learned_stage1_ablation.yaml
-!/configs/field_to_llm_stage1_reference.yaml
-!/configs/stage1_test_protocol_lock.example.json
 
 # Local research scripts are outside the release.
 /scripts/
 
-# Paper release test allowlist
+# Current workflow test allowlist
 /tests/*
 !/tests/test_config_and_normalization.py
-!/tests/test_patch_qa_contract.py
-!/tests/test_tensor_patch_text_alignment.py
-!/tests/test_tensor_patch_matched_qa.py
-!/tests/test_direct_qa_warm_start.py
-!/tests/test_frozen_qwen_patch_qa.py
-!/tests/test_tensor_qwen_cross_attention.py
-!/tests/test_variable_shape_fields.py
 !/tests/test_point_readout.py
 !/tests/test_readout_training_cache.py
 !/tests/test_readout_prefetch.py
@@ -83,10 +61,6 @@ Thumbs.db
 !/tests/test_readout_evaluation_v2.py
 !/tests/test_point_readout_performance.py
 !/tests/test_chat_point_readout.py
-!/tests/test_mixed_shape_fields.py
-!/tests/test_tensor_qwen_inference_benchmark.py
-!/tests/test_tensor_qwen_stage1_ablation.py
-!/tests/test_compare_tensor_qwen_stage1_ablation.py
 
 # Historical compression, editor, and downstream-evaluation implementation
 /src/tensor_compression/adapters/
@@ -107,7 +81,6 @@ Thumbs.db
 # Local research history and paper-authoring artifacts
 /training_workflow.md
 /docs/*
-!/docs/protocols.md
 !/docs/sources.md
 /figures/
 
@@ -186,3 +159,4 @@ id_ed25519*
 /dist/
 
 !/tests/test_cli.py
+!/tests/fixtures/

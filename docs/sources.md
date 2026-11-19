@@ -13,7 +13,7 @@
 | Gray–Scott | 157,940,711,424 | 128×128 | 6 / 6 / 6 |
 | INS-Tracer | 20,250,643,760 | 128×128 | 单文件，按轨迹划分 |
 
-四源合计约 3.118 TB；QA、训练数组、权重和运行结果分别配置空间。Euler periodicBC 有独立固定清单，由显式配置选择。实验裁剪配额见[实验协议](protocols.md)。
+四源合计约 3.118 TB；QA、训练数组、权重和运行结果分别配置空间。Euler periodicBC 有独立固定清单，由显式配置选择。实验裁剪配额见 [README](../README.md#实验协议与开发)。
 
 ## 字段布局
 
@@ -29,7 +29,5 @@ The Well 动态标量通常为 `[N,T,H,W]`，向量为 `[N,T,H,W,C]`；静态材
 ## 获取与校验
 
 README 的 `download-ins`、`download-well` 命令获取完整源。The Well 下载器使用已固定的 manifest；`--verify-only` 检查已有文件，`--rehash` 重做文件摘要及有限值扫描。INS 下载器记录源信息与本地完整文件校验。各来源的发布者校验类型保存在对应清单中。
-
-PDEBench 配方使用完整 `2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5`，字段为 `density`、`pressure`、`Vx`、`Vy`。官方 MD5 为 `844555000d342d2947162c6cf46798e7`；`download-pdebench` 完成下载后验证该值。
 
 完整性由源清单和校验收据确定，QA manifest 记录实际使用的源身份、轨迹划分与裁剪。数据准备操作统一见 [README](../README.md#数据准备)。

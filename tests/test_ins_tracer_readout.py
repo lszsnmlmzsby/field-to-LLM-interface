@@ -34,7 +34,7 @@ def test_integer_domain_includes_thin_odd_and_large_shapes():
 
 
 def test_random_shape_dataset_replays_every_question_and_preserves_splits(tmp_path):
-    config = load_config(ROOT / "configs/field_to_llm_ins_tracer.yaml", "full")
+    config = load_config(ROOT / "tests/fixtures/field_to_llm_ins_tracer.yaml", "full")
     config["data"]["require_complete_ins_tracer"] = False  # Synthetic unit-test fixture only.
     config["data"]["shape_sampling"].update(height=[1, 13], width=[1, 19])
     config["generation"].update(train_states=96, eval_states=36)
@@ -88,7 +88,7 @@ def test_tiny_regions_are_only_fallbacks():
 
 
 def test_ins_path_cannot_be_overridden_by_old_pdebench_environment(monkeypatch, tmp_path):
-    config = load_config(ROOT / "configs/field_to_llm_ins_tracer.yaml", "full")
+    config = load_config(ROOT / "tests/fixtures/field_to_llm_ins_tracer.yaml", "full")
     monkeypatch.setenv("PDEBENCH_HDF5", str(tmp_path / "old.h5"))
     monkeypatch.setenv("FIELD_TO_LLM_ROOT", str(tmp_path))
     monkeypatch.delenv("INS_TRACER_HDF5", raising=False)
@@ -123,7 +123,7 @@ def test_complete_validation_catches_nan_and_truncation(tmp_path):
 
 def test_production_encoder_handles_one_cell_with_group_norm():
     from tensor_compression.workflows import train_point_readout as trainer
-    config = load_config(ROOT / "configs/field_to_llm_ins_tracer.yaml", "smoke")
+    config = load_config(ROOT / "tests/fixtures/field_to_llm_ins_tracer.yaml", "smoke")
     encoder, _, _, _ = trainer.core.build_scratch_memory_components(trainer.model_args(config), (1, 16, 16))
     output = encoder(torch.zeros(1, 1, 1, 1))
     assert output.shape == (1, 8, 1, 1)
@@ -133,7 +133,7 @@ def test_production_encoder_handles_one_cell_with_group_norm():
 
 def test_geometry_check_is_not_training_and_covers_extremes():
     from test_point_readout import tiny_components
-    config = load_config(ROOT / "configs/field_to_llm_ins_tracer.yaml", "smoke")
+    config = load_config(ROOT / "tests/fixtures/field_to_llm_ins_tracer.yaml", "smoke")
     config["field_encoder"]["model"]["norm"] = "identity"
     trainer, llm, sidecar, tokenizer, config = tiny_components(config)
     config["training"]["batch_size"] = 3
@@ -194,7 +194,7 @@ def test_full_size_aria2_partial_is_not_mistaken_for_complete(tmp_path, monkeypa
 @pytest.mark.parametrize("block", [(1, 1), (2, 2)])
 def test_positive_shapes_forward_backward_on_tiny_qwen(shape, block):
     from test_point_readout import tiny_components
-    config = load_config(ROOT / "configs/field_to_llm_ins_tracer.yaml", "smoke")
+    config = load_config(ROOT / "tests/fixtures/field_to_llm_ins_tracer.yaml", "smoke")
     config["memory"]["block_shape"] = list(block)
     # tiny_components uses 8 base channels: choose identity to avoid 1 value/group.
     # The production config has 32 base channels, i.e. 4 values/group even at 1x1.

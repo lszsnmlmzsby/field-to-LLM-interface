@@ -1,1 +1,1 @@
-"""Field normalization utilities used by the paper pipeline."""
+"""Normalization utilities for scalar field inputs."""

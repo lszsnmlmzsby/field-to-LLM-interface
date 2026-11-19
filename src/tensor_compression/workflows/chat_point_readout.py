@@ -65,7 +65,7 @@ def reply(llm, sidecar, tokenizer, messages, field, mode, device, dtype, max_pro
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(ROOT / "configs/field_to_llm_point_readout.yaml"))
+    parser.add_argument("--config", default=str(ROOT / "configs/field_to_llm_multisource_v2.yaml"))
     parser.add_argument("--profile", choices=("smoke", "pilot", "full"), default="full")
     parser.add_argument("--split", choices=("train", "val", "test"), default="val")
     parser.add_argument("--qa-dir")

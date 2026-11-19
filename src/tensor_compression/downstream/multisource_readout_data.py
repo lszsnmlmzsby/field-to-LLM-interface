@@ -19,7 +19,7 @@ from pathlib import Path
 import h5py
 import torch
 
-from tensor_compression.downstream.patch_qa_contract import sha256_file
+from tensor_compression.utils.io import sha256_file
 from tensor_compression.downstream.point_readout import (
     FORMAT, PROMPT_VERSION, TASKS, json_hash, make_record, normalize_field,
     sample_spec, tensor_hash, validate_record,

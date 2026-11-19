@@ -11,13 +11,13 @@ from pathlib import Path
 import h5py
 import torch
 
-from tensor_compression.downstream.patch_qa_contract import sha256_file
+from tensor_compression.utils.io import sha256_file
 from tensor_compression.downstream.point_readout import (
     FORMAT, PROMPT_VERSION, TASKS, STAT_TASKS, LOCATION_TASKS, json_hash, make_record, normalize_field,
     sample_spec, validate_record,
 )
-from tensor_compression.downstream.variable_shape import experiment_config, parse_shapes
-from tensor_compression.utils.pipeline_config import load_yaml_mapping
+from collections.abc import Mapping, Sequence
+from tensor_compression.utils.io import load_yaml_mapping
 from tensor_compression.downstream.random_readout_shapes import (
     shape_pools, training_plan, evaluation_plan, fitting_tasks,
 )
@@ -344,3 +344,41 @@ class PointReadoutDataset:
             self.handle.close()
             self.handle = None
         self.cache.clear()
+
+
+def experiment_config(config: Mapping, profile: str | None) -> dict:
+    result = copy.deepcopy(dict(config))
+    profiles = result.pop("profiles", None)
+    if profiles is None:
+        if profile is not None:
+            raise ValueError("--profile requires a configuration with profiles.")
+        return result
+    if profile not in profiles:
+        raise ValueError("Select --profile pilot or --profile full explicitly.")
+
+    def merge(target, overlay):
+        for key, value in overlay.items():
+            if isinstance(value, Mapping) and isinstance(target.get(key), dict):
+                merge(target[key], value)
+            else:
+                target[key] = copy.deepcopy(value)
+
+    merge(result, profiles[profile])
+    result["experiment_profile"] = profile
+    return result
+
+def parse_shapes(values: Sequence, *, allow_odd: bool = False) -> list[tuple[int, int]]:
+    shapes = []
+    for value in values:
+        parts = value.lower().split("x") if isinstance(value, str) else value
+        if len(parts) != 2:
+            raise ValueError(f"Expected HxW, got {value!r}.")
+        shape = tuple(int(part) for part in parts)
+        if any(size < 4 or (size % 2 and not allow_odd) for size in shape):
+            raise ValueError(f"First variable-grid protocol requires even H,W >= 4: {shape}.")
+        if shape in shapes:
+            raise ValueError(f"Duplicate shape: {shape}.")
+        shapes.append(shape)
+    if not shapes:
+        raise ValueError("At least one field shape is required.")
+    return shapes

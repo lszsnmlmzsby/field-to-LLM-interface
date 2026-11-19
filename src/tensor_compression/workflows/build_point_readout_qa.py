@@ -14,7 +14,7 @@ from tensor_compression.downstream.point_readout_data import build_dataset, load
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(ROOT / "configs/field_to_llm_point_readout.yaml"))
+    parser.add_argument("--config", default=str(ROOT / "configs/field_to_llm_multisource_v2.yaml"))
     parser.add_argument("--profile", choices=("smoke", "pilot", "full"), required=True)
     parser.add_argument("--hdf5-path")
     parser.add_argument("--output-dir")
