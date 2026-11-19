@@ -17,14 +17,9 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+from tensor_compression.paths import ROOT as PROJECT_ROOT
 
-from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
+from tensor_compression.workflows.train_tensor_patch_text_alignment import (  # noqa: E402
     PDEBenchPatchTextDataset,
     build_axis_split_plan,
     build_patch_records,
@@ -952,7 +947,3 @@ def main() -> None:
     compressor_config = {}
     gc.collect()
     print(json.dumps(metadata, ensure_ascii=False, indent=2))
-
-
-if __name__ == "__main__":
-    main()

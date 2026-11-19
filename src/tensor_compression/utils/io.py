@@ -6,6 +6,10 @@ from pathlib import Path
 import yaml
 
 
+def load_json(path: str | Path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
 def dump_json(path: str | Path, payload: dict) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

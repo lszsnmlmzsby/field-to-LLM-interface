@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from .runtime import (
+    _config_value,
+)
+
 """Benchmark serialized-field input against the cross-attention interface.
 
 The two methods share one frozen LLM replica, one QA record order, one
@@ -29,13 +33,9 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-for search_path in (PROJECT_ROOT, SRC_ROOT):
-    if str(search_path) not in sys.path:
-        sys.path.insert(0, str(search_path))
+from tensor_compression.paths import ROOT as PROJECT_ROOT
 
-from scripts.evaluate_frozen_qwen_patch_qa import (  # noqa: E402
+from tensor_compression.workflows.evaluate_frozen_qwen_patch_qa import (  # noqa: E402
     FrozenQwenQADataset,
     audit_frozen_qwen,
     collate_records,
@@ -50,7 +50,7 @@ from scripts.evaluate_frozen_qwen_patch_qa import (  # noqa: E402
     serializable_metric_payload,
     update_metric_payload,
 )
-from scripts.train_tensor_llm_adapter import (  # noqa: E402
+from tensor_compression.workflows.train_tensor_llm_adapter import (  # noqa: E402
     ExactDistributedEvalSampler,
     TensorReadoutQADataset,
     apply_runtime_environment,
@@ -72,7 +72,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     set_frozen_llm_execution_mode,
     single_token_choice_ids,
 )
-from scripts.train_tensor_qwen_cross_attention import (  # noqa: E402
+from tensor_compression.workflows.train_tensor_qwen_cross_attention import (  # noqa: E402
     CHECKPOINT_TYPE,
     CHECKPOINT_VERSION,
     DenseCrossAttentionSidecar,
@@ -102,14 +102,40 @@ SUPPORTED_METHODS = ("serialized", "dense")
 class DenseBenchmarkDataset(TensorReadoutQADataset):
     """The formal latent loader without constructing an unused shuffled baseline."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._checkpoint_policy_locked = False
+
+    def lock_checkpoint_policy(self, latent_channel_policy: str) -> None:
+        if self._latent_cache:
+            raise RuntimeError(
+                "The dense benchmark dataset was accessed before its checkpoint latent "
+                "channel policy was applied."
+            )
+        self.latent_channel_policy = str(latent_channel_policy)
+        self._checkpoint_policy_locked = True
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        if not self._checkpoint_policy_locked:
+            raise RuntimeError(
+                "Dense latent access is forbidden until the dense checkpoint architecture "
+                "locks latent_channel_policy."
+            )
+        return super().__getitem__(index)
+
+    def load_latent_for_record(self, record: Mapping[str, Any]) -> torch.Tensor:
+        if not self._checkpoint_policy_locked:
+            raise RuntimeError(
+                "Dense latent loading is forbidden until the dense checkpoint architecture "
+                "locks latent_channel_policy."
+            )
+        return super().load_latent_for_record(record)
+
     def _build_random_different_indices(self, seed: int) -> list[int]:
         del seed
         return list(range(len(self.records)))
 
 
-def _config_value(config: Mapping[str, Any], paths: Sequence[str], default: Any = None) -> Any:
-    value = first_nested(config, list(paths))
-    return default if value is None else value
 
 
 def _path_value(value: Any) -> str | None:
@@ -335,6 +361,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.value_fourier_bands = 0
     args.value_hidden_dim = 0
     args.freeze_spatial_backbone = True
+    args.input_source = "precomputed_latent"
+    args.memory_init_mode = "direct_qa_checkpoint"
+    args.field_encoder_trainable = False
+    # The dense checkpoint is the source of truth.  Legacy checkpoints did not
+    # record this field and are defined to mean the historical ``all`` policy.
+    args.latent_channel_policy = None
+    args.latent_channel_policy_source = "dense_checkpoint_architecture"
     validate_args(args)
     return args
 
@@ -536,9 +569,51 @@ def apply_checkpoint_architecture(
     args.value_fourier_bands = int(architecture["value_fourier_bands"])
     args.value_hidden_dim = int(architecture["value_hidden_dim"])
     args.freeze_spatial_backbone = bool(architecture["freeze_spatial_backbone"])
+    args.input_source = str(architecture.get("input_source", "precomputed_latent"))
+    args.memory_init_mode = str(
+        architecture.get("memory_init_mode", "direct_qa_checkpoint")
+    )
+    args.field_encoder_trainable = bool(
+        architecture.get("field_encoder_trainable", False)
+    )
+    args.latent_channel_policy = str(architecture.get("latent_channel_policy", "all"))
+    if args.latent_channel_policy not in {"all", "value_only"}:
+        raise ValueError(
+            "The dense checkpoint has an unsupported latent_channel_policy: "
+            f"{args.latent_channel_policy!r}."
+        )
     if args.bridge_dim <= 0 or args.bridge_heads <= 0 or args.bridge_dim % args.bridge_heads:
         raise ValueError("The checkpoint bridge dimension is not divisible by its head count.")
-    return dict(architecture)
+    normalized = dict(architecture)
+    normalized["latent_channel_policy"] = args.latent_channel_policy
+    return normalized
+
+
+def apply_checkpoint_dataset_policy(
+    dataset: DenseBenchmarkDataset,
+    latent_channel_policy: str,
+) -> None:
+    """Lock the dense loader to the policy recorded by its checkpoint.
+
+    Dataset construction precedes dense-checkpoint loading so the serialized
+    benchmark can run first on an untouched Qwen.  No dense latent is allowed
+    to be cached before the checkpoint contract selects its input policy.
+    """
+
+    policy = str(latent_channel_policy)
+    if policy not in {"all", "value_only"}:
+        raise ValueError(f"Unsupported benchmark latent channel policy: {policy!r}.")
+    lock_policy = getattr(dataset, "lock_checkpoint_policy", None)
+    if callable(lock_policy):
+        lock_policy(policy)
+        return
+    latent_cache = getattr(dataset, "_latent_cache", None)
+    if latent_cache:
+        raise RuntimeError(
+            "The dense benchmark dataset was accessed before its checkpoint latent "
+            "channel policy was applied."
+        )
+    dataset.latent_channel_policy = policy
 
 
 def build_benchmark_datasets(
@@ -566,6 +641,9 @@ def build_benchmark_datasets(
             shuffle_seed=int(args.shuffle_seed),
             latent_cache_size=int(args.latent_cache_size),
             latent_contract=latent_contract,
+            # This is an inaccessible placeholder until load_dense_interface()
+            # locks the checkpoint-recorded policy before the first __getitem__.
+            latent_channel_policy="all",
         )
         serialized_ids = [str(record["qa_id"]) for record in serialized_dataset.records]
         dense_ids = [str(record["qa_id"]) for record in dense_dataset.records]
@@ -1606,6 +1684,16 @@ def load_dense_interface(
     if not isinstance(checkpoint, Mapping):
         raise ValueError("Dense checkpoint payload must be a mapping.")
     observed_architecture = apply_checkpoint_architecture(args, checkpoint)
+    if (
+        str(args.input_source) != "precomputed_latent"
+        or str(args.memory_init_mode) != "direct_qa_checkpoint"
+    ):
+        raise ValueError(
+            "The paired paper benchmark currently supports only precomputed-latent "
+            "checkpoints initialized by Direct-QA. Evaluate a Direct-Cross scratch run "
+            "with the trainer's built-in validation modes."
+        )
+    apply_checkpoint_dataset_policy(dense_dataset, args.latent_channel_policy)
     first_latent = dense_dataset[0]["latent_map"]
     latent_shape = tuple(int(value) for value in first_latent.shape)
     hidden_size = int(llm.get_input_embeddings().embedding_dim)
@@ -1615,10 +1703,12 @@ def load_dense_interface(
         hidden_size,
         latent_contract,
         args.model_name_or_path,
+        args.latent_channel_policy,
     )
     sidecar, install_report = build_sidecar(llm, spatial_initializer, args, device)
     expected_architecture = architecture_contract(
         args,
+        latent_shape,
         latent_shape,
         hidden_size,
         latent_contract,
@@ -1802,6 +1892,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                 dense_setup_report["critical_path_elapsed_seconds"] = max(
                     dense_setup_by_rank
                 )
+                if is_main_process():
+                    atomic_dump_json(
+                        run_dir / "effective_dense_input_contract.json",
+                        {
+                            "source": "dense_checkpoint_architecture",
+                            "latent_channel_policy": str(args.latent_channel_policy),
+                            "dense_checkpoint": dense_setup_report["checkpoint"],
+                            "validated_architecture": dense_setup_report[
+                                "validated_architecture"
+                            ],
+                        },
+                    )
                 model_info["memory_cells"] = int(dataset[0]["latent_map"].shape[-2]) * int(
                     dataset[0]["latent_map"].shape[-1]
                 )
@@ -1987,7 +2089,3 @@ def main(argv: Sequence[str] | None = None) -> None:
     finally:
         if distributed_is_initialized():
             dist.destroy_process_group()
-
-
-if __name__ == "__main__":
-    main()

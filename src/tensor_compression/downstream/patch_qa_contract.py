@@ -272,7 +272,7 @@ def latent_qa_stats_from_record(record: Mapping[str, Any]) -> dict[str, float]:
     if not isinstance(audit, Mapping) or str(audit.get("format", "")) != PATCH_LATENT_AUDIT_FORMAT:
         raise ValueError(
             "A formal patch QA record is missing latent_audit provenance. Regenerate the QA JSONL with "
-            "scripts/build_tensor_patch_qa.py."
+            "src/tensor_compression/workflows/build_tensor_patch_qa.py."
         )
     result: dict[str, float] = {}
     for name in ("mean", "std", "scale"):

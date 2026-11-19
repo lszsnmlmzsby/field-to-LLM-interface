@@ -1,0 +1,290 @@
+"""Explicit data parallelism for the hook-based frozen-LLM readout trainer.
+
+Gradients are summed once per optimizer update, after every local backward has
+finished. This supports empty ranks, uneven batches and local OOM retries without
+DDP hooks entering collectives halfway through a failed backward.
+"""
+from __future__ import annotations
+
+from datetime import timedelta
+from array import array
+import hashlib
+import os
+import random
+
+import torch
+import torch.distributed as dist
+
+
+class ParallelContext:
+    def __init__(self, device, *, owned=False):
+        self.device = torch.device(device)
+        self.owned = owned
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+
+    @classmethod
+    def initialize(cls, requested="auto", timeout_minutes=360):
+        if timeout_minutes <= 0:
+            raise ValueError("Distributed timeout must be positive")
+        world = int(os.environ.get("WORLD_SIZE", "1"))
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if requested == "auto" else torch.device(requested)
+        if world > 1 and device.type == "cuda":
+            local_rank = int(os.environ["LOCAL_RANK"])
+            if requested not in ("auto", "cuda"):
+                raise ValueError("With torchrun use --device auto/cuda, not a fixed CUDA index")
+            if not 0 <= local_rank < torch.cuda.device_count():
+                raise ValueError("LOCAL_RANK exceeds the number of visible CUDA devices")
+            device = torch.device("cuda", local_rank)
+        if device.type == "cuda":
+            # set_device requires an explicit index. A standalone process sees
+            # logical cuda:0 after CUDA_VISIBLE_DEVICES filtering, including MIG.
+            if device.index is None:
+                device = torch.device("cuda", 0)
+            torch.cuda.set_device(device)
+        owned = world > 1 and not dist.is_initialized()
+        if owned:
+            dist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo",
+                                    timeout=timedelta(minutes=timeout_minutes))
+        return cls(device, owned=owned)
+
+    @property
+    def primary(self):
+        return self.rank == 0
+
+    def gather(self, value):
+        if self.world_size == 1:
+            return [value]
+        values = [None] * self.world_size
+        dist.all_gather_object(values, value)
+        return values
+
+    def main(self, operation):
+        """One writer; propagate its exception instead of stranding other ranks."""
+        if self.world_size == 1:
+            return operation()
+        envelope, error = [None], None
+        if self.primary:
+            try:
+                envelope[0] = (True, operation())
+            except Exception as exc:
+                error = exc
+                envelope[0] = (False, f"{type(exc).__name__}: {exc}")
+        dist.broadcast_object_list(envelope, src=0)
+        ok, value = envelope[0]
+        if not ok:
+            if error is not None:
+                raise error
+            raise RuntimeError(f"Rank 0 failed: {value}")
+        return value
+
+    def check_errors(self, error):
+        messages = self.gather(error)
+        failures = [f"rank {i}: {value}" for i, value in enumerate(messages) if value]
+        if failures:
+            raise RuntimeError("Distributed operation failed: " + "; ".join(failures))
+
+    def any(self, flag):
+        value = torch.tensor(int(flag), device=self.device)
+        if self.world_size > 1:
+            dist.all_reduce(value, op=dist.ReduceOp.MAX)
+        return bool(value.item())
+
+    def sums(self, values):
+        value = torch.tensor(values, dtype=torch.float64, device=self.device)
+        if self.world_size > 1:
+            dist.all_reduce(value)
+        return value.cpu().tolist()
+
+    @torch.no_grad()
+    def synchronize_parameters(self, module):
+        if self.world_size > 1:
+            for parameter in module.parameters():
+                if parameter.requires_grad:
+                    dist.broadcast(parameter, src=0)
+            for buffer in module.buffers():
+                dist.broadcast(buffer, src=0)
+
+    @torch.no_grad()
+    def sum_gradients(self, module):
+        """Input losses already use the GLOBAL question-count denominator.
+
+        Preserve globally unused gradients as None (AdamW must not update them).
+        Bucket the reductions to avoid one collective per small parameter.
+        """
+        if self.world_size == 1:
+            return
+        parameters = [p for p in module.parameters() if p.requires_grad]
+        used = torch.tensor([p.grad is not None for p in parameters], dtype=torch.int32, device=self.device)
+        dist.all_reduce(used, op=dist.ReduceOp.MAX)
+        buckets, bucket, size, dtype = [], [], 0, None
+        for parameter, present in zip(parameters, used.cpu().tolist()):
+            if not present:
+                continue
+            if parameter.grad is None:
+                parameter.grad = torch.zeros_like(parameter)
+            if bucket and (size + parameter.numel() * parameter.element_size() > 16 * 2**20
+                           or parameter.dtype != dtype):
+                buckets.append(bucket)
+                bucket, size = [], 0
+            bucket.append(parameter)
+            size += parameter.numel() * parameter.element_size()
+            dtype = parameter.dtype
+        if bucket:
+            buckets.append(bucket)
+        for bucket in buckets:
+            flat = torch.cat([p.grad.reshape(-1) for p in bucket])
+            dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+            offset = 0
+            for parameter in bucket:
+                count = parameter.numel()
+                parameter.grad.copy_(flat[offset:offset + count].view_as(parameter))
+                offset += count
+
+    def close(self):
+        if self.owned and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def partition_batch(indices, rank, world_size):
+    """Balanced contiguous pieces, with no padding, repeats or dropped samples."""
+    if not 0 <= rank < world_size:
+        raise ValueError("Invalid rank/world size")
+    quotient, remainder = divmod(len(indices), world_size)
+    start = rank * quotient + min(rank, remainder)
+    return indices[start:start + quotient + int(rank < remainder)]
+
+
+def merge_strided_lengths(local_lengths, total, parallel):
+    """One compact collective after preflight, not extra tokenization per step."""
+    expected = len(range(parallel.rank, total, parallel.world_size))
+    parallel.check_errors(None if len(local_lengths) == expected else "Preflight length count mismatch")
+    lengths = torch.zeros(total, dtype=torch.int32, device=parallel.device)
+    lengths[parallel.rank::parallel.world_size] = torch.tensor(local_lengths, dtype=torch.int32,
+                                                              device=parallel.device)
+    if parallel.world_size > 1:
+        dist.all_reduce(lengths, op=dist.ReduceOp.SUM)
+    if bool((lengths <= 0).any()):
+        raise ValueError("Every training question must have a positive complete token length")
+    result = array("I")
+    result.frombytes(lengths.cpu().numpy().tobytes())
+    return result
+
+
+def length_balanced_partitions(indices, lengths, world_size, *, chunk_size=4):
+    """Assign length-homogeneous chunks by padded-token cost, then sort locally.
+
+    Input is ONE existing same-shape batch. Preserve its multiset, including
+    tails; only rank ownership and within-update execution order may change.
+    Length is a cost proxy, not a measured runtime or a memory-fit guarantee.
+    """
+    if world_size <= 0 or chunk_size <= 0:
+        raise ValueError("world_size and chunk_size must be positive")
+    ordered = sorted(indices, key=lambda i: (-int(lengths[i]), i))
+    if any(lengths[i] <= 0 for i in ordered):
+        raise ValueError("Token lengths must be positive")
+    # Small global tails should still use available ranks when possible.
+    size = min(chunk_size, max(1, len(indices) // world_size))
+    parts, loads = [[] for _ in range(world_size)], [0] * world_size
+    for start in range(0, len(ordered), size):
+        chunk = ordered[start:start + size]
+        rank = min(range(world_size), key=lambda r: (loads[r], len(parts[r]), r))
+        parts[rank].extend(chunk)
+        loads[rank] += len(chunk) * max(int(lengths[i]) for i in chunk)
+    return [sorted(part, key=lambda i: (-int(lengths[i]), i)) for part in parts]
+
+
+def capture_rng(device):
+    return {"python_rng": random.getstate(), "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state(device) if device.type == "cuda" else None}
+
+
+def restore_rng(state, device):
+    random.setstate(state["python_rng"])
+    torch.set_rng_state(state["torch_rng"])
+    if device.type == "cuda" and state["cuda_rng"] is not None:
+        torch.cuda.set_rng_state(state["cuda_rng"], device)
+
+
+def resume_execution_state(checkpoint, parallel, *, allow_world_size_change=False,
+                           reset_micro_batch_limits=False, seed=0):
+    """Map execution state only; model/optimizer/global data cursor stay untouched.
+
+    Surviving ranks keep their RNG streams. Added ranks get deterministic distinct
+    streams. A different world size is a recorded migration, not bitwise replay.
+    OOM caps from different hardware must not be treated as memory-fit evidence.
+    """
+    old_world = checkpoint.get("parallel_execution", {}).get("world_size", 1)
+    if type(old_world) is not int or old_world < 1:
+        raise ValueError("Invalid checkpoint process count")
+    states = checkpoint.get("rank_states", [checkpoint])
+    if len(states) != old_world:
+        raise ValueError("Checkpoint rank state count differs from its process count")
+    changed = old_world != parallel.world_size
+    if changed and not allow_world_size_change:
+        raise ValueError("Strict training resume requires the same GPU/process count; "
+                         "use --allow-world-size-change for a recorded migration preserving "
+                         "the global batch, optimizer, scheduler and data cursor")
+    if not 0 <= parallel.rank < parallel.world_size:
+        raise ValueError("Invalid current rank")
+    added_seed = None
+    if parallel.rank < old_world:
+        state = dict(states[parallel.rank])
+    else:
+        payload = (f"readout-rank-migration-v1:{seed}:{checkpoint['step']}:"
+                   f"{old_world}:{parallel.world_size}:{parallel.rank}").encode()
+        payload += states[0]["torch_rng"].cpu().numpy().tobytes()
+        added_seed = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**63)
+        state = {"python_rng": random.Random(added_seed).getstate(),
+                 "torch_rng": torch.Generator().manual_seed(added_seed).get_state(),
+                 "cuda_rng": (torch.Generator(device=parallel.device).manual_seed(added_seed).get_state()
+                              if parallel.device.type == "cuda" else None)}
+    reset_limits = changed or reset_micro_batch_limits
+    if reset_limits:
+        state.pop("micro_batch_limit", None)
+        state.pop("adaptive_micro_batch_limits", None)
+    report = {"checkpoint_step": checkpoint["step"], "from_world_size": old_world,
+              "to_world_size": parallel.world_size, "world_size_changed": changed,
+              "micro_batch_limits_reset": reset_limits,
+              "rng_policy": "preserve_surviving_ranks_seed_added_ranks_v1",
+              "rank": parallel.rank, "restored_rng_from_rank": parallel.rank if parallel.rank < old_world else None,
+              "added_rank_seed": added_seed,
+              "bitwise_replay_guaranteed": False}
+    return state, report
+
+
+class RecordView:
+    """A lightweight view; don't copy millions of QA dictionaries for preflight."""
+    def __init__(self, records, indices):
+        self.records, self.indices = records, indices
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        return self.records[self.indices[index]]
+
+
+def evaluation_indices(records, world_size):
+    """Keep all questions of a field on one rank, balanced by question count."""
+    groups = {}
+    for index, row in enumerate(records):
+        groups.setdefault(row["state_ref"], []).append(index)
+    shards = [[] for _ in range(world_size)]
+    for indices in groups.values():
+        rank = min(range(world_size), key=lambda r: len(shards[r]))
+        shards[rank].extend(indices)
+    return [sorted(indices) for indices in shards]
+
+
+def merge_token_reports(reports):
+    merged = dict(reports[0])
+    for key in ("questions", "prompt_overflow_count", "target_overflow_count", "overflow_questions"):
+        merged[key] = sum(report[key] for report in reports)
+    for length, record in (("max_prompt_tokens_observed", "max_prompt_record"),
+                           ("max_target_tokens_observed", "max_target_record")):
+        largest = max(reports, key=lambda report: report[length])
+        merged[length], merged[record] = largest[length], largest[record]
+    merged["overflow_examples"] = [example for report in reports for example in report["overflow_examples"]][:8]
+    merged["status"] = "overflow" if merged["overflow_questions"] else "ok"
+    return merged

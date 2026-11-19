@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from scripts.build_tensor_patch_matched_qa import (
+from tensor_compression.workflows.build_tensor_patch_matched_qa import (
     assign_spatial_families,
     build_state_records,
     evaluation_record_replay,

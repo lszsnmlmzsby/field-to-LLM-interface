@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+from .runtime import (
+    distributed_is_initialized,
+    distributed_rank,
+    distributed_world_size,
+    is_main_process,
+    parse_csv,
+    redacted_args,
+)
+
 import argparse
 import hashlib
 import json
@@ -24,10 +33,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+from tensor_compression.paths import ROOT as PROJECT_ROOT
 
 from tensor_compression.config import load_config  # noqa: E402
 from tensor_compression.downstream.field_io import (  # noqa: E402
@@ -51,7 +57,7 @@ try:
     from transformers import AutoModel, AutoTokenizer
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
-        "scripts/train_tensor_patch_text_alignment.py requires transformers. "
+        "src/tensor_compression/workflows/train_tensor_patch_text_alignment.py requires transformers. "
         "Install it with: pip install transformers accelerate safetensors"
     ) from exc
 
@@ -139,12 +145,6 @@ def require_h5py() -> Any:
     return h5py
 
 
-def parse_csv(raw: str | Sequence[str] | None) -> list[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, Sequence) and not isinstance(raw, str):
-        return [str(part).strip() for part in raw if str(part).strip()]
-    return [part.strip() for part in str(raw).split(",") if part.strip()]
 
 
 def validate_finite_float(
@@ -314,20 +314,12 @@ def dump_json(path: str | Path, payload: Mapping[str, Any]) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def distributed_is_initialized() -> bool:
-    return dist.is_available() and dist.is_initialized()
 
 
-def distributed_world_size() -> int:
-    return int(dist.get_world_size()) if distributed_is_initialized() else 1
 
 
-def distributed_rank() -> int:
-    return int(dist.get_rank()) if distributed_is_initialized() else 0
 
 
-def is_main_process() -> bool:
-    return distributed_rank() == 0
 
 
 def setup_distributed_from_env(args: argparse.Namespace) -> None:
@@ -610,11 +602,6 @@ def gather_without_grad(tensor: torch.Tensor) -> torch.Tensor:
     return torch.cat(gathered, dim=0)
 
 
-def redacted_args(args: argparse.Namespace) -> dict[str, Any]:
-    payload = dict(vars(args))
-    if payload.get("wandb_api_key"):
-        payload["wandb_api_key"] = "***REDACTED***"
-    return payload
 
 
 def load_checkpoint_and_config(
@@ -2433,13 +2420,9 @@ def forward_teacher_readout_hiddens(
                         f"Transformer block {index} returned shape {tuple(hidden.shape)} inconsistent with "
                         f"attention_mask={tuple(attention_mask.shape)}."
                     )
-                readout = hidden[batch_indices, last_indices]
-                # Non-reentrant checkpointing invokes the hook again while backward
-                # recomputes a block. Keep the original forward tensor whose retained
-                # gradient is inspected after backward; the recomputed tensor is an
-                # implementation detail and must not overwrite this reference.
-                if index not in captured:
-                    captured[index] = readout
+                if requires_gradient_path and not hidden.requires_grad:
+                    raise RuntimeError("Transformer readout hooks lost the student gradient graph; use non-reentrant checkpointing.")
+                captured[index] = hidden
 
             return hook
 
@@ -2458,6 +2441,9 @@ def forward_teacher_readout_hiddens(
         missing = [index for index in requested if index not in captured]
         if missing:
             raise RuntimeError(f"Transformer hooks did not capture requested readout blocks {missing}.")
+        # Index outside the checkpointed block: transient hooks are removed
+        # before backward, so their tensor operations cannot be replayed there.
+        captured = {index: hidden[batch_indices, last_indices] for index, hidden in captured.items()}
         disconnected = [
             index for index in requested if requires_gradient_path and not captured[index].requires_grad
         ]
@@ -7287,11 +7273,3 @@ def main() -> None:
         )
     distributed_barrier("final_test_written")
     cleanup_distributed()
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        if distributed_is_initialized():
-            dist.destroy_process_group()

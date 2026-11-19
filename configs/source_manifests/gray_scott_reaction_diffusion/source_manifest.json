@@ -1,0 +1,193 @@
+{
+  "schema": "the_well_manifest_v1",
+  "provider": "huggingface",
+  "dataset": "gray_scott_reaction_diffusion",
+  "repo_id": "polymathic-ai/gray_scott_reaction_diffusion",
+  "revision": "913ef5679d5c4b4ccd6fcd52c055509dfbf190f9",
+  "metadata_endpoint": "https://huggingface.co",
+  "scope": "all_current_data_split_hdf5_and_text_metadata",
+  "files": [
+    {
+      "path": ".gitattributes",
+      "split": null,
+      "size_bytes": 4339,
+      "sha256": null,
+      "git_blob_sha1": "02c6d726e31e8c27b011fbbc295958cbe913881d"
+    },
+    {
+      "path": "README.md",
+      "split": null,
+      "size_bytes": 9070,
+      "sha256": null,
+      "git_blob_sha1": "7b2ed3676f002dfb2d99d94e47604631c1d9f24e"
+    },
+    {
+      "path": "data/stats.yaml",
+      "split": null,
+      "size_bytes": 109,
+      "sha256": null,
+      "git_blob_sha1": "5e858e20d32487506a1297ffab2f58b6f560d45d"
+    },
+    {
+      "path": "data/test/gray_scott_reaction_diffusion_bubbles_F_0.098_k_0.057.hdf5",
+      "split": "test",
+      "size_bytes": 2650800128,
+      "sha256": "db6bac94402d5c7a46e8c335d80e77c1f293fabda0d6521ba1dfbbe0c65c2ba1",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/gray_scott_reaction_diffusion_gliders_F_0.014_k_0.054.hdf5",
+      "split": "test",
+      "size_bytes": 2650800128,
+      "sha256": "b22d51b7f1b33743934b608d94f845f458dd480fac4ee981cc516fb9170ff4e9",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/gray_scott_reaction_diffusion_maze_F_0.029_k_0.057.hdf5",
+      "split": "test",
+      "size_bytes": 2650800128,
+      "sha256": "87a2793031e3a4d14b70c947e72a1f8729b7a73eb21b662b6bcfa0441a2d160a",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/gray_scott_reaction_diffusion_spirals_F_0.018_k_0.051.hdf5",
+      "split": "test",
+      "size_bytes": 2650800128,
+      "sha256": "8b0e58cea61e4786f36a77987429bf19d4be27becb25f8414ad90ae2411ad69d",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/gray_scott_reaction_diffusion_spots_F_0.03_k_0.062.hdf5",
+      "split": "test",
+      "size_bytes": 2650800128,
+      "sha256": "eaeb4c3c9f779b32069f61d526d0e98f6448a5f2237e3a69d1eb6920f3424095",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/test/gray_scott_reaction_diffusion_worms_F_0.058_k_0.065.hdf5",
+      "split": "test",
+      "size_bytes": 2650800128,
+      "sha256": "5035e742f727b34e3aec7dc62841f88545ebf465e851e0d31f1bce8d8b715546",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/gray_scott_reaction_diffusion_bubbles_F_0.098_k_0.057.hdf5",
+      "split": "train",
+      "size_bytes": 21021851648,
+      "sha256": "fc53a8d65d05442cd8fcd9fbf01331ddd32fb745e82b7b38dc55d2fc85d53207",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/gray_scott_reaction_diffusion_gliders_F_0.014_k_0.054.hdf5",
+      "split": "train",
+      "size_bytes": 21021851648,
+      "sha256": "b12aa07a0a4a1c280884fd72d01702072884af1702220523b05fc0385a6f32a0",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/gray_scott_reaction_diffusion_maze_F_0.029_k_0.057.hdf5",
+      "split": "train",
+      "size_bytes": 21021851648,
+      "sha256": "78344f11a4c2187562138c13290567d3af17b1db01768270d494e971f7ebaca8",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/gray_scott_reaction_diffusion_spirals_F_0.018_k_0.051.hdf5",
+      "split": "train",
+      "size_bytes": 21021851648,
+      "sha256": "25db53d4a508704719a82f6fd453fbab3a84b107c144a0e342bc4cf6800b08ee",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/gray_scott_reaction_diffusion_spots_F_0.03_k_0.062.hdf5",
+      "split": "train",
+      "size_bytes": 21021851648,
+      "sha256": "7a51b17891a51d68ccae81777a2f7af6e22c6c7871ab7d6299d2ecf3f764ee72",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/train/gray_scott_reaction_diffusion_worms_F_0.058_k_0.065.hdf5",
+      "split": "train",
+      "size_bytes": 21021851648,
+      "sha256": "4aa508c14dd9dfb5ddc9a4c1204428a19af33fb2df66ed032397e92478e6ad03",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/gray_scott_reaction_diffusion_bubbles_F_0.098_k_0.057.hdf5",
+      "split": "valid",
+      "size_bytes": 2650800128,
+      "sha256": "927fb3c51e6974ac5207f435f1d4360a96678fd38f3d92a94550cbd8ce35c3ec",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/gray_scott_reaction_diffusion_gliders_F_0.014_k_0.054.hdf5",
+      "split": "valid",
+      "size_bytes": 2650800128,
+      "sha256": "0ea89a4a691b0f4a195b15767441fd4426cdd21f01d591d73f43588fb118b6e6",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/gray_scott_reaction_diffusion_maze_F_0.029_k_0.057.hdf5",
+      "split": "valid",
+      "size_bytes": 2650800128,
+      "sha256": "7dee37a829ddcc8bbcee3881dc8142489c9b906acb75fd79e74f49918b85ddcf",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/gray_scott_reaction_diffusion_spirals_F_0.018_k_0.051.hdf5",
+      "split": "valid",
+      "size_bytes": 2650800128,
+      "sha256": "eb83bc9a7f5e2686fba9d4cfc5466adbf8a55c1b0973889c52b0717dca9eeca9",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/gray_scott_reaction_diffusion_spots_F_0.03_k_0.062.hdf5",
+      "split": "valid",
+      "size_bytes": 2650800128,
+      "sha256": "a64a4f0c1e18d68ef9e59da3191faf72dfd457aefcd49080c53a5ef6823bb016",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "data/valid/gray_scott_reaction_diffusion_worms_F_0.058_k_0.065.hdf5",
+      "split": "valid",
+      "size_bytes": 2650800128,
+      "sha256": "f8df51aa04ca360113ad088f2a5038a95b366ffbb049526e889367e6d8a3ddfa",
+      "git_blob_sha1": null
+    },
+    {
+      "path": "full_stats.yaml",
+      "split": null,
+      "size_bytes": 355,
+      "sha256": null,
+      "git_blob_sha1": "9e3cd46ba77d28f0ad846706b0db6592e175763a"
+    },
+    {
+      "path": "gray_scott_reaction_diffusion.yaml",
+      "split": null,
+      "size_bytes": 424,
+      "sha256": null,
+      "git_blob_sha1": "27de15ecc1de1a92b3d9b4d95ee7842740a096c4"
+    },
+    {
+      "path": "stats.yaml",
+      "split": null,
+      "size_bytes": 243,
+      "sha256": null,
+      "git_blob_sha1": "c47f811575955502625d7db5a9c5ad2e4b0d6bb5"
+    }
+  ],
+  "excluded_files": [
+    {
+      "path": "gif/concentration_A_normalized.gif",
+      "reason": "auxiliary_visualization_or_non_source_asset"
+    },
+    {
+      "path": "gif/concentration_A_unormalized.gif",
+      "reason": "auxiliary_visualization_or_non_source_asset"
+    },
+    {
+      "path": "visualization_gray_scott_reaction_diffusion.ipynb",
+      "reason": "auxiliary_visualization_or_non_source_asset"
+    }
+  ]
+}

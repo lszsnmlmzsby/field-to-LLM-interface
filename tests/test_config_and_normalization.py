@@ -47,11 +47,27 @@ def test_release_configs_expose_only_the_paper_interfaces() -> None:
     assert direct["adapter"]["architecture"] == "alignment_adapter"
     assert direct["adapter"]["question_conditioning"] is False
     assert direct["adapter"]["structured_query_conditioning"] is False
+    assert direct["llm_training"]["latent_channel_policy"] == "all"
     assert cross["memory"]["freeze_spatial_backbone"] is True
+    assert cross["memory"]["latent_channel_policy"] == "all"
     assert cross["cross_attention"]["layers_1based"] == [8, 20, 32]
     assert cross["runtime"]["final_eval_reserve_minutes"] == 70
     assert benchmark["benchmark"]["methods"] == ["serialized", "dense"]
     assert benchmark["benchmark"]["max_records"] is None
+
+
+def test_direct_cross_scratch_config_has_no_upstream_model_initializer() -> None:
+    scratch = load_release_config("field_to_llm_cross_attention_scratch.yaml")
+
+    assert scratch["data"]["input_source"] == "raw_hdf5"
+    assert "latent_dir" not in scratch["data"]
+    assert "alignment_checkpoint" not in scratch["data"]
+    assert scratch["memory"]["init_mode"] == "scratch"
+    assert scratch["memory"]["init_checkpoint"] is None
+    assert scratch["memory"]["freeze_spatial_backbone"] is False
+    assert scratch["field_encoder"]["trainable"] is True
+    assert scratch["spatial_adapter"]["type"] == "full_grid_transformer"
+    assert scratch["evaluation"]["evaluate_test"] is False
 
 
 def test_channelwise_minmax_normalizes_each_channel_independently() -> None:

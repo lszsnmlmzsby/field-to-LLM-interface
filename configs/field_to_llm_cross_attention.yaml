@@ -14,6 +14,7 @@ model:
   gradient_checkpointing: true
 
 data:
+  input_source: precomputed_latent
   qa_dir: ${FIELD_TO_LLM_ROOT}/data/matched_patch_qa
   latent_dir: ${FIELD_TO_LLM_ROOT}/data/patch_latents
   alignment_checkpoint: ${FIELD_TO_LLM_ALIGNMENT_CHECKPOINT}
@@ -30,8 +31,10 @@ data:
   num_workers: 2
 
 memory:
+  init_mode: direct_qa_checkpoint
   init_checkpoint: ${FIELD_TO_LLM_DIRECT_CHECKPOINT}
   freeze_spatial_backbone: true
+  latent_channel_policy: all
   value_fourier_bands: 4
   value_hidden_dim: 128
 

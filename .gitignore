@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
+.pytest_tmp_*/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -29,17 +30,28 @@ Thumbs.db
 !/configs/field_to_llm_stage1.yaml
 !/configs/field_to_llm_direct_qa.yaml
 !/configs/field_to_llm_cross_attention.yaml
+!/configs/field_to_llm_cross_attention_scratch.yaml
+!/configs/field_to_llm_variable_shape.yaml
+!/configs/field_to_llm_variable_shape_mixed.yaml
+!/configs/field_to_llm_point_readout.yaml
+!/configs/field_to_llm_block_readout.yaml
+!/configs/field_to_llm_ins_tracer.yaml
+!/configs/field_to_llm_multisource.yaml
+!/configs/field_to_llm_multisource_v2.yaml
+!/configs/source_manifests/
+/configs/source_manifests/*
+!/configs/source_manifests/acoustic_scattering_inclusions/
+!/configs/source_manifests/euler_multi_quadrants_openBC/
+!/configs/source_manifests/euler_multi_quadrants_periodicBC/
+!/configs/source_manifests/gray_scott_reaction_diffusion/
 !/configs/field_to_llm_benchmark.yaml
+!/configs/field_to_llm_stage1_adapter_ablation.yaml
+!/configs/field_to_llm_no_learned_stage1_ablation.yaml
+!/configs/field_to_llm_stage1_reference.yaml
+!/configs/stage1_test_protocol_lock.example.json
 
-# Paper release entry-point allowlist
-/scripts/*
-!/scripts/train_tensor_patch_text_alignment.py
-!/scripts/build_tensor_patch_qa.py
-!/scripts/build_tensor_patch_matched_qa.py
-!/scripts/train_tensor_llm_adapter.py
-!/scripts/train_tensor_qwen_cross_attention.py
-!/scripts/evaluate_frozen_qwen_patch_qa.py
-!/scripts/benchmark_tensor_qwen_inference.py
+# Local research scripts are outside the release.
+/scripts/
 
 # Paper release test allowlist
 /tests/*
@@ -50,7 +62,31 @@ Thumbs.db
 !/tests/test_direct_qa_warm_start.py
 !/tests/test_frozen_qwen_patch_qa.py
 !/tests/test_tensor_qwen_cross_attention.py
+!/tests/test_variable_shape_fields.py
+!/tests/test_point_readout.py
+!/tests/test_readout_training_cache.py
+!/tests/test_readout_prefetch.py
+!/tests/test_readout_position_cache.py
+!/tests/test_readout_answer_ce.py
+!/tests/test_readout_input_pipeline.py
+!/tests/test_readout_verified_validation.py
+!/tests/test_readout_efficiency.py
+!/tests/test_readout_distributed.py
+!/tests/test_block_readout.py
+!/tests/test_ins_tracer_readout.py
+!/tests/test_the_well_source.py
+!/tests/test_multisource_readout.py
+!/tests/test_multisource_protocol.py
+!/tests/test_field_query_program.py
+!/tests/test_multisource_v2.py
+!/tests/test_multisource_v2_training.py
+!/tests/test_readout_evaluation_v2.py
+!/tests/test_point_readout_performance.py
+!/tests/test_chat_point_readout.py
+!/tests/test_mixed_shape_fields.py
 !/tests/test_tensor_qwen_inference_benchmark.py
+!/tests/test_tensor_qwen_stage1_ablation.py
+!/tests/test_compare_tensor_qwen_stage1_ablation.py
 
 # Historical compression, editor, and downstream-evaluation implementation
 /src/tensor_compression/adapters/
@@ -70,7 +106,9 @@ Thumbs.db
 
 # Local research history and paper-authoring artifacts
 /training_workflow.md
-/docs/
+/docs/*
+!/docs/protocols.md
+!/docs/sources.md
 /figures/
 
 # Data, checkpoints, model weights, and generated outputs
@@ -99,3 +137,52 @@ Thumbs.db
 .env
 .env.*
 configs/local_*.yaml
+
+/tmp_svg_render/
+/submission_code/
+
+# Local experiment assets and disposable products (safe for git add .).
+/.cache/
+/assets/
+/artifacts/
+/datasets/
+/downloads/
+/checkpoints/
+/logs/
+/results/
+/backups/
+/envs/
+/.conda/
+/.hf/
+*.part
+*.download
+*.jsonl
+*.bin
+events.out.tfevents.*
+*.npz
+*.npy
+*.hdf
+*.nc
+*.zarr/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.pdf
+*.docx
+*.pptx
+*.ipynb
+*.pem
+*.key
+*.p12
+id_rsa*
+id_ed25519*
+.netrc
+.ipynb_checkpoints/
+.venv*/
+*.egg-info/
+/build/
+/dist/
+
+!/tests/test_cli.py

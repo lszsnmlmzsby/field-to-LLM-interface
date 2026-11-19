@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+from .runtime import (
+    ExactDistributedEvalSampler,
+    apply_runtime_environment,
+    distributed_barrier,
+    distributed_is_initialized,
+    distributed_rank,
+    distributed_world_size,
+    is_main_process,
+    local_timestamp,
+    qa_path,
+)
+
 import argparse
 import gc
 import hashlib
@@ -23,11 +35,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm.auto import tqdm
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-for search_path in (PROJECT_ROOT, SRC_ROOT):
-    if str(search_path) not in sys.path:
-        sys.path.insert(0, str(search_path))
+from tensor_compression.paths import ROOT as PROJECT_ROOT
 
 from tensor_compression.downstream.patch_qa_contract import (  # noqa: E402
     MATCHED_GROUP_FORMAT,
@@ -54,7 +62,7 @@ try:
     from transformers import logging as transformers_logging
 except ImportError as exc:  # pragma: no cover - dependency error on the execution host
     raise ImportError(
-        "scripts/evaluate_frozen_qwen_patch_qa.py requires transformers. "
+        "src/tensor_compression/workflows/evaluate_frozen_qwen_patch_qa.py requires transformers. "
         "Install it with: pip install transformers accelerate safetensors"
     ) from exc
 
@@ -80,20 +88,12 @@ EXPECTED_TASKS = frozenset(
 ALLOWED_LABELS = frozenset({"A", "B", "C", "D"})
 
 
-def distributed_is_initialized() -> bool:
-    return dist.is_available() and dist.is_initialized()
 
 
-def distributed_rank() -> int:
-    return int(dist.get_rank()) if distributed_is_initialized() else 0
 
 
-def distributed_world_size() -> int:
-    return int(dist.get_world_size()) if distributed_is_initialized() else 1
 
 
-def is_main_process() -> bool:
-    return distributed_rank() == 0
 
 
 def initialize_device(requested: str, timeout_seconds: float) -> torch.device:
@@ -122,9 +122,6 @@ def initialize_device(requested: str, timeout_seconds: float) -> torch.device:
     return torch.device(requested)
 
 
-def distributed_barrier() -> None:
-    if distributed_is_initialized():
-        dist.barrier()
 
 
 def run_on_rank_zero_and_broadcast(operation, stage: str) -> Any:
@@ -162,8 +159,6 @@ def run_on_rank_zero_and_broadcast(operation, stage: str) -> Any:
     return received.get("value")
 
 
-def local_timestamp() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def atomic_dump_json(path: str | Path, payload: Mapping[str, Any]) -> None:
@@ -399,22 +394,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
-def apply_runtime_environment(args: argparse.Namespace) -> None:
-    if args.hf_home:
-        os.environ.setdefault("HF_HOME", str(args.hf_home))
-    if args.cache_dir:
-        os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(Path(args.cache_dir) / "hub"))
-        os.environ.setdefault("TRANSFORMERS_CACHE", str(args.cache_dir))
-    if not bool(args.console_progress):
-        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-        transformers_logging.disable_progress_bar()
 
 
-def qa_path(qa_dir: str | Path, split: str) -> Path:
-    path = Path(qa_dir) / f"{split}.jsonl"
-    if not path.exists():
-        raise FileNotFoundError(f"QA split file not found: {path}")
-    return path
 
 
 def audit_latent_contract(
@@ -906,23 +887,6 @@ class FrozenQwenQADataset(Dataset):
         }
 
 
-class ExactDistributedEvalSampler(Sampler[int]):
-    """Shard evaluation records without padding or repeating any example."""
-
-    def __init__(self, dataset: Dataset, rank: int, num_replicas: int) -> None:
-        self.dataset = dataset
-        self.rank = int(rank)
-        self.num_replicas = max(1, int(num_replicas))
-        if self.rank < 0 or self.rank >= self.num_replicas:
-            raise ValueError(f"rank must be in [0, {self.num_replicas}), got {self.rank}.")
-
-    def __iter__(self):
-        return iter(range(self.rank, len(self.dataset), self.num_replicas))
-
-    def __len__(self) -> int:
-        if self.rank >= len(self.dataset):
-            return 0
-        return ((len(self.dataset) - 1 - self.rank) // self.num_replicas) + 1
 
 
 def collate_records(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -2076,7 +2040,3 @@ def main(argv: Sequence[str] | None = None) -> None:
     finally:
         if distributed_is_initialized():
             dist.destroy_process_group()
-
-
-if __name__ == "__main__":
-    main()

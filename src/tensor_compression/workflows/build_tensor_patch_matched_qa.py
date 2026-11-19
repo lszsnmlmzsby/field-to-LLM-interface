@@ -18,13 +18,9 @@ from typing import Any
 
 import torch
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-for path in (PROJECT_ROOT, SRC_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+from tensor_compression.paths import ROOT as PROJECT_ROOT
 
-from scripts.build_tensor_patch_qa import AtomicJsonlWriter, quadrant  # noqa: E402
+from tensor_compression.workflows.build_tensor_patch_qa import AtomicJsonlWriter, quadrant  # noqa: E402
 from tensor_compression.downstream.patch_qa_contract import (  # noqa: E402
     MATCHED_GROUP_FORMAT,
     PATCH_LATENT_AUDIT_FORMAT,
@@ -884,7 +880,12 @@ def verify_extreme_replay(
     find_max = match.group(1).lower() == "maximum"
     extreme_value = float(values.max() if find_max else values.min())
     positions = torch.nonzero(values == extreme_value, as_tuple=False).tolist()
-    quadrants = {quadrant(int(row), int(col), int(values.shape[0])) for row, col in positions}
+    from tensor_compression.downstream.variable_shape import rectangular_quadrant
+
+    quadrants = {
+        rectangular_quadrant(int(row), int(col), int(values.shape[0]), int(values.shape[1]))
+        for row, col in positions
+    }
     source_answer = str(record.get("answer", ""))
     if source_answer not in quadrants:
         raise ValueError(
@@ -1849,7 +1850,3 @@ def main() -> None:
         f"{int(extreme_replay_audit_counts['cross_quadrant_tie_records'])} "
         f"latent_inventory={after_digest}"
     )
-
-
-if __name__ == "__main__":
-    main()

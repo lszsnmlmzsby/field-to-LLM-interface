@@ -16,7 +16,7 @@ for search_path in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if str(search_path) not in sys.path:
         sys.path.insert(0, str(search_path))
 
-import scripts.evaluate_frozen_qwen_patch_qa as baseline  # noqa: E402
+import tensor_compression.workflows.evaluate_frozen_qwen_patch_qa as baseline  # noqa: E402
 from tensor_compression.downstream.patch_qa_prompt import build_prompt  # noqa: E402
 
 
@@ -529,7 +529,7 @@ class FrozenQwenPatchQATests(unittest.TestCase):
             baseline.audit_frozen_qwen(model, torch.float32)
 
     def test_script_loads_tensor_payload_but_has_no_training_or_adapter_path(self) -> None:
-        source = (PROJECT_ROOT / "scripts" / "evaluate_frozen_qwen_patch_qa.py").read_text(
+        source = (PROJECT_ROOT / "src" / "tensor_compression" / "workflows" / "evaluate_frozen_qwen_patch_qa.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("train_tensor_llm_adapter", source)
